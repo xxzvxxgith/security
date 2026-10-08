@@ -1509,7 +1509,7 @@ def build_app():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("الاوامر", commands))
+    app.add_handler(CommandHandler("All", commands))
     app.add_handler(CommandHandler("commands", commands))
     app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CommandHandler("روليت", roulette))
