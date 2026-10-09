@@ -14,7 +14,7 @@ from telegram.ext import (
 from telegram.constants import ChatMemberStatus
 
 # قراءة التوكن من متغير البيئة حصراً لضمان الأمان
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("8906278700:AAGf5AZs6tKkPtROSxYjJPjLS4cuHX8tW5E")
 if not TOKEN:
     print("خطأ: لم يتم العثور على متغير البيئة BOT_TOKEN. يرجى ضبطه قبل تشغيل البوت.")
     sys.exit(1)
