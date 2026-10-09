@@ -1532,7 +1532,6 @@ application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^قائمة
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^إعادة تشغيل$"), restart))
 
 
-appfrom telegram.ext import MessageHandler, filters
 
     # أعضاء جدد
     app.add_handler(
