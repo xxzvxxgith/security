@@ -1508,8 +1508,6 @@ def build_app():
 
     app = Application.builder().token(TOKEN).build()
 
-    appfrom telegram.ext import MessageHandler, filters
-
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^بدء$"), start))
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(الأوامر|اوامر)$"), commands))
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^لوحة$"), panel))
