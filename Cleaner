@@ -13,14 +13,14 @@ from telegram.ext import (
 )
 from telegram.constants import ChatMemberStatus
 
-TOKEN = "8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY"
+# ضع توكن بوتك هنا مباشرة
+TOKEN = "8707884664:AAGEbtn...توكنك_هنا"
 
 DEFAULT_ADMINS = [1537665613, 6369115613]
 
 db = sqlite3.connect("cleaner_bot.db", check_same_thread=False)
 cur = db.cursor()
 
-# جدول لإعدادات المجموعات (التفعيل والإيقاف)
 cur.execute("""
 CREATE TABLE IF NOT EXISTS groups (
     chat_id INTEGER PRIMARY KEY,
@@ -28,7 +28,6 @@ CREATE TABLE IF NOT EXISTS groups (
 )
 """)
 
-# جدول لتخزين معرفات الرسائل المجمعة خلال آخر 24 ساعة
 cur.execute("""
 CREATE TABLE IF NOT EXISTS collected_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,7 +40,6 @@ CREATE TABLE IF NOT EXISTS collected_messages (
 """)
 cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_time ON collected_messages(chat_id, timestamp)")
 
-# جدول لمشرفي البوت الخاصين بكل مجموعة
 cur.execute("""
 CREATE TABLE IF NOT EXISTS cleaner_mods (
     chat_id INTEGER,
@@ -50,7 +48,6 @@ CREATE TABLE IF NOT EXISTS cleaner_mods (
 )
 """)
 
-# جدول لربط يوزرنيمات المستخدمين بمعرفتهم الـ ID لكي يسهل رفعهم/تنزيلهم
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users_map (
     chat_id INTEGER,
@@ -77,14 +74,13 @@ async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     except Exception:
         pass
     
-    # تحقق مما إذا كان مشرفاً في جدول Cleaner المخصص للمجموعة
     cur.execute("SELECT 1 FROM cleaner_mods WHERE chat_id=? AND user_id=?", (chat_id, user_id))
     return cur.fetchone() is not None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message:
-        await message.reply_text("أهلاً بك في بوت Cleaner لتنظيف المجموعات.\nأرسل /تفعيل لبدء العمل في هذه المجموعة.")
+        await message.reply_text("أهلاً بك في بوت Cleaner لتنظيف المجموعات من الروابط والوسائط خلال 24 ساعة.")
 
 async def enable_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -96,7 +92,7 @@ async def enable_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ensure_group(chat.id)
         cur.execute("UPDATE groups SET active=1 WHERE chat_id=?", (chat.id,))
         db.commit()
-        await message.reply_text("✅ تم تفعيل بوت Cleaner بنجاح. سيتم بدء تجميع الرسائل والوسائط.")
+        await message.reply_text("✅ تم تفعيل بوت Cleaner بنجاح. سيتم تجميع الروابط والوسائط فقط.")
     else:
         await message.reply_text("❌ هذا الأمر مخصص للمشرفين فقط.")
 
@@ -110,7 +106,7 @@ async def disable_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ensure_group(chat.id)
         cur.execute("UPDATE groups SET active=0 WHERE chat_id=?", (chat.id,))
         db.commit()
-        await message.reply_text("🛑 تم إيقاف بوت Cleaner. لن يتم جمع رسائل جديدة أو تنفيذ عمليات تنظيف.")
+        await message.reply_text("🛑 تم إيقاف بوت Cleaner.")
     else:
         await message.reply_text("❌ هذا الأمر مخصص للمشرفين فقط.")
 
@@ -124,7 +120,6 @@ async def bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = cur.fetchone()
     active_status = "مفعل ✅" if (row and row[0] == 1) else "متوقف 🛑"
     
-    # تنظيف السجلات الأقدم من 24 ساعة قبل العد
     cutoff = time.time() - 86400
     cur.execute("DELETE FROM collected_messages WHERE chat_id=? AND timestamp < ?", (chat.id, cutoff))
     db.commit()
@@ -132,7 +127,7 @@ async def bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT COUNT(*) FROM collected_messages WHERE chat_id=?", (chat.id,))
     count = cur.fetchone()[0]
     
-    await message.reply_text(f"📊 حالة بوت Cleaner:\n- الحالة: {active_status}\n- عدد الرسائل والوسائط المسجلة خلال آخر 24 ساعة: {count}")
+    await message.reply_text(f"📊 حالة بوت Cleaner:\n- الحالة: {active_status}\n- عدد الوسائط والروابط المسجلة خلال آخر 24 ساعة: {count}")
 
 async def clean_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -148,10 +143,10 @@ async def clean_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT active FROM groups WHERE chat_id=?", (chat.id,))
     row = cur.fetchone()
     if not row or row[0] == 0:
-        await message.reply_text("⚠️ البوت متوقف حالياً في هذه المجموعة. يرجى إرسال /تفعيل أولاً.")
+        await message.reply_text("⚠️ البوت متوقف حالياً. يرجى إرسال /تفعيل أولاً.")
         return
 
-    await message.reply_text("🧹 جاري فحص وحذف رسائل آخر 24 ساعة...")
+    await message.reply_text("🧹 جاري فحص وحذف الروابط والوسائط لآخر 24 ساعة...")
 
     cutoff = time.time() - 86400
     cur.execute("SELECT id, message_id FROM collected_messages WHERE chat_id=? AND timestamp >= ?", (chat.id, cutoff))
@@ -160,7 +155,6 @@ async def clean_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     deleted_success = 0
     not_available = 0
     failed_count = 0
-    remaining_in_db = 0
 
     for rec_id, msg_id in records:
         try:
@@ -170,26 +164,12 @@ async def clean_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.commit()
         except Exception as e:
             err_str = str(e).lower()
-            if "retry after" in err_str:
-                try:
-                    import re
-                    seconds = int(re.search(r'\d+', err_str).group())
-                    time.sleep(seconds + 1)
-                    await context.bot.delete_message(chat_id=chat.id, message_id=msg_id)
-                    deleted_success += 1
-                    cur.execute("DELETE FROM collected_messages WHERE id=?", (rec_id,))
-                    db.commit()
-                    continue
-                except Exception:
-                    pass
-            
-            if "message to delete not found" in err_str or "not modified" in err_str or "message can't be deleted" in err_str:
+            if "message to delete not found" in err_str or "not modified" in err_str:
                 not_available += 1
                 cur.execute("DELETE FROM collected_messages WHERE id=?", (rec_id,))
                 db.commit()
             else:
                 failed_count += 1
-                remaining_in_db += 1
 
     cur.execute("SELECT COUNT(*) FROM collected_messages WHERE chat_id=?", (chat.id,))
     total_remaining = cur.fetchone()[0]
@@ -197,9 +177,9 @@ async def clean_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = (
         f"📋 تقرير عملية التنظيف:\n\n"
         f"• تم الحذف بنجاح: {deleted_success}\n"
-        f"• رسائل غير متاحة أو سبق حذفها: {not_available}\n"
-        f"• تعذر حذفها (أخطاء مؤقتة): {failed_count}\n"
-        f"• المتبقي في قائمة السجلات: {total_remaining}"
+        f"• غير متاحة أو ممسوحة مسبقاً: {not_available}\n"
+        f"• تعذر حذفها: {failed_count}\n"
+        f"• المتبقي في القائمة: {total_remaining}"
     )
     await message.reply_text(report)
 
@@ -209,8 +189,7 @@ async def promote_mod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat or chat.type not in ["group", "supergroup"]:
         return
-
-    # فقط مشرفو تيليغرام الحقيقيون يمكنهم رفع مشرفين للبوت
+    
     is_real_admin = False
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
@@ -220,7 +199,7 @@ async def promote_mod(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     if not is_real_admin and user.id not in DEFAULT_ADMINS:
-        await message.reply_text("❌ أمر رفع المشرف مخصص لمشرفي المجموعة الحقيقيين فقط.")
+        await message.reply_text("❌ مخصص لمشرفي المجموعة الحقيقيين فقط.")
         return
 
     target_id = None
@@ -237,12 +216,12 @@ async def promote_mod(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_id = res[0]
 
     if not target_id:
-        await message.reply_text("❌ يرجى الرد على رسالة الشخص المراد رفعه أو كتابة معرفه/آيديه الصحيح.")
+        await message.reply_text("❌ رد على رسالة الشخص أو اكتب آيديه.")
         return
 
     cur.execute("INSERT OR IGNORE INTO cleaner_mods(chat_id, user_id) VALUES(?, ?)", (chat.id, target_id))
     db.commit()
-    await message.reply_text(f"✅ تم رفع المستخدم ({target_id}) مشرفاً في Cleaner بنجاح.")
+    await message.reply_text(f"✅ تم رفع المستخدم ({target_id}) مشرفاً بنجاح.")
 
 async def demote_mod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -250,7 +229,7 @@ async def demote_mod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat or chat.type not in ["group", "supergroup"]:
         return
-
+    
     is_real_admin = False
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
@@ -260,7 +239,7 @@ async def demote_mod(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     if not is_real_admin and user.id not in DEFAULT_ADMINS:
-        await message.reply_text("❌ أمر تنزيل المشرف مخصص لمشرفي المجموعة الحقيقيين فقط.")
+        await message.reply_text("❌ مخصص لمشرفي المجموعة الحقيقيين فقط.")
         return
 
     target_id = None
@@ -277,12 +256,12 @@ async def demote_mod(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_id = res[0]
 
     if not target_id:
-        await message.reply_text("❌ يرجى الرد على رسالة الشخص أو كتابة آيديه لتنزيله.")
+        await message.reply_text("❌ رد على رسالة الشخص أو اكتب آيديه.")
         return
 
     cur.execute("DELETE FROM cleaner_mods WHERE chat_id=? AND user_id=?", (chat.id, target_id))
     db.commit()
-    await message.reply_text(f"✅ تم تنزيل المستخدم ({target_id}) من مشرفي Cleaner بنجاح.")
+    await message.reply_text(f"✅ تم تنزيل المستخدم ({target_id}) بنجاح.")
 
 async def list_mods(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -292,9 +271,9 @@ async def list_mods(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT user_id FROM cleaner_mods WHERE chat_id=?", (chat.id,))
     rows = cur.fetchall()
     if not rows:
-        await message.reply_text("📋 لا يوجد مشرفون مخصصون لـ Cleaner في هذه المجموعة.")
+        await message.reply_text("📋 لا يوجد مشرفون مخصصون.")
         return
-    text = "📋 قائمة مشرفي Cleaner:\n\n"
+    text = "📋 مشرفو البوت:\n\n"
     for idx, (m_id,) in enumerate(rows, 1):
         text += f"{idx}. أيدي: {m_id}\n"
     await message.reply_text(text)
@@ -308,19 +287,17 @@ async def collect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ensure_group(chat.id)
 
-    # حفظ يوزرنيم المستخدم لكي نتمكن من استخدام الرفع/التنزيل باليوزر لاحقاً
     if user and user.username:
         cur.execute("INSERT OR REPLACE INTO users_map(chat_id, username, user_id) VALUES(?, ?, ?)", 
                     (chat.id, f"@{user.username.lower()}", user.id))
         db.commit()
 
-    # التحقق مما إذا كان البوت مفعلًا في المجموعة
     cur.execute("SELECT active FROM groups WHERE chat_id=?", (chat.id,))
     row = cur.fetchone()
     if not row or row[0] == 0:
         return
 
-    # منع تسجيل أوامر الإدارة نفسها ضمن الرسائل المراد تنظيفها
+    # استثناء الأوامر حتى لا تسجل
     if message.text:
         txt = message.text.strip()
         management_commands = ["/تفعيل", "/إيقاف", "/ايقاف", "/تنظيف", "/حالة", "/رفع_مشرف", "/تنزيل_مشرف", "/مشرفيني",
@@ -328,49 +305,56 @@ async def collect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if any(txt.startswith(cmd) for cmd in management_commands):
             return
 
-    # تحديد نوع المحتوى والوسائط
+    # تجميع الروابط والوسائط حصراً وتجاهل النصوص العادية للأعضاء تماماً
+    is_media_or_link = False
     media_type = "text"
+
     if message.photo:
         media_type = "photo"
+        is_media_or_link = True
     elif message.document:
         media_type = "document"
+        is_media_or_link = True
     elif message.video:
         media_type = "video"
+        is_media_or_link = True
     elif message.audio:
         media_type = "audio"
+        is_media_or_link = True
     elif message.voice:
         media_type = "voice"
+        is_media_or_link = True
     elif message.video_note:
         media_type = "video_note"
+        is_media_or_link = True
     elif message.animation:
         media_type = "animation"
+        is_media_or_link = True
     elif message.sticker:
         media_type = "sticker"
+        is_media_or_link = True
     elif message.text and ("http://" in message.text or "https://" in message.text or "t.me/" in message.text):
         media_type = "link"
+        is_media_or_link = True
+
+    if not is_media_or_link:
+        return
 
     current_time = time.time()
     
-    # حفظ رسالة المعرف والتاريخ في قاعدة البيانات
     cur.execute("""
     INSERT INTO collected_messages(chat_id, message_id, timestamp, user_id, media_type)
     VALUES(?, ?, ?, ?, ?)
     """, (chat.id, message.message_id, current_time, user.id if user else 0, media_type))
     db.commit()
 
-    # تنظيف تلقائي دوري للرسائل الأقدم من 24 ساعة (86400 ثانية)
     cutoff = current_time - 86400
     cur.execute("DELETE FROM collected_messages WHERE chat_id=? AND timestamp < ?", (chat.id, cutoff))
     db.commit()
 
 def main():
-    if not TOKEN:
-        print("Error: BOT_TOKEN environment variable not set.")
-        return
-
     app = Application.builder().token(TOKEN).build()
 
-    # تسجيل الأوامر الصحيحة
     app.add_handler(CommandHandler("start", start))
     
     app.add_handler(CommandHandler("clean", clean_messages))
@@ -394,10 +378,6 @@ def main():
     app.add_handler(CommandHandler("mods", list_mods))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^مشرفيني$"), list_mods))
 
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_messages))
-
-
-    # معالج تجميع كافة الرسائل والوسائط الواردة في المجموعات
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_messages))
 
     print("Cleaner Bot is running...")
