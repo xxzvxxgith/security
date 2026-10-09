@@ -2,7 +2,7 @@ import sqlite3
 import sys
 import os
 import time
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -112,18 +112,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type == "private":
         if await is_bot_admin(user.id):
             keyboard = [
-                [KeyboardButton("رفع مشرف 👤+"), KeyboardButton("تنزيل مشرف 👤-")],
-                [KeyboardButton("تعيين اشتراك إجباري 🔗"), KeyboardButton("حذف اشتراك إجباري 🗑️")],
-                [KeyboardButton("تفعيل البوت بقسم 🟢"), KeyboardButton("إيقاف البوت بقسم 🛑")]
+                [InlineKeyboardButton("رفع مشرف 👤+", callback_data="add_admin"), InlineKeyboardButton("تنزيل مشرف 👤-", callback_data="remove_admin")],
+                [InlineKeyboardButton("تعيين اشتراك إجباري 🔗", callback_data="set_sub"), InlineKeyboardButton("حذف اشتراك إجباري 🗑️", callback_data="del_sub")],
+                [InlineKeyboardButton("تفعيل البوت بقسم 🟢", callback_data="info_enable"), InlineKeyboardButton("إيقاف البوت بقسم 🛑", callback_data="info_disable")]
             ]
             await update.message.reply_text(
                 "أهلاً بك في لوحة تحكم بوت Cleaner (الخاصة بالمشرفين):\nاختر من الأزرار أدناه للتحكم:",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
         else:
             await update.message.reply_text("أهلاً بك في بوت Cleaner لتنظيف المجموعات من الروابط والوسائط.")
     else:
         await update.message.reply_text("أهلاً بك في بوت Cleaner. يعمل هذا البوت على تنظيف الوسائط والروابط خلال 24 ساعة.")
+
+async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    if not await is_bot_admin(user.id):
+        await query.message.reply_text("❌ عذراً، هذا الأمر مخصص للمشرفين العامين فقط.")
+        return
+
+    data = query.data
+
+    if data == "add_admin":
+        context.user_data["action"] = "add_admin"
+        await query.message.reply_text("أرسل آيدي الشخص أو يوزرنيمه لرفعه مشرفاً بالبوت:")
+    elif data == "remove_admin":
+        context.user_data["action"] = "remove_admin"
+        cur.execute("SELECT user_id FROM bot_admins")
+        rows = cur.fetchall()
+        txt = "قائمة المشرفين الحاليين:\n\n"
+        for (m_id,) in rows:
+            txt += f"• آيدي: {m_id}\n"
+        txt += "\nأرسل آيدي الشخص المراد تنزيله الآن:"
+        await query.message.reply_text(txt)
+    elif data == "set_sub":
+        context.user_data["action"] = "set_subscription"
+        await query.message.reply_text("أرسل معرف القناة ورابطها (مثال: @ChannelName https://t.me/ChannelName):")
+    elif data == "del_sub":
+        cur.execute("DELETE FROM subscription WHERE chat_id=0")
+        db.commit()
+        await query.message.reply_text("🗑 تم حذف وإلغاء الاشتراك الإجباري بنجاح.")
+    elif data == "info_enable":
+        await query.message.reply_text("💡 لتفعيل البوت، أضفه إلى مجموعتك وارسل كلمة: **تفعيل**")
+    elif data == "info_disable":
+        await query.message.reply_text("💡 لإيقاف البوت في مجموعة، أرسل فيها كلمة: **إيقاف**")
 
 async def private_panel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
@@ -189,7 +224,6 @@ async def private_panel_handler(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception:
                 pass
 
-            # استخراج ورابط صحيح ومنع تكرار https://t.me/
             raw_link = parts[1] if len(parts) > 1 else f"https://t.me/{channel_input.replace('@', '')}"
             raw_link = raw_link.replace("https://t.me/https://t.me/", "https://t.me/").replace("https://t.me/", "")
             group_link = f"https://t.me/{raw_link.replace('@', '')}"
@@ -204,36 +238,6 @@ async def private_panel_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await message.reply_text(f"✅ تم تفعيل الاشتراك الإجباري بنجاح على القناة.\n- الآيدي: {target_channel}\n- الرابط: {group_link}")
         else:
             await message.reply_text("❌ يرجى إرسال معرف القناة بشكل صحيح.")
-        return
-
-    if text == "رفع مشرف 👤+":
-        context.user_data["action"] = "add_admin"
-        await message.reply_text("أرسل آيدي الشخص أو يوزرنيمه لرفعه مشرفاً بالبوت:")
-        return
-    elif text == "تنزيل مشرف 👤-":
-        context.user_data["action"] = "remove_admin"
-        cur.execute("SELECT user_id FROM bot_admins")
-        rows = cur.fetchall()
-        txt = "قائمة المشرفين الحاليين:\n\n"
-        for (m_id,) in rows:
-            txt += f"• آيدي: {m_id}\n"
-        txt += "\nأرسل آيدي الشخص المراد تنزيله الآن:"
-        await message.reply_text(txt)
-        return
-    elif text == "تعيين اشتراك إجباري 🔗":
-        context.user_data["action"] = "set_subscription"
-        await message.reply_text("أرسل معرف القناة ورابطها (مثال: @ChannelName https://t.me/ChannelName):")
-        return
-    elif text == "حذف اشتراك إجباري 🗑️":
-        cur.execute("DELETE FROM subscription WHERE chat_id=0")
-        db.commit()
-        await message.reply_text("🗑 تم حذف وإلغاء الاشتراك الإجباري بنجاح.")
-        return
-    elif text == "تفعيل البوت بقسم 🟢":
-        await message.reply_text("💡 لتفعيل البوت، أضفه إلى مجموعتك وارسل كلمة: **تفعيل**")
-        return
-    elif text == "إيقاف البوت بقسم 🛑":
-        await message.reply_text("💡 لإيقاف البوت في مجموعة، أرسل فيها كلمة: **إيقاف**")
         return
 
 async def enable_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -352,7 +356,6 @@ async def collect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if any(txt.startswith(cmd) for cmd in management_commands):
             return
 
-    # فحص الاشتراك الإجباري
     cur.execute("SELECT enabled, channel, group_link FROM subscription WHERE chat_id=0 AND enabled=1")
     sub = cur.fetchone()
     if sub and user and not await is_group_admin(update, context, user.id):
@@ -437,6 +440,7 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_callback_handler))
     
     app.add_handler(CommandHandler("clean", clean_messages))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^تنظيف$"), clean_messages))
@@ -454,7 +458,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_messages))
 
-    print("Cleaner Bot is running with control panel...")
+    print("Cleaner Bot is running with inline panel...")
     app.run_polling()
 
 if __name__ == "__main__":
