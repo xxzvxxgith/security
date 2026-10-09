@@ -14,7 +14,7 @@ from telegram.ext import (
 from telegram.constants import ChatMemberStatus
 
 # ضع توكن بوتك هنا مباشرة
-TOKEN = "8707884664:AAGEbtn...توكنك_هنا"
+TOKEN = "8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY"
 
 DEFAULT_ADMINS = [1537665613, 6369115613]
 
