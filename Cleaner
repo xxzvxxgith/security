@@ -370,29 +370,32 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # تسجيل الأوامر الأساسية والأوامر العربية المباشرة بدون رموز
-    app.add_handler(CommandHandler(["start"], start))
+    # تسجيل الأوامر الصحيحة
+    app.add_handler(CommandHandler("start", start))
     
-    app.add_handler(CommandHandler(["clean", "تنظيف"], clean_messages))
+    app.add_handler(CommandHandler("clean", clean_messages))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^تنظيف$"), clean_messages))
 
-    app.add_handler(CommandHandler(["enable", "تفعيل"], enable_bot))
+    app.add_handler(CommandHandler("enable", enable_bot))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^تفعيل$"), enable_bot))
 
-    app.add_handler(CommandHandler(["disable", "إيقاف", "ايقاف"], disable_bot))
+    app.add_handler(CommandHandler("disable", disable_bot))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(إيقاف|ايقاف)$"), disable_bot))
 
-    app.add_handler(CommandHandler(["status", "حالة"], bot_status))
+    app.add_handler(CommandHandler("status", bot_status))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^حالة$"), bot_status))
 
-    app.add_handler(CommandHandler(["promote", "رفع_مشرف"], promote_mod))
+    app.add_handler(CommandHandler("promote", promote_mod))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^رفع مشرف$"), promote_mod))
 
-    app.add_handler(CommandHandler(["demote", "تنزيل_مشرف"], demote_mod))
+    app.add_handler(CommandHandler("demote", demote_mod))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^تنزيل مشرف$"), demote_mod))
 
-    app.add_handler(CommandHandler(["mods", "مشرفيني"], list_mods))
+    app.add_handler(CommandHandler("mods", list_mods))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^مشرفيني$"), list_mods))
+
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_messages))
+
 
     # معالج تجميع كافة الرسائل والوسائط الواردة في المجموعات
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_messages))
