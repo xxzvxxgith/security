@@ -1508,7 +1508,7 @@ def build_app():
 
     app = Application.builder().token(TOKEN).build()
 
-        app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^بدء$"), start))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^بدء$"), start))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(الأوامر|اوامر)$"), commands))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^لوحة$"), panel))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^روليت$"), roulette))
