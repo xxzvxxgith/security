@@ -13,6 +13,7 @@ from telegram.ext import (
 )
 from telegram.constants import ChatMemberStatus
 
+# ضع توكن بوتك الحقيقي هنا
 TOKEN = "8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY"
 
 DEFAULT_ADMINS = [1537665613, 6369115613]
@@ -180,15 +181,27 @@ async def private_panel_handler(update: Update, context: ContextTypes.DEFAULT_TY
         parts = text.split()
         if len(parts) >= 1:
             channel_input = parts[0]
-            group_link = text if len(parts) > 1 else f"https://t.me/{channel_input.replace('@', '')}"
+            target_channel = channel_input
+            try:
+                if not channel_input.startswith("-100"):
+                    chat_info = await context.bot.get_chat(channel_input if channel_input.startswith("@") else f"@{channel_input}")
+                    target_channel = str(chat_info.id)
+            except Exception:
+                pass
+
+            # استخراج ورابط صحيح ومنع تكرار https://t.me/
+            raw_link = parts[1] if len(parts) > 1 else f"https://t.me/{channel_input.replace('@', '')}"
+            raw_link = raw_link.replace("https://t.me/https://t.me/", "https://t.me/").replace("https://t.me/", "")
+            group_link = f"https://t.me/{raw_link.replace('@', '')}"
+
             cur.execute("""
             INSERT INTO subscription(chat_id, enabled, channel, group_link)
             VALUES(0, 1, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET enabled=1, channel=excluded.channel, group_link=excluded.group_link
-            """, (channel_input, group_link))
+            """, (target_channel, group_link))
             db.commit()
             context.user_data.pop("action", None)
-            await message.reply_text(f"✅ تم تفعيل الاشتراك الإجباري بنجاح على القناة: {channel_input}")
+            await message.reply_text(f"✅ تم تفعيل الاشتراك الإجباري بنجاح على القناة.\n- الآيدي: {target_channel}\n- الرابط: {group_link}")
         else:
             await message.reply_text("❌ يرجى إرسال معرف القناة بشكل صحيح.")
         return
@@ -339,15 +352,16 @@ async def collect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if any(txt.startswith(cmd) for cmd in management_commands):
             return
 
-    # فحص الاشتراك الإجباري الإلزامي لجميع الرسائل (نصوص أو ميديا)
+    # فحص الاشتراك الإجباري
     cur.execute("SELECT enabled, channel, group_link FROM subscription WHERE chat_id=0 AND enabled=1")
     sub = cur.fetchone()
     if sub and user and not await is_group_admin(update, context, user.id):
         channel = sub[1]
-        g_link = sub[2] or f"https://t.me/{channel.replace('@', '')}"
+        g_link = sub[2]
         subscribed = False
         try:
-            member = await context.bot.get_chat_member(channel, user.id)
+            target_chat = int(channel) if channel.startswith("-100") or channel.isdigit() else (channel if channel.startswith("@") else f"@{channel}")
+            member = await context.bot.get_chat_member(target_chat, user.id)
             if member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED]:
                 subscribed = True
         except Exception:
@@ -362,7 +376,7 @@ async def collect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = [[InlineKeyboardButton("اشتراك بالقناة 🔗", url=g_link)]]
             await context.bot.send_message(
                 chat.id,
-                f"عذراً {user.mention_html()}، عليك الاشتراك بالقناة لتتمكن من الكتابة والنشر هنا:\n{channel}",
+                f"عذراً {user.mention_html()}، عليك الاشتراك بالقناة لتتمكن من الكتابة والنشر هنا.",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
