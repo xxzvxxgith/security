@@ -13,7 +13,6 @@ from telegram.ext import (
 )
 from telegram.constants import ChatMemberStatus
 
-# ضع توكن بوتك الحقيقي هنا
 TOKEN = "8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY"
 
 DEFAULT_ADMINS = [1537665613, 6369115613]
@@ -181,7 +180,6 @@ async def private_panel_handler(update: Update, context: ContextTypes.DEFAULT_TY
         parts = text.split()
         if len(parts) >= 1:
             channel_input = parts[0]
-            # محاولة جلب آيدي القناة الحقيقي تلقائياً لتجنب مشاكل الفحص
             target_channel = channel_input
             try:
                 if not channel_input.startswith("-100"):
@@ -349,6 +347,36 @@ async def collect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if any(txt.startswith(cmd) for cmd in management_commands):
             return
 
+    # فحص الاشتراك الإجباري لكافة أنواع الرسائل (نصوص وعامة)
+    cur.execute("SELECT enabled, channel, group_link FROM subscription WHERE chat_id=0 AND enabled=1")
+    sub = cur.fetchone()
+    if sub and user and not await is_group_admin(update, context, user.id):
+        channel = sub[1]
+        g_link = sub[2] or f"https://t.me/{channel.replace('@', '')}"
+        subscribed = True
+        try:
+            target_chat = int(channel) if channel.startswith("-100") or channel.isdigit() else (channel if channel.startswith("@") else f"@{channel}")
+            member = await context.bot.get_chat_member(target_chat, user.id)
+            if member.status not in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED]:
+                subscribed = False
+        except Exception:
+            subscribed = True
+
+        if not subscribed:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            
+            keyboard = [[InlineKeyboardButton("اشتراك بالقناة 🔗", url=g_link)]]
+            await context.bot.send_message(
+                chat.id,
+                f"عذراً {user.mention_html()}، عليك الاشتراك بالقناة لتتمكن من الكتابة والنشر هنا.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+
     is_media_or_link = False
     media_type = "text"
 
@@ -379,37 +407,6 @@ async def collect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif message.text and ("http://" in message.text or "https://" in message.text or "t.me/" in message.text):
         media_type = "link"
         is_media_or_link = True
-
-    # فحص الاشتراك الإجباري للروابط والميديا مع حماية ضد أخطاء السيرفر
-    cur.execute("SELECT enabled, channel, group_link FROM subscription WHERE chat_id=0 AND enabled=1")
-    sub = cur.fetchone()
-    if sub and user and is_media_or_link and not await is_group_admin(update, context, user.id):
-        channel = sub[1]
-        g_link = sub[2] or f"https://t.me/{channel.replace('@', '')}"
-        subscribed = True # افتراض الأمان حتى لا يتم حظر أحد بالخطأ إذا فشل الاتصال بالقناة
-        try:
-            target_chat = int(channel) if channel.startswith("-100") or channel.isdigit() else (channel if channel.startswith("@") else f"@{channel}")
-            member = await context.bot.get_chat_member(target_chat, user.id)
-            if member.status not in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED]:
-                subscribed = False
-        except Exception:
-            # في حال حدث أي خطأ تقني في جلب العضو، نسمح له بالنشر حتى لا يتعطل البوت
-            subscribed = True
-
-        if not subscribed:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            
-            keyboard = [[InlineKeyboardButton("اشتراك بالقناة 🔗", url=g_link)]]
-            await context.bot.send_message(
-                chat.id,
-                f"عذراً {user.mention_html()}، عليك الاشتراك بالقناة لتتمكن من إرسال الروابط والوسائط.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return
 
     cur.execute("SELECT active FROM groups WHERE chat_id=?", (chat.id,))
     row = cur.fetchone()
