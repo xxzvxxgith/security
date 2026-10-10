@@ -22,7 +22,7 @@ from telegram.ext import (
 
 # ==================== الإعدادات ====================
 
-TOKEN = os.getenv("8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY", "").strip()
+TOKEN = os.getenv("BOT_TOKEN", "8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY").strip()
 OWNER_IDS = {1537665613}
 logging.basicConfig(
     level=logging.INFO,
