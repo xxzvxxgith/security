@@ -22,8 +22,11 @@ from telegram.ext import (
 
 # ==================== الإعدادات ====================
 
-TOKEN = os.getenv("BOT_TOKEN", "8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY").strip()
+TOKEN = os.getenv("8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY", "").strip()
 OWNER_IDS = {1537665613}
+DB_PATH = os.getenv("CLEANER_DB_PATH", "cleaner_bot.db")
+DAY = 86400
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
