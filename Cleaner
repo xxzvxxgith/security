@@ -18,7 +18,6 @@ from telegram.ext import (
 # ==================== الإعدادات ====================
 
 TOKEN = "8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY"
-strip()
 OWNER_IDS = {1537665613}
 DB_PATH = os.getenv("CLEANER_DB_PATH", "cleaner_bot.db")
 DAY = 86400
