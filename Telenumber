@@ -1,0 +1,681 @@
+# -*- coding: utf-8 -*-
+"""Telegram public-profile lookup bot with inline menus and owner statistics.
+Set BOT_TOKEN in the environment. Do not hardcode or share bot tokens.
+Only stores public profile details the bot can access and changes it observes.
+"""
+import os, re, time, html, sqlite3, logging, asyncio
+from contextlib import closing
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.constants import ChatType
+from telegram.error import TelegramError, RetryAfter, TimedOut, NetworkError
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+
+OWNER_ID = 1537665613
+BOT_TOKEN = "8906278700:AAGf5AZs6tKkPtROSxYjJPjLS4cuHX8tW5E"
+TG_API_ID = os.getenv("TG_API_ID", "").strip()
+TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
+TG_SESSION = os.getenv("TG_SESSION", "").strip()
+DB_PATH = os.getenv("LOOKUP_DB_PATH", "telegram_lookup.db")
+COOLDOWN = 2.0
+MAX_INPUT_LENGTH = 100
+MAX_HISTORY_RESULTS = 10
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("telegram_lookup")
+db_lock = asyncio.Lock()
+telethon_client = None
+
+
+# ---------- Database ----------
+def init_db():
+    with closing(sqlite3.connect(DB_PATH, timeout=15)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS profiles(
+          user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT NOT NULL DEFAULT '',
+          last_name TEXT NOT NULL DEFAULT '', is_bot INTEGER NOT NULL DEFAULT 0,
+          first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS name_history(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, username TEXT,
+          first_name TEXT NOT NULL DEFAULT '', last_name TEXT NOT NULL DEFAULT '', observed_at INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_history_user ON name_history(user_id, observed_at DESC);
+        CREATE TABLE IF NOT EXISTS usage(user_id INTEGER PRIMARY KEY, last_request REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS bot_users(
+          user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT NOT NULL DEFAULT '',
+          first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+        """)
+        conn.commit()
+
+
+async def db_execute(sql, params=(), one=False, all_rows=False):
+    async with db_lock:
+        with closing(sqlite3.connect(DB_PATH, timeout=15)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(sql, params)
+            result = cur.fetchone() if one else cur.fetchall() if all_rows else None
+            conn.commit()
+            return result
+
+
+async def record_user(user):
+    if not user:
+        return
+    now = int(time.time())
+    await db_execute("""INSERT INTO bot_users(user_id,username,first_name,first_seen,last_seen)
+      VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
+      first_name=excluded.first_name,last_seen=excluded.last_seen""",
+      (user.id, user.username, user.first_name or "", now, now))
+
+
+async def save_profile(user_id, username, first_name, last_name, is_bot=False):
+    now, username = int(time.time()), (username or "").lstrip("@") or None
+    first_name, last_name = first_name or "", last_name or ""
+    old = await db_execute(
+        "SELECT username,first_name,last_name FROM profiles WHERE user_id=?",
+        (int(user_id),), one=True
+    )
+    changed = old is not None and (
+        old["username"] != username
+        or old["first_name"] != first_name
+        or old["last_name"] != last_name
+    )
+
+    if old is None:
+        await db_execute("""INSERT INTO profiles
+          (user_id,username,first_name,last_name,is_bot,first_seen,last_seen)
+          VALUES(?,?,?,?,?,?,?)""",
+          (int(user_id), username, first_name, last_name, int(bool(is_bot)), now, now))
+        await db_execute("""INSERT INTO name_history
+          (user_id,username,first_name,last_name,observed_at)
+          VALUES(?,?,?,?,?)""",
+          (int(user_id), username, first_name, last_name, now))
+    else:
+        if changed:
+            await db_execute("""INSERT INTO name_history
+              (user_id,username,first_name,last_name,observed_at)
+              VALUES(?,?,?,?,?)""",
+              (int(user_id), username, first_name, last_name, now))
+        await db_execute("""UPDATE profiles
+          SET username=?,first_name=?,last_name=?,is_bot=?,last_seen=?
+          WHERE user_id=?""",
+          (username, first_name, last_name, int(bool(is_bot)), now, int(user_id)))
+
+
+async def get_profile(user_id):
+    return await db_execute(
+        "SELECT * FROM profiles WHERE user_id=?",
+        (int(user_id),), one=True
+    )
+
+
+async def get_history(user_id):
+    return await db_execute("""SELECT username,first_name,last_name,observed_at
+      FROM name_history WHERE user_id=?
+      ORDER BY observed_at DESC LIMIT ?""",
+      (int(user_id), MAX_HISTORY_RESULTS), all_rows=True)
+
+
+async def cooldown_ok(user_id):
+    now = time.time()
+    async with db_lock:
+        with closing(sqlite3.connect(DB_PATH, timeout=15)) as conn:
+            row = conn.execute(
+                "SELECT last_request FROM usage WHERE user_id=?",
+                (int(user_id),)
+            ).fetchone()
+
+            if row and now - float(row[0]) < COOLDOWN:
+                return False
+
+            conn.execute("""INSERT INTO usage(user_id,last_request)
+              VALUES(?,?) ON CONFLICT(user_id)
+              DO UPDATE SET last_request=excluded.last_request""",
+              (int(user_id), now))
+            conn.commit()
+    return True
+
+
+# ---------- Optional Telethon ----------
+async def start_telethon():
+    global telethon_client
+
+    if not (TG_API_ID and TG_API_HASH and TG_SESSION):
+        log.info("Telethon disabled; Bot API/local archive only.")
+        return
+
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+
+        client = TelegramClient(
+            StringSession(TG_SESSION),
+            int(TG_API_ID),
+            TG_API_HASH,
+            connection_retries=2,
+            request_retries=2,
+            auto_reconnect=True
+        )
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            log.error("Telethon session is not authorized.")
+            await client.disconnect()
+            return
+
+        telethon_client = client
+        log.info("Telethon session connected.")
+
+    except Exception:
+        log.exception("Telethon startup failed.")
+        telethon_client = None
+
+
+async def lookup_mtproto(query):
+    if telethon_client is None:
+        return None
+
+    try:
+        target = int(query) if query.isdigit() else query.lstrip("@")
+        entity = await telethon_client.get_entity(target)
+
+        if not hasattr(entity, "first_name") or not hasattr(entity, "id"):
+            return None
+
+        return {
+            "id": int(entity.id),
+            "username": getattr(entity, "username", None),
+            "first_name": getattr(entity, "first_name", None) or "",
+            "last_name": getattr(entity, "last_name", None) or "",
+            "is_bot": bool(getattr(entity, "bot", False))
+        }
+
+    except Exception as exc:
+        log.info("MTProto lookup unavailable: %s", type(exc).__name__)
+        return None
+
+
+# ---------- UI helpers ----------
+def esc(x):
+    return html.escape(str(x or ""), quote=True)
+
+
+def fmt_time(ts):
+    if not ts:
+        return "غير متوفر"
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts))
+
+
+def valid_query(raw):
+    value = (raw or "").strip()
+
+    if not value or len(value) > MAX_INPUT_LENGTH:
+        return None
+
+    if value.isdigit():
+        try:
+            n = int(value)
+            return str(n) if 0 < n <= 9_223_372_036_854_775_807 else None
+        except ValueError:
+            return None
+
+    username = value[1:] if value.startswith("@") else value
+
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", username):
+        return "@" + username
+
+    return None
+
+
+def main_keyboard(is_owner=False):
+    rows = [
+        [
+            InlineKeyboardButton("🔎 بحث عن حساب", callback_data="search"),
+            InlineKeyboardButton("🗂 سجل الأسماء", callback_data="history_help")
+        ],
+        [
+            InlineKeyboardButton("📘 طريقة الاستخدام", callback_data="help"),
+            InlineKeyboardButton("🛡️ حول البوت", callback_data="about")
+        ]
+    ]
+
+    if is_owner:
+        rows.append([
+            InlineKeyboardButton("⚙️ لوحة المالك", callback_data="owner")
+        ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def back_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="home")]
+    ])
+
+
+def owner_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data="stats")],
+        [InlineKeyboardButton("🔄 تحديث اللوحة", callback_data="owner")],
+        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="home")]
+    ])
+
+
+async def edit_menu(q, text, markup=None):
+    try:
+        await q.edit_message_text(
+            text, parse_mode="HTML", reply_markup=markup
+        )
+    except TelegramError:
+        if q.message:
+            await q.message.reply_text(
+                text, parse_mode="HTML", reply_markup=markup
+            )
+
+
+async def render_profile(p, source):
+    uid = int(p["id"])
+
+    await save_profile(
+        uid, p.get("username"), p.get("first_name"),
+        p.get("last_name"), p.get("is_bot", False)
+    )
+
+    history = await get_history(uid)
+
+    name = (
+        (p.get("first_name") or "") + " " +
+        (p.get("last_name") or "")
+    ).strip() or "غير متوفر"
+
+    username = (
+        "@" + esc(p.get("username"))
+        if p.get("username") else "غير متوفر"
+    )
+
+    lines = [
+        "🔎 <b>نتيجة البحث</b>",
+        "",
+        f"🆔 <b>الآيدي:</b> <code>{uid}</code>",
+        f"👤 <b>الاسم:</b> {esc(name)}",
+        f"🔗 <b>اليوزرنيم:</b> {username}",
+        f"🤖 <b>نوع الحساب:</b> {'بوت' if p.get('is_bot') else 'حساب مستخدم أو غير محدد'}",
+        f"📡 <b>المصدر:</b> {esc(source)}",
+        "",
+        "🕓 <b>الأسماء التي رصدها البوت:</b>"
+    ]
+
+    if history:
+        for item in history:
+            n = (
+                (item["first_name"] or "") + " " +
+                (item["last_name"] or "")
+            ).strip() or "اسم غير متوفر"
+
+            u = (
+                "@" + item["username"]
+                if item["username"] else "بدون يوزرنيم"
+            )
+
+            lines.append(
+                f"• {esc(n)} — {esc(u)}\n"
+                f"  <i>{esc(fmt_time(item['observed_at']))}</i>"
+            )
+    else:
+        lines.append("• لا توجد سجلات سابقة.")
+
+    lines += [
+        "",
+        "⚠️ <i>الأرشيف يبدأ من وقت رصد البوت للحساب.</i>",
+        "🔒 <i>لا يعرض أرقام الهواتف المخفية أو البيانات الخاصة.</i>"
+    ]
+
+    return "\n".join(lines)
+
+
+# ---------- Commands ----------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.effective_message
+
+    if not user or not msg:
+        return
+
+    await record_user(user)
+    await save_profile(
+        user.id, user.username, user.first_name,
+        user.last_name, user.is_bot
+    )
+
+    await msg.reply_text(
+        "👋 <b>أهلاً بيك ببوت البحث عن الحسابات العامة</b>\n\n"
+        "اختار من الأزرار، أو أرسل يوزرنيم مثل <code>@username</code>.\n"
+        "تگدر ترسل آيدي رقمي إذا كان الحساب متاحاً.",
+        parse_mode="HTML",
+        reply_markup=main_keyboard(user.id == OWNER_ID)
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user:
+        await record_user(update.effective_user)
+
+    await update.effective_message.reply_text(
+        "📘 <b>طريقة الاستخدام</b>\n\n"
+        "• أرسل يوزرنيم مثل <code>@username</code>.\n"
+        "• أو أرسل آيدي رقمي إذا كان الحساب متاحاً.\n"
+        "• <code>/history 123456789</code> يعرض السجل المحلي.\n\n"
+        "الوصول إلى كل الحسابات غير مضمون، ولا يمكن كشف رقم هاتف مخفي.",
+        parse_mode="HTML",
+        reply_markup=back_keyboard()
+    )
+
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user:
+        await record_user(update.effective_user)
+
+    msg = update.effective_message
+
+    if not context.args or not context.args[0].isdigit():
+        await msg.reply_text(
+            "الاستخدام الصحيح: <code>/history 123456789</code>",
+            parse_mode="HTML",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    uid = int(context.args[0])
+    history = await get_history(uid)
+
+    if not history:
+        await msg.reply_text(
+            "ماكو أسماء محفوظة لهذا الآيدي بقاعدة بيانات البوت.",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    lines = [f"🗂 <b>الأسماء المرصودة للآيدي</b> <code>{uid}</code>\n"]
+
+    for item in history:
+        n = (
+            (item["first_name"] or "") + " " +
+            (item["last_name"] or "")
+        ).strip() or "اسم غير متوفر"
+
+        u = "@" + item["username"] if item["username"] else "بدون يوزرنيم"
+
+        lines.append(
+            f"• {esc(n)} — {esc(u)}\n"
+            f"  <i>{esc(fmt_time(item['observed_at']))}</i>"
+        )
+
+    await msg.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=back_keyboard()
+    )
+
+
+async def search_query(update, context, raw):
+    user = update.effective_user
+    msg = update.effective_message
+
+    if not user or not msg:
+        return
+
+    await record_user(user)
+
+    if not await cooldown_ok(user.id):
+        await msg.reply_text("⏳ تمهّل شوي قبل البحث مرة ثانية.")
+        return
+
+    query = valid_query(raw)
+
+    if not query:
+        await msg.reply_text(
+            "❌ الصيغة مو صحيحة. أرسل يوزرنيم صحيح أو آيدي رقمي.",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    status = await msg.reply_text("🔎 جارٍ البحث عن المعلومات المتاحة...")
+
+    profile = await lookup_mtproto(query)
+    source = "جلسة Telethon المصرح بها"
+
+    if profile is None and query.startswith("@"):
+        try:
+            chat = await context.bot.get_chat(query)
+
+            if chat.type == ChatType.PRIVATE:
+                profile = {
+                    "id": int(chat.id),
+                    "username": getattr(chat, "username", None),
+                    "first_name": getattr(chat, "first_name", None) or "",
+                    "last_name": getattr(chat, "last_name", None) or "",
+                    "is_bot": bool(getattr(chat, "is_bot", False))
+                }
+                source = "Telegram Bot API"
+
+        except TelegramError as exc:
+            log.info("Bot API lookup unavailable: %s", type(exc).__name__)
+
+    if profile is None and query.isdigit():
+        archived = await get_profile(int(query))
+
+        if archived:
+            profile = {
+                "id": int(archived["user_id"]),
+                "username": archived["username"],
+                "first_name": archived["first_name"],
+                "last_name": archived["last_name"],
+                "is_bot": bool(archived["is_bot"])
+            }
+            source = "الأرشيف المحلي"
+
+    if profile is None:
+        await status.edit_text(
+            "ما گدرت أوصل لهذا الحساب.\n"
+            "تأكد من اليوزرنيم؛ البحث بالآيدي وحده ما يضمن الوصول.",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    try:
+        result = await render_profile(profile, source)
+
+        await status.edit_text(
+            result,
+            parse_mode="HTML",
+            reply_markup=back_keyboard()
+        )
+
+    except TelegramError:
+        log.exception("Failed to send search result")
+        await msg.reply_text("صار خطأ أثناء إرسال النتيجة. جرّب مرة ثانية.")
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+
+    if not msg or not user or msg.chat.type != ChatType.PRIVATE:
+        return
+
+    raw = (msg.text or "").strip()
+
+    if raw:
+        await search_query(update, context, raw)
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+
+    if not q:
+        return
+
+    await q.answer()
+
+    user = q.from_user
+    data = q.data or ""
+
+    await record_user(user)
+
+    if data == "home":
+        await edit_menu(
+            q,
+            "🏠 <b>القائمة الرئيسية</b>\nاختار الخدمة المطلوبة:",
+            main_keyboard(user.id == OWNER_ID)
+        )
+
+    elif data == "search":
+        await edit_menu(
+            q,
+            "🔎 <b>البحث عن حساب</b>\n\n"
+            "أرسل يوزرنيم مثل <code>@username</code> أو آيدي رقمي.",
+            back_keyboard()
+        )
+
+    elif data == "history_help":
+        await edit_menu(
+            q,
+            "🗂 <b>سجل الأسماء</b>\n\n"
+            "أرسل الأمر بهذا الشكل:\n"
+            "<code>/history 123456789</code>\n"
+            "السجل يحفظ فقط التغييرات التي رصدها البوت.",
+            back_keyboard()
+        )
+
+    elif data == "help":
+        await edit_menu(
+            q,
+            "📘 <b>طريقة الاستخدام</b>\n\n"
+            "• ابحث بيوزرنيم أو آيدي متاح.\n"
+            "• الأرشيف محلي ويبدأ من وقت الرصد.\n"
+            "• الوصول إلى كل الحسابات غير مضمون.\n"
+            "• لا توجد ميزة لكشف الأرقام المخفية.",
+            back_keyboard()
+        )
+
+    elif data == "about":
+        await edit_menu(
+            q,
+            "🛡️ <b>حول البوت</b>\n"
+            "يعرض معلومات عامة متاحة ويحفظ التغييرات التي يلاحظها. "
+            "لا يفتح الحسابات الخاصة ولا يستخرج معلومات مخفية.",
+            back_keyboard()
+        )
+
+    elif data == "owner":
+        if user.id != OWNER_ID:
+            await edit_menu(
+                q, "⛔ هذه اللوحة مخصصة لمالك البوت.", back_keyboard()
+            )
+            return
+
+        await edit_menu(
+            q,
+            "⚙️ <b>لوحة المالك</b>\n"
+            "من هنا تراجع إحصائيات الأرشيف والمستخدمين المسجلين.",
+            owner_keyboard()
+        )
+
+    elif data == "stats":
+        if user.id != OWNER_ID:
+            await edit_menu(
+                q, "⛔ هذا الخيار مخصص للمالك.", back_keyboard()
+            )
+            return
+
+        pc = await db_execute(
+            "SELECT COUNT(*) AS n FROM profiles", one=True
+        )
+        hc = await db_execute(
+            "SELECT COUNT(*) AS n FROM name_history", one=True
+        )
+        uc = await db_execute(
+            "SELECT COUNT(*) AS n FROM bot_users", one=True
+        )
+
+        await edit_menu(
+            q,
+            "📊 <b>إحصائيات البوت</b>\n\n"
+            f"👥 المستخدمون المسجلون: <code>{uc['n']}</code>\n"
+            f"🔎 الحسابات المؤرشفة: <code>{pc['n']}</code>\n"
+            f"🗂 سجلات الأسماء: <code>{hc['n']}</code>\n"
+            f"🕒 وقت الخادم: <code>{esc(fmt_time(int(time.time())))}</code>",
+            owner_keyboard()
+        )
+
+
+# ---------- Startup ----------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+
+    if isinstance(err, RetryAfter):
+        log.warning("Telegram rate limit reached")
+
+    elif isinstance(err, (TimedOut, NetworkError)):
+        log.warning("Temporary network issue: %s", type(err).__name__)
+
+    else:
+        log.error(
+            "Unhandled error: %s",
+            type(err).__name__ if err else "unknown",
+            exc_info=err
+        )
+
+
+async def post_init(app: Application):
+    init_db()
+    await start_telethon()
+
+    await app.bot.set_my_commands([
+        BotCommand("start", "فتح القائمة الرئيسية"),
+        BotCommand("help", "طريقة الاستخدام"),
+        BotCommand("history", "عرض سجل الأسماء المرصودة")
+    ])
+
+    log.info("Bot initialized; owner ID=%s", OWNER_ID)
+
+
+async def post_shutdown(app: Application):
+    global telethon_client
+
+    if telethon_client is not None:
+        try:
+            await telethon_client.disconnect()
+        except Exception:
+            log.exception("Telethon disconnect failed")
+
+        telethon_client = None
+
+
+def main():
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
+    )
+    app.add_error_handler(error_handler)
+
+    log.info("Starting Telegram profile lookup bot...")
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False
+    )
+
+
+if __name__ == "__main__":
+    main()
