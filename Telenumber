@@ -1,48 +1,114 @@
 # -*- coding: utf-8 -*-
-"""Telegram public-profile lookup bot with inline menus and owner statistics.
-Set BOT_TOKEN in the environment. Do not hardcode or share bot tokens.
-Only stores public profile details the bot can access and changes it observes.
 """
-import os, re, time, html, sqlite3, logging, asyncio
+Telegram Public Profile Lookup & Archive Bot (Professional Edition)
+- Fully public search for all users.
+- Owner-only administrative dashboard and CSV export.
+- SQLite persistent storage for profiles, name history, user stats, and local profile photo archiving.
+- Optional Telethon support.
+"""
+
+import os
+import re
+import time
+import html
+import sqlite3
+import logging
+import asyncio
+import csv
+import io
 from contextlib import closing
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from datetime import datetime, timezone
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    InputFile,
+)
 from telegram.constants import ChatType
 from telegram.error import TelegramError, RetryAfter, TimedOut, NetworkError
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+# ==================== CONFIGURATION ====================
 
 OWNER_ID = 1537665613
 BOT_TOKEN = "8906278700:AAGf5AZs6tKkPtROSxYjJPjLS4cuHX8tW5E"
+
 TG_API_ID = os.getenv("TG_API_ID", "").strip()
 TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
 TG_SESSION = os.getenv("TG_SESSION", "").strip()
+
 DB_PATH = os.getenv("LOOKUP_DB_PATH", "telegram_lookup.db")
+PHOTOS_DIR = "archived_photos"
+
 COOLDOWN = 2.0
 MAX_INPUT_LENGTH = 100
 MAX_HISTORY_RESULTS = 10
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 log = logging.getLogger("telegram_lookup")
+
 db_lock = asyncio.Lock()
 telethon_client = None
 
 
-# ---------- Database ----------
+# ==================== DATABASE SETUP ====================
+
 def init_db():
+    os.makedirs(PHOTOS_DIR, exist_ok=True)
     with closing(sqlite3.connect(DB_PATH, timeout=15)) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS profiles(
-          user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT NOT NULL DEFAULT '',
-          last_name TEXT NOT NULL DEFAULT '', is_bot INTEGER NOT NULL DEFAULT 0,
-          first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT NOT NULL DEFAULT '',
+            last_name TEXT NOT NULL DEFAULT '',
+            is_bot INTEGER NOT NULL DEFAULT 0,
+            photo_path TEXT,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS name_history(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, username TEXT,
-          first_name TEXT NOT NULL DEFAULT '', last_name TEXT NOT NULL DEFAULT '', observed_at INTEGER NOT NULL);
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT NOT NULL DEFAULT '',
+            last_name TEXT NOT NULL DEFAULT '',
+            observed_at INTEGER NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_history_user ON name_history(user_id, observed_at DESC);
-        CREATE TABLE IF NOT EXISTS usage(user_id INTEGER PRIMARY KEY, last_request REAL NOT NULL);
+        
+        CREATE TABLE IF NOT EXISTS usage(
+            user_id INTEGER PRIMARY KEY,
+            last_request REAL NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS bot_users(
-          user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT NOT NULL DEFAULT '',
-          first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT NOT NULL DEFAULT '',
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS search_logs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            query TEXT NOT NULL,
+            success INTEGER NOT NULL,
+            source TEXT,
+            searched_at INTEGER NOT NULL
+        );
         """)
         conn.commit()
 
@@ -52,7 +118,7 @@ async def db_execute(sql, params=(), one=False, all_rows=False):
         with closing(sqlite3.connect(DB_PATH, timeout=15)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.execute(sql, params)
-            result = cur.fetchone() if one else cur.fetchall() if all_rows else None
+            result = cur.fetchone() if one else (cur.fetchall() if all_rows else None)
             conn.commit()
             return result
 
@@ -61,17 +127,32 @@ async def record_user(user):
     if not user:
         return
     now = int(time.time())
-    await db_execute("""INSERT INTO bot_users(user_id,username,first_name,first_seen,last_seen)
-      VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
-      first_name=excluded.first_name,last_seen=excluded.last_seen""",
-      (user.id, user.username, user.first_name or "", now, now))
+    await db_execute("""
+        INSERT INTO bot_users(user_id, username, first_name, first_seen, last_seen)
+        VALUES(?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            last_seen=excluded.last_seen
+    """, (user.id, user.username, user.first_name or "", now, now))
 
 
-async def save_profile(user_id, username, first_name, last_name, is_bot=False):
-    now, username = int(time.time()), (username or "").lstrip("@") or None
-    first_name, last_name = first_name or "", last_name or ""
+async def log_search(user_id, query, success, source):
+    now = int(time.time())
+    await db_execute("""
+        INSERT INTO search_logs(user_id, query, success, source, searched_at)
+        VALUES(?, ?, ?, ?, ?)
+    """, (user_id, query, int(success), source, now))
+
+
+async def save_profile(user_id, username, first_name, last_name, is_bot=False, photo_path=None):
+    now = int(time.time())
+    username = (username or "").lstrip("@") or None
+    first_name = first_name or ""
+    last_name = last_name or ""
+
     old = await db_execute(
-        "SELECT username,first_name,last_name FROM profiles WHERE user_id=?",
+        "SELECT username, first_name, last_name, photo_path FROM profiles WHERE user_id=?",
         (int(user_id),), one=True
     )
     changed = old is not None and (
@@ -80,73 +161,67 @@ async def save_profile(user_id, username, first_name, last_name, is_bot=False):
         or old["last_name"] != last_name
     )
 
+    final_photo = photo_path or (old["photo_path"] if old else None)
+
     if old is None:
-        await db_execute("""INSERT INTO profiles
-          (user_id,username,first_name,last_name,is_bot,first_seen,last_seen)
-          VALUES(?,?,?,?,?,?,?)""",
-          (int(user_id), username, first_name, last_name, int(bool(is_bot)), now, now))
-        await db_execute("""INSERT INTO name_history
-          (user_id,username,first_name,last_name,observed_at)
-          VALUES(?,?,?,?,?)""",
-          (int(user_id), username, first_name, last_name, now))
+        await db_execute("""
+            INSERT INTO profiles(user_id, username, first_name, last_name, is_bot, photo_path, first_seen, last_seen)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        """, (int(user_id), username, first_name, last_name, int(bool(is_bot)), final_photo, now, now))
+        await db_execute("""
+            INSERT INTO name_history(user_id, username, first_name, last_name, observed_at)
+            VALUES(?, ?, ?, ?, ?)
+        """, (int(user_id), username, first_name, last_name, now))
     else:
         if changed:
-            await db_execute("""INSERT INTO name_history
-              (user_id,username,first_name,last_name,observed_at)
-              VALUES(?,?,?,?,?)""",
-              (int(user_id), username, first_name, last_name, now))
-        await db_execute("""UPDATE profiles
-          SET username=?,first_name=?,last_name=?,is_bot=?,last_seen=?
-          WHERE user_id=?""",
-          (username, first_name, last_name, int(bool(is_bot)), now, int(user_id)))
+            await db_execute("""
+                INSERT INTO name_history(user_id, username, first_name, last_name, observed_at)
+                VALUES(?, ?, ?, ?, ?)
+            """, (int(user_id), username, first_name, last_name, now))
+        await db_execute("""
+            UPDATE profiles
+            SET username=?, first_name=?, last_name=?, is_bot=?, photo_path=COALESCE(?, photo_path), last_seen=?
+            WHERE user_id=?
+        """, (username, first_name, last_name, int(bool(is_bot)), final_photo, now, int(user_id)))
 
 
 async def get_profile(user_id):
-    return await db_execute(
-        "SELECT * FROM profiles WHERE user_id=?",
-        (int(user_id),), one=True
-    )
+    return await db_execute("SELECT * FROM profiles WHERE user_id=?", (int(user_id),), one=True)
 
 
 async def get_history(user_id):
-    return await db_execute("""SELECT username,first_name,last_name,observed_at
-      FROM name_history WHERE user_id=?
-      ORDER BY observed_at DESC LIMIT ?""",
-      (int(user_id), MAX_HISTORY_RESULTS), all_rows=True)
+    return await db_execute("""
+        SELECT username, first_name, last_name, observed_at
+        FROM name_history WHERE user_id=?
+        ORDER BY observed_at DESC LIMIT ?
+    """, (int(user_id), MAX_HISTORY_RESULTS), all_rows=True)
 
 
 async def cooldown_ok(user_id):
     now = time.time()
     async with db_lock:
         with closing(sqlite3.connect(DB_PATH, timeout=15)) as conn:
-            row = conn.execute(
-                "SELECT last_request FROM usage WHERE user_id=?",
-                (int(user_id),)
-            ).fetchone()
-
+            row = conn.execute("SELECT last_request FROM usage WHERE user_id=?", (int(user_id),)).fetchone()
             if row and now - float(row[0]) < COOLDOWN:
                 return False
-
-            conn.execute("""INSERT INTO usage(user_id,last_request)
-              VALUES(?,?) ON CONFLICT(user_id)
-              DO UPDATE SET last_request=excluded.last_request""",
-              (int(user_id), now))
+            conn.execute("""
+                INSERT INTO usage(user_id, last_request) VALUES(?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET last_request=excluded.last_request
+            """, (int(user_id), now))
             conn.commit()
     return True
 
 
-# ---------- Optional Telethon ----------
+# ==================== TELETHON INTEGRATION ====================
+
 async def start_telethon():
     global telethon_client
-
     if not (TG_API_ID and TG_API_HASH and TG_SESSION):
-        log.info("Telethon disabled; Bot API/local archive only.")
+        log.info("Telethon disabled; using Bot API and local archive.")
         return
-
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
-
         client = TelegramClient(
             StringSession(TG_SESSION),
             int(TG_API_ID),
@@ -156,15 +231,12 @@ async def start_telethon():
             auto_reconnect=True
         )
         await client.connect()
-
         if not await client.is_user_authorized():
             log.error("Telethon session is not authorized.")
             await client.disconnect()
             return
-
         telethon_client = client
-        log.info("Telethon session connected.")
-
+        log.info("Telethon session connected successfully.")
     except Exception:
         log.exception("Telethon startup failed.")
         telethon_client = None
@@ -173,28 +245,38 @@ async def start_telethon():
 async def lookup_mtproto(query):
     if telethon_client is None:
         return None
-
     try:
         target = int(query) if query.isdigit() else query.lstrip("@")
         entity = await telethon_client.get_entity(target)
-
-        if not hasattr(entity, "first_name") or not hasattr(entity, "id"):
+        if not hasattr(entity, "id"):
             return None
+        
+        # محاولة حفظ صورة الحساب إذا وجدت
+        photo_path = None
+        try:
+            profile_photos = await telethon_client.get_profile_photos(entity, limit=1)
+            if profile_photos:
+                filename = f"{entity.id}_{int(time.time())}.jpg"
+                photo_path = os.path.join(PHOTOS_DIR, filename)
+                await telethon_client.download_profile_photo(entity, file=photo_path)
+        except Exception:
+            pass
 
         return {
             "id": int(entity.id),
             "username": getattr(entity, "username", None),
             "first_name": getattr(entity, "first_name", None) or "",
             "last_name": getattr(entity, "last_name", None) or "",
-            "is_bot": bool(getattr(entity, "bot", False))
+            "is_bot": bool(getattr(entity, "bot", False)),
+            "photo_path": photo_path,
         }
-
     except Exception as exc:
         log.info("MTProto lookup unavailable: %s", type(exc).__name__)
         return None
 
 
-# ---------- UI helpers ----------
+# ==================== UI & HELPERS ====================
+
 def esc(x):
     return html.escape(str(x or ""), quote=True)
 
@@ -205,44 +287,54 @@ def fmt_time(ts):
     return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts))
 
 
+def estimate_creation_date(user_id):
+    """تقدير تقريبي لتاريخ إنشاء الحساب استناداً إلى تسلسل IDs في تيليجرام (غير رسمي)"""
+    if not str(user_id).isdigit():
+        return "غير متاح"
+    uid = int(user_id)
+    # تقريب زمني تقريبي جداً بناءً على المعرفات التاريخية
+    if uid < 100_000_000:
+        return "تقديري: مبكر جداً (قبل 2016)"
+    elif uid < 500_000_000:
+        return "تقديري: بين 2016 و 2019"
+    elif uid < 1_000_000_000:
+        return "تقديري: بين 2019 و 2021"
+    else:
+        return "تقديري: حديث (بعد 2021)"
+
+
 def valid_query(raw):
     value = (raw or "").strip()
-
     if not value or len(value) > MAX_INPUT_LENGTH:
         return None
-
     if value.isdigit():
         try:
             n = int(value)
             return str(n) if 0 < n <= 9_223_372_036_854_775_807 else None
         except ValueError:
             return None
-
     username = value[1:] if value.startswith("@") else value
-
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", username):
         return "@" + username
-
     return None
 
 
 def main_keyboard(is_owner=False):
     rows = [
         [
-            InlineKeyboardButton("🔎 بحث عن حساب", callback_data="search"),
+            InlineKeyboardButton("🔎 بحث عن حساب", callback_data="search_prompt"),
             InlineKeyboardButton("🗂 سجل الأسماء", callback_data="history_help")
         ],
         [
-            InlineKeyboardButton("📘 طريقة الاستخدام", callback_data="help"),
-            InlineKeyboardButton("🛡️ حول البوت", callback_data="about")
+            InlineKeyboardButton("📊 إحصائياتي", callback_data="my_stats"),
+            InlineKeyboardButton("📖 طريقة الاستخدام", callback_data="help")
+        ],
+        [
+            InlineKeyboardButton("ℹ️ حول البوت", callback_data="about")
         ]
     ]
-
     if is_owner:
-        rows.append([
-            InlineKeyboardButton("⚙️ لوحة المالك", callback_data="owner")
-        ])
-
+        rows.append([InlineKeyboardButton("⚙️ لوحة تحكم المالك", callback_data="owner")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -254,7 +346,8 @@ def back_keyboard():
 
 def owner_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 الإحصائيات", callback_data="stats")],
+        [InlineKeyboardButton("📊 إحصائيات البوت الشاملة", callback_data="stats")],
+        [InlineKeyboardButton("📤 تصدير السجلات CSV", callback_data="export_csv")],
         [InlineKeyboardButton("🔄 تحديث اللوحة", callback_data="owner")],
         [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="home")]
     ])
@@ -262,94 +355,65 @@ def owner_keyboard():
 
 async def edit_menu(q, text, markup=None):
     try:
-        await q.edit_message_text(
-            text, parse_mode="HTML", reply_markup=markup
-        )
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     except TelegramError:
         if q.message:
-            await q.message.reply_text(
-                text, parse_mode="HTML", reply_markup=markup
-            )
+            await q.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def render_profile(p, source):
     uid = int(p["id"])
-
     await save_profile(
         uid, p.get("username"), p.get("first_name"),
-        p.get("last_name"), p.get("is_bot", False)
+        p.get("last_name"), p.get("is_bot", False), p.get("photo_path")
     )
-
     history = await get_history(uid)
 
-    name = (
-        (p.get("first_name") or "") + " " +
-        (p.get("last_name") or "")
-    ).strip() or "غير متوفر"
-
-    username = (
-        "@" + esc(p.get("username"))
-        if p.get("username") else "غير متوفر"
-    )
+    name = ((p.get("first_name") or "") + " " + (p.get("last_name") or "")).strip() or "غير متوفر"
+    username = "@" + esc(p.get("username")) if p.get("username") else "غير متوفر"
+    creation_est = estimate_creation_date(uid)
 
     lines = [
-        "🔎 <b>نتيجة البحث</b>",
+        "🔎 <b>نتيجة البحث المباشر</b>",
         "",
         f"🆔 <b>الآيدي:</b> <code>{uid}</code>",
         f"👤 <b>الاسم:</b> {esc(name)}",
         f"🔗 <b>اليوزرنيم:</b> {username}",
-        f"🤖 <b>نوع الحساب:</b> {'بوت' if p.get('is_bot') else 'حساب مستخدم أو غير محدد'}",
-        f"📡 <b>المصدر:</b> {esc(source)}",
+        f"🤖 <b>نوع الحساب:</b> {'بوت' if p.get('is_bot') else 'حساب مستخدم'}",
+        f"📅 <b>تاريخ الإنشاء (تقديري):</b> {esc(creation_est)}",
+        f"📡 <b>مصدر البيانات:</b> {esc(source)}",
         "",
-        "🕓 <b>الأسماء التي رصدها البوت:</b>"
+        "🕓 <b>سجل التغييرات المرصودة:</b>"
     ]
 
     if history:
         for item in history:
-            n = (
-                (item["first_name"] or "") + " " +
-                (item["last_name"] or "")
-            ).strip() or "اسم غير متوفر"
-
-            u = (
-                "@" + item["username"]
-                if item["username"] else "بدون يوزرنيم"
-            )
-
-            lines.append(
-                f"• {esc(n)} — {esc(u)}\n"
-                f"  <i>{esc(fmt_time(item['observed_at']))}</i>"
-            )
+            n = ((item["first_name"] or "") + " " + (item["last_name"] or "")).strip() or "غير متوفر"
+            u = "@" + item["username"] if item["username"] else "بدون يوزرنيم"
+            lines.append(f"• {esc(n)} — {esc(u)}\n  <i>{esc(fmt_time(item['observed_at']))}</i>")
     else:
-        lines.append("• لا توجد سجلات سابقة.")
+        lines.append("• لا توجد سجلات سابقة مسجلة.")
 
     lines += [
         "",
-        "⚠️ <i>الأرشيف يبدأ من وقت رصد البوت للحساب.</i>",
-        "🔒 <i>لا يعرض أرقام الهواتف المخفية أو البيانات الخاصة.</i>"
+        "⚠️ <i>ملاحظة: أرقام الهواتف محمية بخصوصية صارمة من تيليجرام ولا يمكن للبوت استخراجها بصورة مشروعة.</i>"
     ]
-
     return "\n".join(lines)
 
 
-# ---------- Commands ----------
+# ==================== HANDLERS ====================
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg = update.effective_message
-
     if not user or not msg:
         return
-
     await record_user(user)
-    await save_profile(
-        user.id, user.username, user.first_name,
-        user.last_name, user.is_bot
-    )
+    await save_profile(user.id, user.username, user.first_name, user.last_name, user.is_bot)
 
     await msg.reply_text(
-        "👋 <b>أهلاً بيك ببوت البحث عن الحسابات العامة</b>\n\n"
-        "اختار من الأزرار، أو أرسل يوزرنيم مثل <code>@username</code>.\n"
-        "تگدر ترسل آيدي رقمي إذا كان الحساب متاحاً.",
+        "👋 <b>مرحباً بك في بوت البحث والاستعلام المتقدم</b>\n\n"
+        "أرسل أي يوزرنيم (مثل <code>@username</code>) أو آيدي رقمي في المحادثة مباشرة للبحث الفوري، أو استخدم الأزرار أدناه:",
         parse_mode="HTML",
         reply_markup=main_keyboard(user.id == OWNER_ID)
     )
@@ -358,13 +422,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user:
         await record_user(update.effective_user)
-
     await update.effective_message.reply_text(
-        "📘 <b>طريقة الاستخدام</b>\n\n"
-        "• أرسل يوزرنيم مثل <code>@username</code>.\n"
-        "• أو أرسل آيدي رقمي إذا كان الحساب متاحاً.\n"
-        "• <code>/history 123456789</code> يعرض السجل المحلي.\n\n"
-        "الوصول إلى كل الحسابات غير مضمون، ولا يمكن كشف رقم هاتف مخفي.",
+        "📘 <b>طريقة الاستخدام الشاملة</b>\n\n"
+        "1. <b>البحث المباشر:</b> اكتب اليوزرنيم أو الآيدي مباشرة وسيقوم البوت بالبحث فوراُ.\n"
+        "2. <b>سجل الأسماء:</b> استخدم الأمر <code>/history [ID]</code> لعرض الأرشيف المحلي.\n"
+        "3. البوت عام ومتاح للجميع للبحث واستخراج المعلومات العامة المتاحة.",
         parse_mode="HTML",
         reply_markup=back_keyboard()
     )
@@ -373,282 +435,202 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user:
         await record_user(update.effective_user)
-
     msg = update.effective_message
-
     if not context.args or not context.args[0].isdigit():
-        await msg.reply_text(
-            "الاستخدام الصحيح: <code>/history 123456789</code>",
-            parse_mode="HTML",
-            reply_markup=back_keyboard()
-        )
+        await msg.reply_text("الاستخدام الصحيح:\n<code>/history 123456789</code>", parse_mode="HTML", reply_markup=back_keyboard())
         return
 
     uid = int(context.args[0])
     history = await get_history(uid)
-
     if not history:
-        await msg.reply_text(
-            "ماكو أسماء محفوظة لهذا الآيدي بقاعدة بيانات البوت.",
-            reply_markup=back_keyboard()
-        )
+        await msg.reply_text("لا توجد سجلات أسماء محفوظة لهذا الآيدي في قاعدة البيانات.", reply_markup=back_keyboard())
         return
 
-    lines = [f"🗂 <b>الأسماء المرصودة للآيدي</b> <code>{uid}</code>\n"]
-
+    lines = [f"🗂 <b>سجل التغييرات للآيدي:</b> <code>{uid}</code>\n"]
     for item in history:
-        n = (
-            (item["first_name"] or "") + " " +
-            (item["last_name"] or "")
-        ).strip() or "اسم غير متوفر"
-
+        n = ((item["first_name"] or "") + " " + (item["last_name"] or "")).strip() or "غير متوفر"
         u = "@" + item["username"] if item["username"] else "بدون يوزرنيم"
+        lines.append(f"• {esc(n)} — {esc(u)}\n  <i>{esc(fmt_time(item['observed_at']))}</i>")
 
-        lines.append(
-            f"• {esc(n)} — {esc(u)}\n"
-            f"  <i>{esc(fmt_time(item['observed_at']))}</i>"
-        )
-
-    await msg.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=back_keyboard()
-    )
+    await msg.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=back_keyboard())
 
 
 async def search_query(update, context, raw):
     user = update.effective_user
     msg = update.effective_message
-
     if not user or not msg:
         return
-
     await record_user(user)
 
     if not await cooldown_ok(user.id):
-        await msg.reply_text("⏳ تمهّل شوي قبل البحث مرة ثانية.")
+        await msg.reply_text("⏳ تمهّل قليلاً قبل إجراء بحث جديد.")
         return
 
     query = valid_query(raw)
-
     if not query:
-        await msg.reply_text(
-            "❌ الصيغة مو صحيحة. أرسل يوزرنيم صحيح أو آيدي رقمي.",
-            reply_markup=back_keyboard()
-        )
+        await msg.reply_text("❌ صيغة غير صحيحة. أرسل يوزرنيم صحيح يبدأ بـ @ أو آيدي رقمي.", reply_markup=back_keyboard())
         return
 
-    status = await msg.reply_text("🔎 جارٍ البحث عن المعلومات المتاحة...")
+    status = await msg.reply_text("🔎 جارٍ البحث واستخراج المعلومات...")
 
     profile = await lookup_mtproto(query)
-    source = "جلسة Telethon المصرح بها"
+    source = "جلسة Telethon"
 
     if profile is None and query.startswith("@"):
         try:
             chat = await context.bot.get_chat(query)
-
             if chat.type == ChatType.PRIVATE:
                 profile = {
                     "id": int(chat.id),
                     "username": getattr(chat, "username", None),
                     "first_name": getattr(chat, "first_name", None) or "",
                     "last_name": getattr(chat, "last_name", None) or "",
-                    "is_bot": bool(getattr(chat, "is_bot", False))
+                    "is_bot": bool(getattr(chat, "is_bot", False)),
+                    "photo_path": None,
                 }
                 source = "Telegram Bot API"
-
-        except TelegramError as exc:
-            log.info("Bot API lookup unavailable: %s", type(exc).__name__)
+        except TelegramError:
+            pass
 
     if profile is None and query.isdigit():
         archived = await get_profile(int(query))
-
         if archived:
             profile = {
                 "id": int(archived["user_id"]),
                 "username": archived["username"],
                 "first_name": archived["first_name"],
                 "last_name": archived["last_name"],
-                "is_bot": bool(archived["is_bot"])
+                "is_bot": bool(archived["is_bot"]),
+                "photo_path": archived["photo_path"],
             }
             source = "الأرشيف المحلي"
 
-    if profile is None:
-        await status.edit_text(
-            "ما گدرت أوصل لهذا الحساب.\n"
-            "تأكد من اليوزرنيم؛ البحث بالآيدي وحده ما يضمن الوصول.",
-            reply_markup=back_keyboard()
-        )
+    success = profile is not None
+    await log_search(user.id, query, success, source if success else "فشل")
+
+    if not profile:
+        await status.edit_text("❌ لم يتم العثور على أي معلومات لهذا الحساب عبر المصادر المتاحة.", reply_markup=back_keyboard())
         return
 
     try:
         result = await render_profile(profile, source)
-
-        await status.edit_text(
-            result,
-            parse_mode="HTML",
-            reply_markup=back_keyboard()
-        )
-
+        await status.edit_text(result, parse_mode="HTML", reply_markup=back_keyboard())
+        
+        # إرسال الصورة المؤرشفة إن وجدت
+        if profile.get("photo_path") and os.path.exists(profile["photo_path"]):
+            with open(profile["photo_path"], "rb") as photo_file:
+                await msg.reply_photo(photo=InputFile(photo_file), caption="📸 صورة الحساب المؤرشفة")
     except TelegramError:
-        log.exception("Failed to send search result")
-        await msg.reply_text("صار خطأ أثناء إرسال النتيجة. جرّب مرة ثانية.")
+        await msg.reply_text("حدث خطأ أثناء عرض النتيجة.", reply_markup=back_keyboard())
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
-
     if not msg or not user or msg.chat.type != ChatType.PRIVATE:
         return
-
     raw = (msg.text or "").strip()
-
     if raw:
         await search_query(update, context, raw)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-
     if not q:
         return
-
     await q.answer()
-
     user = q.from_user
     data = q.data or ""
-
     await record_user(user)
 
     if data == "home":
-        await edit_menu(
-            q,
-            "🏠 <b>القائمة الرئيسية</b>\nاختار الخدمة المطلوبة:",
-            main_keyboard(user.id == OWNER_ID)
-        )
-
-    elif data == "search":
-        await edit_menu(
-            q,
-            "🔎 <b>البحث عن حساب</b>\n\n"
-            "أرسل يوزرنيم مثل <code>@username</code> أو آيدي رقمي.",
-            back_keyboard()
-        )
-
+        await edit_menu(q, "🏠 <b>القائمة الرئيسية</b>\nاختر الخدمة المطلوبة:", main_keyboard(user.id == OWNER_ID))
+    elif data == "search_prompt":
+        await edit_menu(q, "🔎 <b>البحث السريع</b>\n\nأرسل الآن يوزرنيم مثل <code>@username</code> أو آيدي رقمي في المحادثة مباشرة.", back_keyboard())
     elif data == "history_help":
-        await edit_menu(
-            q,
-            "🗂 <b>سجل الأسماء</b>\n\n"
-            "أرسل الأمر بهذا الشكل:\n"
-            "<code>/history 123456789</code>\n"
-            "السجل يحفظ فقط التغييرات التي رصدها البوت.",
-            back_keyboard()
+        await edit_menu(q, "🗂 <b>سجل الأسماء</b>\n\nاستخدم الأمر:\n<code>/history [ID]</code> لعرض أرشيف التغييرات.", back_keyboard())
+    elif data == "my_stats":
+        searches = await db_execute("SELECT COUNT(*) AS c, SUM(success) AS s FROM search_logs WHERE user_id=?", (user.id,), one=True)
+        first_act = await db_execute("SELECT first_seen FROM bot_users WHERE user_id=?", (user.id,), one=True)
+        total = searches["c"] if searches and searches["c"] else 0
+        succ = searches["s"] if searches and searches["s"] else 0
+        joined = fmt_time(first_act["first_seen"]) if first_act else "غير متوفر"
+        
+        text = (
+            f"📊 <b>إحصائياتك الشخصية</b>\n\n"
+            f"• أول استخدام للبوت: <code>{joined}</code>\n"
+            f"• إجمالي عمليات البحث: <code>{total}</code>\n"
+            f"• عمليات بحث ناجحة: <code>{succ}</code>\n"
+            f"• عمليات بلاผล: <code>{total - succ}</code>"
         )
-
+        await edit_menu(q, text, back_keyboard())
     elif data == "help":
-        await edit_menu(
-            q,
-            "📘 <b>طريقة الاستخدام</b>\n\n"
-            "• ابحث بيوزرنيم أو آيدي متاح.\n"
-            "• الأرشيف محلي ويبدأ من وقت الرصد.\n"
-            "• الوصول إلى كل الحسابات غير مضمون.\n"
-            "• لا توجد ميزة لكشف الأرقام المخفية.",
-            back_keyboard()
-        )
-
+        await edit_menu(q, "📘 <b>مساعدة المستخدمين</b>\nالبوت متاح للجميع للبحث عن الحسابات العامة عبر اليوزرنيم أو الآيدي.", back_keyboard())
     elif data == "about":
-        await edit_menu(
-            q,
-            "🛡️ <b>حول البوت</b>\n"
-            "يعرض معلومات عامة متاحة ويحفظ التغييرات التي يلاحظها. "
-            "لا يفتح الحسابات الخاصة ولا يستخرج معلومات مخفية.",
-            back_keyboard()
-        )
-
+        await edit_menu(q, "ℹ️ <b>حول البوت</b>\nنسخة احترافية متكاملة تدعم الأرشيف، التتبع، وإدارة قواعد البيانات بأمان.", back_keyboard())
     elif data == "owner":
         if user.id != OWNER_ID:
-            await edit_menu(
-                q, "⛔ هذه اللوحة مخصصة لمالك البوت.", back_keyboard()
-            )
+            await edit_menu(q, "⛔ هذه اللوحة مخصصة لمالك البوت فقط.", back_keyboard())
             return
-
-        await edit_menu(
-            q,
-            "⚙️ <b>لوحة المالك</b>\n"
-            "من هنا تراجع إحصائيات الأرشيف والمستخدمين المسجلين.",
-            owner_keyboard()
-        )
-
+        await edit_menu(q, "⚙️ <b>لوحة تحكم المالك الإدارية</b>", owner_keyboard())
     elif data == "stats":
         if user.id != OWNER_ID:
-            await edit_menu(
-                q, "⛔ هذا الخيار مخصص للمالك.", back_keyboard()
-            )
+            await edit_menu(q, "⛔ غير مسموح لك بالوصول.", back_keyboard())
             return
+        pc = await db_execute("SELECT COUNT(*) AS n FROM profiles", one=True)
+        hc = await db_execute("SELECT COUNT(*) AS n FROM name_history", one=True)
+        uc = await db_execute("SELECT COUNT(*) AS n FROM bot_users", one=True)
+        sc = await db_execute("SELECT COUNT(*) AS n FROM search_logs", one=True)
+        photos_count = len(os.listdir(PHOTOS_DIR)) if os.path.exists(PHOTOS_DIR) else 0
 
-        pc = await db_execute(
-            "SELECT COUNT(*) AS n FROM profiles", one=True
+        text = (
+            f"📊 <b>إحصائيات النظام الشاملة</b>\n\n"
+            f"👥 إجمالي المستخدمين: <code>{uc['n']}</code>\n"
+            f"🔎 إجمالي عمليات البحث: <code>{sc['n']}</code>\n"
+            f"🗄️ الحسابات المؤرشفة: <code>{pc['n']}</code>\n"
+            f"🕓 سجلات الأسماء: <code>{hc['n']}</code>\n"
+            f"📸 الصور المؤرشفة: <code>{photos_count}</code>"
         )
-        hc = await db_execute(
-            "SELECT COUNT(*) AS n FROM name_history", one=True
-        )
-        uc = await db_execute(
-            "SELECT COUNT(*) AS n FROM bot_users", one=True
+        await edit_menu(q, text, owner_keyboard())
+    elif data == "export_csv":
+        if user.id != OWNER_ID:
+            await edit_menu(q, "⛔ غير مسموح لك بتصدير السجلات.", back_keyboard())
+            return
+        logs = await db_execute("SELECT user_id, query, success, source, searched_at FROM search_logs", all_rows=True)
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["User ID", "Query", "Success", "Source", "Timestamp"])
+        for row in logs:
+            writer.writerow([row["user_id"], row["query"], row["success"], row["source"], fmt_time(row["searched_at"])])
+        output.seek(0)
+        await q.message.reply_document(
+            document=InputFile(io.BytesIO(output.getvalue().encode('utf-8')), filename="search_logs.csv"),
+            caption="📤 سجلات البحث المصدرة بنجاح."
         )
 
-        await edit_menu(
-            q,
-            "📊 <b>إحصائيات البوت</b>\n\n"
-            f"👥 المستخدمون المسجلون: <code>{uc['n']}</code>\n"
-            f"🔎 الحسابات المؤرشفة: <code>{pc['n']}</code>\n"
-            f"🗂 سجلات الأسماء: <code>{hc['n']}</code>\n"
-            f"🕒 وقت الخادم: <code>{esc(fmt_time(int(time.time())))}</code>",
-            owner_keyboard()
-        )
 
-
-# ---------- Startup ----------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    err = context.error
-
-    if isinstance(err, RetryAfter):
-        log.warning("Telegram rate limit reached")
-
-    elif isinstance(err, (TimedOut, NetworkError)):
-        log.warning("Temporary network issue: %s", type(err).__name__)
-
-    else:
-        log.error(
-            "Unhandled error: %s",
-            type(err).__name__ if err else "unknown",
-            exc_info=err
-        )
+    log.error("Unhandled error: %s", context.error)
 
 
 async def post_init(app: Application):
     init_db()
     await start_telethon()
-
     await app.bot.set_my_commands([
-        BotCommand("start", "فتح القائمة الرئيسية"),
+        BotCommand("start", "القائمة الرئيسية"),
         BotCommand("help", "طريقة الاستخدام"),
-        BotCommand("history", "عرض سجل الأسماء المرصودة")
+        BotCommand("history", "سجل الأسماء المرصودة")
     ])
-
-    log.info("Bot initialized; owner ID=%s", OWNER_ID)
+    log.info("Professional Lookup Bot initialized successfully. Owner ID: %s", OWNER_ID)
 
 
 async def post_shutdown(app: Application):
     global telethon_client
-
-    if telethon_client is not None:
+    if telethon_client:
         try:
             await telethon_client.disconnect()
         except Exception:
-            log.exception("Telethon disconnect failed")
-
-        telethon_client = None
+            pass
 
 
 def main():
@@ -664,17 +646,11 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
-    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    log.info("Starting Telegram profile lookup bot...")
-
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False
-    )
+    log.info("Starting bot polling...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
 if __name__ == "__main__":
