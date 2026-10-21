@@ -1,15 +1,17 @@
+# -*- coding: utf-8 -*-
+"""
+Group Moderation & Cleanup Bot
+- Silent/Noticed deletion of restricted media, links, stickers, and replies.
+- Group admin controls and interactive cleanup menu.
+- SQLite persistent storage.
+Python 3.10+
+"""
 
 import os
-import re
-import io
-import csv
 import html
-import asyncio
 import logging
 import sqlite3
-from datetime import datetime, timezone
-from urllib.parse import urlparse
-
+import re
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -32,57 +34,35 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "1537665613"))
-DEFAULT_ADMINS = {
-    int(x.strip())
-    for x in os.getenv("DEFAULT_ADMINS", "").split(",")
-    if x.strip().isdigit()
-}
-DEFAULT_ADMINS.add(OWNER_ID)
+DEFAULT_ADMINS = {OWNER_ID}
 
-DB_PATH = os.getenv("BOT_DB_PATH", "bot_database.sqlite3")
-PHOTOS_DIR = os.getenv("PHOTOS_DIR", "profile_photos")
-
-# Optional Telethon support:
-TG_API_ID = os.getenv("TG_API_ID", "").strip()
-TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
-TG_SESSION = os.getenv("TG_SESSION", "archive_session").strip()
-
-# Optional forced subscription channel, e.g. @MyChannel
-FORCE_CHANNEL = os.getenv("FORCE_CHANNEL", "").strip()
-
-# Use only when you own or are authorized to access this account.
-USE_TELETHON = bool(TG_API_ID and TG_API_HASH)
+DB_PATH = os.getenv("BOT_DB_PATH", "moderation_bot.sqlite3")
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("unified_bot")
+log = logging.getLogger("moderation_bot")
 
-os.makedirs(PHOTOS_DIR, exist_ok=True)
-
-# Content moderation types:
+# أنواع المحتوى القابلة للحظر والتنظيف:
 MODERATION_TYPES = {
     "links": "الروابط",
     "photos": "الصور",
     "videos": "الفيديوهات",
     "stickers": "الملصقات",
-    "gifs": "صور GIF",
+    "gifs": "صور GIF المتحركة",
     "forward": "الرسائل المحوّلة",
-    "text": "النصوص",
     "voice": "الرسائل الصوتية",
-    "files": "الملفات",
-    "video_notes": "فيديوهات الدائرة",
-    "animations": "الرسوم المتحركة",
+    "files": "الملفات والمستندات",
+    "replies": "الردود على الرسائل (منع الردود)",
 }
 
 # =========================================================
-# DATABASE
+# DATABASE SETUP
 # =========================================================
 
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
-db_lock = asyncio.Lock()
 
 
 def init_db():
@@ -93,9 +73,7 @@ def init_db():
         chat_id INTEGER PRIMARY KEY,
         title TEXT DEFAULT '',
         enabled INTEGER DEFAULT 1,
-        replies_enabled INTEGER DEFAULT 0,
-        delete_message INTEGER DEFAULT 0,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        delete_notice TEXT DEFAULT 'عذراً، ممنوع إرسال هذا النوع من المحتوى هنا.'
     );
 
     CREATE TABLE IF NOT EXISTS moderation (
@@ -105,76 +83,8 @@ def init_db():
         PRIMARY KEY (chat_id, kind)
     );
 
-    CREATE TABLE IF NOT EXISTS users (
-        chat_id INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,
-        name TEXT DEFAULT '',
-        username TEXT DEFAULT '',
-        messages INTEGER DEFAULT 0,
-        PRIMARY KEY (chat_id, user_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS auto_replies (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER NOT NULL,
-        keyword TEXT NOT NULL,
-        response TEXT NOT NULL,
-        enabled INTEGER DEFAULT 1
-    );
-
     CREATE TABLE IF NOT EXISTS bot_admins (
         user_id INTEGER PRIMARY KEY
-    );
-
-    CREATE TABLE IF NOT EXISTS subscription (
-        channel TEXT PRIMARY KEY,
-        enabled INTEGER DEFAULT 1
-    );
-
-    CREATE TABLE IF NOT EXISTS profiles (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT DEFAULT '',
-        first_name TEXT DEFAULT '',
-        last_name TEXT DEFAULT '',
-        bio TEXT DEFAULT '',
-        photo_path TEXT DEFAULT '',
-        first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
-        last_seen TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS name_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        first_name TEXT DEFAULT '',
-        last_name TEXT DEFAULT '',
-        username TEXT DEFAULT '',
-        observed_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS usage (
-        key TEXT PRIMARY KEY,
-        value INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS bot_users (
-        user_id INTEGER PRIMARY KEY,
-        first_name TEXT DEFAULT '',
-        username TEXT DEFAULT '',
-        first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
-        last_seen TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS search_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        requester_id INTEGER NOT NULL,
-        query TEXT NOT NULL,
-        result TEXT DEFAULT '',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT DEFAULT ''
     );
     """)
     for admin_id in DEFAULT_ADMINS:
@@ -199,38 +109,10 @@ def fetchall(query, params=()):
     return db.execute(query, params).fetchall()
 
 
-def get_setting(key, default=""):
-    row = fetchone("SELECT value FROM settings WHERE key=?", (key,))
-    return row["value"] if row else default
-
-
-def set_setting(key, value):
-    execute(
-        """INSERT INTO settings(key,value) VALUES(?,?)
-           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
-        (key, str(value)),
-    )
-
-
-def increment_usage(key, amount=1):
-    execute("""
-        INSERT INTO usage(key,value) VALUES(?,?)
-        ON CONFLICT(key) DO UPDATE SET value=value+excluded.value
-    """, (key, amount))
-
-
-def is_bot_enabled():
-    return get_setting("bot_enabled", "1") == "1"
-
-
 def is_admin(user_id):
-    return bool(fetchone(
-        "SELECT 1 FROM bot_admins WHERE user_id=?", (user_id,)
-    ))
-
-
-def is_owner(user_id):
-    return user_id == OWNER_ID
+    return user_id == OWNER_ID or bool(
+        fetchone("SELECT 1 FROM bot_admins WHERE user_id=?", (user_id,))
+    )
 
 
 def ensure_group(chat_id, title=""):
@@ -243,8 +125,8 @@ def ensure_group(chat_id, title=""):
     for kind in MODERATION_TYPES:
         execute("""
             INSERT OR IGNORE INTO moderation(chat_id,kind,enabled)
-            VALUES(?,?,0)
-        """, (chat_id, kind))
+            VALUES(?,?,?)
+        """, (chat_id, kind, 0))
 
 
 def group_enabled(chat_id):
@@ -270,106 +152,287 @@ def set_moderation(chat_id, kind, enabled):
     """, (chat_id, kind, int(enabled)))
 
 
-def track_bot_user(user):
-    if not user:
-        return
-    execute("""
-        INSERT INTO bot_users(user_id,first_name,username)
-        VALUES(?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            first_name=excluded.first_name,
-            username=excluded.username,
-            last_seen=CURRENT_TIMESTAMP
-    """, (user.id, user.first_name or "", user.username or ""))
-
-
-def track_group_user(chat_id, user):
-    if not user or user.is_bot:
-        return
-
-    name = " ".join(
-        x for x in [user.first_name, user.last_name] if x
-    )
-    execute("""
-        INSERT INTO users(chat_id,user_id,name,username,messages)
-        VALUES(?,?,?,?,1)
-        ON CONFLICT(chat_id,user_id) DO UPDATE SET
-            name=excluded.name,
-            username=excluded.username,
-            messages=messages+1
-    """, (chat_id, user.id, name, user.username or ""))
-
-
-def archive_profile(user):
-    if not user:
-        return
-
-    first = user.first_name or ""
-    last = user.last_name or ""
-    username = user.username or ""
-
-    old = fetchone(
-        "SELECT first_name,last_name,username FROM profiles WHERE user_id=?",
-        (user.id,),
-    )
-
-    execute("""
-        INSERT INTO profiles(user_id,username,first_name,last_name)
-        VALUES(?,?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name,
-            last_name=excluded.last_name,
-            last_seen=CURRENT_TIMESTAMP
-    """, (user.id, username, first, last))
-
-    if not old or (
-        old["first_name"] != first
-        or old["last_name"] != last
-        or old["username"] != username
-    ):
-        execute("""
-            INSERT INTO name_history(user_id,first_name,last_name,username)
-            VALUES(?,?,?,?)
-        """, (user.id, first, last, username))
-
-
 # =========================================================
-# OPTIONAL TELETHON
+# HELPERS & PERMISSIONS
 # =========================================================
 
-telethon_client = None
-
-
-async def setup_telethon():
-    global telethon_client
-    if not USE_TELETHON:
-        return
-
+async def is_group_admin(bot, chat_id, user_id):
     try:
-        from telethon import TelegramClient
-        telethon_client = TelegramClient(
-            TG_SESSION, int(TG_API_ID), TG_API_HASH
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in (
+            ChatMemberStatus.OWNER,
+            ChatMemberStatus.ADMINISTRATOR,
         )
-        await telethon_client.connect()
-
-        if not await telethon_client.is_user_authorized():
-            log.warning(
-                "Telethon session is not authorized; lookup fallback only."
-            )
-            await telethon_client.disconnect()
-            telethon_client = None
-    except Exception:
-        log.exception("Telethon initialization failed")
-        telethon_client = None
+    except TelegramError:
+        return False
 
 
-async def telethon_lookup(query):
-    if not telethon_client:
-        return None
+async def bot_can_delete(bot, chat_id):
     try:
-        entity = await telethon_client.get_entity(query)
-        first = getattr(entity, "first_name", "") or ""
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        return (
+            member.status == ChatMemberStatus.ADMINISTRATOR
+            and bool(getattr(member, "can_delete_messages", False))
+        )
+    except TelegramError:
+        return False
+
+
+URL_RE = re.compile(
+    r"(?i)(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+)"
+    r"|(?:^|\s)@[A-Za-z0-9_]{4,}"
+)
+
+
+def has_link(message):
+    if URL_RE.search(message.text or message.caption or ""):
+        return True
+    entities = list(message.entities or []) + list(message.caption_entities or [])
+    for entity in entities:
+        if entity.type in ("url", "text_link"):
+            return True
+    return False
+
+
+def classify_message(message):
+    found = set()
+
+    if has_link(message):
+        found.add("links")
+    if message.photo:
+        found.add("photos")
+    if message.video:
+        found.add("videos")
+    if message.sticker:
+        found.add("stickers")
+    if message.animation or message.video_note:
+        found.add("gifs")
+    if message.voice or message.audio:
+        found.add("voice")
+    if message.document:
+        found.add("files")
+    if message.reply_to_message:
+        found.add("replies")
+    if getattr(message, "forward_origin", None) is not None or getattr(message, "forward_date", None) is not None:
+        found.add("forward")
+
+    return found
+
+
+# =========================================================
+# KEYBOARDS
+# =========================================================
+
+def moderation_keyboard(chat_id):
+    rows = []
+    for kind, label in MODERATION_TYPES.items():
+        state = moderation_enabled(chat_id, kind)
+        rows.append([
+            InlineKeyboardButton(
+                f"{'🟢 مفعّل' if state else '⚪ متوقف'} — {label}",
+                callback_data=f"mod:{chat_id}:{kind}",
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton("تفعيل الكل ✅", callback_data=f"modall:{chat_id}:1"),
+        InlineKeyboardButton("إيقاف الكل ❌", callback_data=f"modall:{chat_id}:0"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+# =========================================================
+# COMMANDS
+# =========================================================
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "👋 أهلاً بك في بوت الحماية وتنظيف المجموعات.\n\n"
+        "أضف البوت إلى مجموعتك ومنحه صلاحية الحذف، ثم اكتب:\n"
+        "🧹 <code>/clean</code> لتفعيل أو إيقاف حظر (الروابط، الصور، الفيديوهات، الملصقات، الملفات، الردود، وغيرها).",
+        parse_mode="HTML",
+    )
+
+
+async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.effective_message.reply_text("هذا الأمر يُستخدم داخل المجموعات فقط.")
+        return
+
+    if not await is_group_admin(context.bot, chat.id, user.id):
+        await update.effective_message.reply_text("عذراً، هذا الأمر خاص بمشرفي المجموعة فقط.")
+        return
+
+    ensure_group(chat.id, chat.title)
+    if not await bot_can_delete(context.bot, chat.id):
+        await update.effective_message.reply_text(
+            "⚠️ تنبيه: البوت لا يمتلك صلاحية 'حذف الرسائل' (Delete Messages). يرجى إعطاؤه الصلاحية ليعمل التنظيف بشكل صحيح."
+        )
+
+    await update.effective_message.reply_text(
+        "🎛 <b>لوحة تحكم حماية وتنظيف المجموعة:</b>\n"
+        "اضغط على أي خيار لتفعيله أو إلغائه:",
+        reply_markup=moderation_keyboard(chat.id),
+        parse_mode="HTML",
+    )
+
+
+async def group_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    ensure_group(chat.id, chat.title)
+    active = [
+        label for kind, label in MODERATION_TYPES.items()
+        if moderation_enabled(chat.id, kind)
+    ]
+    text = (
+        f"📊 <b>حالة الحماية في المجموعة: {html.escape(chat.title or '')}</b>\n\n"
+        f"🛡 الأنواع المحظورة حالياً:\n"
+        f"{'\n'.join('• ' + x for x in active) if active else 'لا توجد أي قيود مفعلة حالياً.'}"
+    )
+    await update.effective_message.reply_text(text, parse_mode="HTML")
+
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    user_id = query.from_user.id
+
+    if data.startswith("mod:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            return
+        chat_id, kind = int(parts[1]), parts[2]
+        if kind not in MODERATION_TYPES:
+            return
+        if not await is_group_admin(context.bot, chat_id, user_id):
+            await query.answer("للمشرفين فقط.", show_alert=True)
+            return
+
+        new_value = not moderation_enabled(chat_id, kind)
+        set_moderation(chat_id, kind, new_value)
+        await query.edit_message_reply_markup(reply_markup=moderation_keyboard(chat_id))
+        return
+
+    if data.startswith("modall:"):
+        _, chat_id, value = data.split(":")
+        chat_id, enabled = int(chat_id), int(value)
+        if not await is_group_admin(context.bot, chat_id, user_id):
+            await query.answer("للمشرفين فقط.", show_alert=True)
+            return
+        ensure_group(chat_id)
+        for kind in MODERATION_TYPES:
+            set_moderation(chat_id, kind, bool(enabled))
+        await query.edit_message_reply_markup(reply_markup=moderation_keyboard(chat_id))
+        return
+
+
+# =========================================================
+# MESSAGE MODERATOR (DELETE & MENTION)
+# =========================================================
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not msg or not chat or not user:
+        return
+
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        ensure_group(chat.id, chat.title)
+
+        if not group_enabled(chat.id):
+            return
+
+        # استثناء مشرفي المجموعة والمالك من الحظر والتنظيف
+        if await is_group_admin(context.bot, chat.id, user.id) or is_admin(user.id):
+            return
+
+        categories = classify_message(msg)
+        if not categories:
+            return
+
+        # التحقق مما إذا كان أي نوع من المحتوى مفعل حظره في هذه المجموعة
+        active_violations = [
+            kind for kind in categories
+            if kind in MODERATION_TYPES and moderation_enabled(chat.id, kind)
+        ]
+
+        if not active_violations:
+            return
+
+        if not await bot_can_delete(context.bot, chat.id):
+            return
+
+        try:
+            await msg.delete()
+            
+            # جلب كليشة التنبيه الخاصة بالحذف مع تاك العضو
+            row = fetchone("SELECT delete_notice FROM groups WHERE chat_id=?", (chat.id,))
+            notice = row["delete_notice"] if row and row["delete_notice"] else "عذراً، ممنوع إرسال هذا المحتوى هنا."
+            
+            warning = await context.bot.send_message(
+                chat.id,
+                f"{user.mention_html()}، {esc(notice)}",
+                parse_mode="HTML",
+            )
+            
+            # حذف رسالة التنبيه بعد 5 ثوانٍ لكي يبقى الجروب نظيفاً (اختياري)
+            context.job_queue.run_once(delete_warning_job, 5, data=warning)
+
+        except TelegramError as exc:
+            log.warning("Failed to delete message in chat %s: %s", chat.id, exc)
+
+
+async def delete_warning_job(context: ContextTypes.DEFAULT_TYPE):
+    message = context.job.data
+    try:
+        await message.delete()
+    except TelegramError:
+        pass
+
+
+def esc(text):
+    return html.escape(str(text or ""))
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN مفقود! يرجى إدخال التوكن الصحيح.")
+
+    init_db()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("clean", clean_command))
+    app.add_handler(CommandHandler("status", group_status_command))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    app.add_handler(
+        MessageHandler(
+            filters.ALL & ~filters.StatusUpdate.ALL,
+            message_handler,
+        )
+    )
+
+    log.info("Moderation Bot started successfully.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
+       first = getattr(entity, "first_name", "") or ""
         last = getattr(entity, "last_name", "") or ""
         username = getattr(entity, "username", "") or ""
         uid = getattr(entity, "id", None)
