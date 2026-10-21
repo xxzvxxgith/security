@@ -290,9 +290,6 @@ async def clean_24h(update, context):
 
     cutoff = int(time.time()) - CLEAN_HOURS * 3600
 
-    # الأنواع المستهدفة للحذف الفوري عند كتابة "تنظيف"
-    target_kinds = ('صورة', 'فيديو', 'GIF', 'ملصق', 'رسالة صوتية', 'أغنية/صوت', 'فيديو دائري', 'ملف', 'رابط')
-
     with db() as con:
         rows = con.execute(
             "SELECT message_id FROM tracked_messages WHERE chat_id=? AND message_date>=? AND kind IN ('صورة', 'فيديو', 'GIF', 'ملصق', 'رسالة صوتية', 'أغنية/صوت', 'فيديو دائري', 'ملف', 'رابط') ORDER BY message_id DESC", 
@@ -304,7 +301,7 @@ async def clean_24h(update, context):
         if await safe_delete(chat.id, r["message_id"], context):
             deleted += 1
 
-    # حذف رسالة أمر "تنظيف" نفسها من الكروب فوراً
+    # حذف أمر "تنظيف" نفسه فوراً
     await safe_delete(chat.id, message.message_id, context)
 
     with db() as con:
@@ -316,8 +313,7 @@ async def clean_24h(update, context):
             f"🧹 **تم تنظيف الكروب بنجاح!**\n\n• تم مسح `{deleted}` عنصر (صور، فيديوهات، روابط، ملصقات، ملفات، صوتيات) من آخر 24 ساعة.",
             parse_mode="Markdown"
         )
-        # حذف رسالة النجاح بعد 5 ثوانٍ ليبقى الجروب نظيفاً تماماً
-        await asyncio.sleep(5)
+        await asyncio.sleep(4)
         await safe_delete(chat.id, sent_msg.message_id, context)
     except TelegramError:
         pass
@@ -328,7 +324,7 @@ async def moderate_message(update, context):
     if not message or not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not user or user.is_bot: return
     
     txt_check = (message.text or message.caption or "").strip()
-    allowed_cmds = {"تنظيف", "حالة", "توب", "تصفير التوب", "تصفير توب المتفاعلين", "تفعيل", "/تفعيل", "إيقاف", "/إيقاف"}
+    allowed_cmds = {"تنظيف", "/تنظيف", "حالة", "توب", "تصفير التوب", "تصفير توب المتفاعلين", "تفعيل", "/تفعيل", "إيقاف", "/إيقاف"}
     if txt_check in allowed_cmds:
         return
 
@@ -381,7 +377,7 @@ async def group_text_commands(update, context):
     message, chat = update.effective_message, update.effective_chat
     if not message or not message.text or chat.type == ChatType.PRIVATE: return
     txt = message.text.strip()
-    if txt == "تنظيف": await clean_24h(update, context)
+    if txt in ("تنظيف", "/تنظيف"): await clean_24h(update, context)
     elif txt == "حالة": await message.reply_text(f"📊 <b>حالة الكروب:</b>\n• الرسائل المسجلة (24س): {recent_count(chat.id)}", parse_mode="HTML")
     elif txt == "توب": await show_top(chat.id, context, message)
     elif txt in ("تصفير التوب", "تصفير توب المتفاعلين"): await reset_top(update, context)
@@ -415,7 +411,6 @@ async def subscription_menu(query):
     buttons.extend([[("➕ إعداد اشتراك", "sub_add")], [("⬅️ رجوع", "home")]])
     await query.edit_message_text("🔔 <b>الاشتراك الإجباري</b>", parse_mode="HTML", reply_markup=kb(buttons))
 
-# ============================ معالجة الأزرار ============================
 async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user, data = query.from_user, query.data or ""
