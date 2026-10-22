@@ -16,10 +16,10 @@ MAX_WINNERS, MAX_DURATION_MINUTES, MAX_TITLE_LENGTH = 100, 10080, 180
 MENU_CREATE, MENU_MINE, MENU_STATS = "🎡 إنشاء روليت", "📋 سحوباتي", "📊 الإحصائيات"
 MENU_HISTORY, MENU_ADMINS = "🏆 سجل النتائج", "🛡 إدارة المشرفين"
 MENU_CANCEL, MENU_HOME = "❌ إلغاء", "🏠 القائمة الرئيسية"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("roulette")
-flows = {}
 
 @contextmanager
 def database():
@@ -94,7 +94,7 @@ def main_keyboard(uid):
 
 def post_keyboard(gid, status):
     rows = [[InlineKeyboardButton("🎟 انضمام", callback_data=f"join:{gid}"),
-             InlineKeyboardButton("🚪 مغادرة", callback_data=f"leave:{gid}")]] if status == "open" else []
+             InlineKeyboardButton("🚪 مغادرة", callback_data=f"leave:{gid}")] if status == "open" else []]
     return InlineKeyboardMarkup(rows)
 
 def post_text(gid):
@@ -197,8 +197,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    flows.pop(uid, None)
-    await update.effective_message.reply_text("تم إلغاء العملية الحالية.", reply_markup=main_keyboard(uid))
+    context.user_data.pop("flow", None)
+    await update.effective_message.reply_text("تم إلغاء العملية.", reply_markup=main_keyboard(uid))
 
 async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -330,72 +330,130 @@ async def flow_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message=update.effective_message; uid=update.effective_user.id
     if message.chat.type!=ChatType.PRIVATE: return
     text=(message.text or "").strip()
-    if text in (MENU_CANCEL,MENU_HOME):
-        flows.pop(uid,None)
-        await message.reply_text("تم إلغاء العملية." if text==MENU_CANCEL else "القائمة الرئيسية:",reply_markup=main_keyboard(uid)); return
-    if text==MENU_CREATE:
-        if not is_admin(uid): await message.reply_text("إنشاء السحوبات متاح للمالك والمشرفين فقط.",reply_markup=main_keyboard(uid)); return
-        flows[uid]={"step":"title"}; await message.reply_text("🎁 أرسل عنوان الجائزة أو السحب:"); return
-    if text==MENU_MINE: await show_mine(message,uid); return
-    if text==MENU_STATS: await show_stats(message); return
-    if text==MENU_HISTORY: await show_history(message); return
-    if text==MENU_ADMINS:
-        if not is_owner(uid): await message.reply_text("هذه الميزة للمالك فقط."); return
-        await message.reply_text("🛡 إدارة المشرفين\nإضافة: /addadmin USER_ID\nحذف: /deladmin USER_ID"); return
-    f=flows.get(uid)
-    if not f: return
-    if not is_admin(uid): flows.pop(uid,None); await message.reply_text("ليس لديك صلاحية."); return
-    step=f["step"]
-    if step=="title":
-        if not text or len(text)>MAX_TITLE_LENGTH: await message.reply_text(f"العنوان يجب أن يكون بين 1 و{MAX_TITLE_LENGTH} حرفاً."); return
-        f["title"]=text; f["step"]="winners"; await message.reply_text("🏆 كم عدد الفائزين؟ أرسل رقماً من 1 إلى 100."); return
-    if step=="winners":
-        if not text.isdigit() or not 1<=int(text)<=MAX_WINNERS: await message.reply_text("أرسل رقماً من 1 إلى 100."); return
-        f["winner_count"]=int(text); f["step"]="duration"; await message.reply_text("⏳ مدة التسجيل بالدقائق. أرسل 0 للتسجيل دون مؤقت."); return
-    if step=="duration":
-        if not text.isdigit() or int(text)>MAX_DURATION_MINUTES: await message.reply_text(f"أرسل رقماً من 0 إلى {MAX_DURATION_MINUTES}."); return
-        f["duration"]=int(text)*60; f["step"]="exclude_previous"; await message.reply_text("استبعاد الفائزين السابقين؟ أرسل نعم أو لا."); return
-    if step=="exclude_previous":
-        ans=text.casefold()
-        if ans not in ("نعم","لا","yes","no"): await message.reply_text("أرسل نعم أو لا."); return
-        f["exclude_previous"]=int(ans in ("نعم","yes")); f["step"]="destination"
-        await message.reply_text("📍 أرسل @اسم_القناة أو المعرّف الرقمي للقناة/المجموعة. أضف البوت إليها وامنحه صلاحية النشر."); return
-    if step=="destination":
-        if text.startswith("@") and len(text)>1: target=text
+    
+    if text in (MENU_CANCEL, MENU_HOME):
+        context.user_data.pop("flow", None)
+        await message.reply_text("تم إلغاء العملية." if text == MENU_CANCEL else "القائمة الرئيسية:", reply_markup=main_keyboard(uid))
+        return
+        
+    if text == MENU_CREATE:
+        if not is_admin(uid):
+            await message.reply_text("إنشاء السحوبات متاح للمالك والمشرفين فقط.", reply_markup=main_keyboard(uid))
+            return
+        context.user_data["flow"] = {"step": "title"}
+        await message.reply_text("🎁 أرسل عنوان الجائزة أو السحب:")
+        return
+        
+    if text == MENU_MINE:
+        await show_mine(message, uid)
+        return
+    if text == MENU_STATS:
+        await show_stats(message)
+        return
+    if text == MENU_HISTORY:
+        await show_history(message)
+        return
+    if text == MENU_ADMINS:
+        if not is_owner(uid):
+            await message.reply_text("هذه الميزة للمالك فقط.")
+            return
+        await message.reply_text("🛡 إدارة المشرفين\nإضافة: /addadmin USER_ID\nحذف: /deladmin USER_ID")
+        return
+        
+    f = context.user_data.get("flow")
+    if not f:
+        return
+    if not is_admin(uid):
+        context.user_data.pop("flow", None)
+        await message.reply_text("ليس لديك صلاحية.")
+        return
+        
+    step = f["step"]
+    if step == "title":
+        if not text or len(text) > MAX_TITLE_LENGTH:
+            await message.reply_text(f"العنوان يجب أن يكون بين 1 و{MAX_TITLE_LENGTH} حرفاً.")
+            return
+        f["title"] = text
+        f["step"] = "winners"
+        await message.reply_text("🏆 كم عدد الفائزين؟ أرسل رقماً من 1 إلى 100.")
+        return
+    if step == "winners":
+        if not text.isdigit() or not 1 <= int(text) <= MAX_WINNERS:
+            await message.reply_text(f"أرسل رقماً من 1 إلى {MAX_WINNERS}.")
+            return
+        f["winner_count"] = int(text)
+        f["step"] = "duration"
+        await message.reply_text("⏳ مدة التسجيل بالدقائق. أرسل 0 للتسجيل دون مؤقت.")
+        return
+    if step == "duration":
+        if not text.isdigit() or int(text) > MAX_DURATION_MINUTES:
+            await message.reply_text(f"أرسل رقماً من 0 إلى {MAX_DURATION_MINUTES}.")
+            return
+        f["duration"] = int(text) * 60
+        f["step"] = "exclude_previous"
+        await message.reply_text("استبعاد الفائزين السابقين؟ أرسل نعم أو لا.")
+        return
+    if step == "exclude_previous":
+        ans = text.casefold()
+        if ans not in ("نعم", "لا", "yes", "no"):
+            await message.reply_text("أرسل نعم أو لا.")
+            return
+        f["exclude_previous"] = int(ans in ("نعم", "yes"))
+        f["step"] = "destination"
+        await message.reply_text("📍 أرسل @اسم_القناة أو المعرّف الرقمي للقناة/المجموعة. أضف البوت إليها وامنحه صلاحية النشر.")
+        return
+    if step == "destination":
+        if text.startswith("@") and len(text) > 1:
+            target = text
         else:
-            try: target=int(text)
-            except ValueError: await message.reply_text("أرسل @username أو معرّفاً رقمياً صالحاً."); return
-        f["target"]=target; f["step"]="confirm"
-        await message.reply_text("📋 <b>تأكيد السحب</b>\n\n"
+            try:
+                target = int(text)
+            except ValueError:
+                await message.reply_text("أرسل @username أو معرّفاً رقمياً صالحاً.")
+                return
+        f["target"] = target
+        f["step"] = "confirm"
+        await message.reply_text(
+            "📋 <b>تأكيد السحب</b>\n\n"
             f"🎁 {html.escape(f['title'])}\n🏆 عدد الفائزين: {f['winner_count']}\n"
-            f"⏳ المدة: {f['duration']//60} دقيقة\n📍 الوجهة: <code>{html.escape(str(target))}</code>\n\nأرسل نعم للنشر أو لا للإلغاء.",parse_mode="HTML"); return
-    if step=="confirm":
-        if text.casefold() not in ("نعم","yes"):
-            flows.pop(uid,None); await message.reply_text("تم إلغاء إنشاء السحب.",reply_markup=main_keyboard(uid)); return
-        target=f["target"]; duration=f["duration"]; ends=now()+duration if duration else None
+            f"⏳ المدة: {f['duration']//60} دقيقة\n📍 الوجهة: <code>{html.escape(str(target))}</code>\n\nأرسل نعم للنشر أو لا للإلغاء.",
+            parse_mode="HTML"
+        )
+        return
+    if step == "confirm":
+        if text.casefold() not in ("نعم", "yes"):
+            context.user_data.pop("flow", None)
+            await message.reply_text("تم إلغاء إنشاء السحب.", reply_markup=main_keyboard(uid))
+            return
+        target = f["target"]
+        duration = f["duration"]
+        ends = now() + duration if duration else None
         with database() as con:
-            cur=con.execute("""INSERT INTO giveaways(creator_id,title,winner_count,duration_seconds,exclude_previous,status,created_at,ends_at)
-                VALUES(?,?,?,?,?,'draft',?,?)""",(uid,f["title"],f["winner_count"],duration,f["exclude_previous"],now(),ends))
-            gid=cur.lastrowid; audit(con,uid,"create",gid,str(target))
+            cur = con.execute("""INSERT INTO giveaways(creator_id,title,winner_count,duration_seconds,exclude_previous,status,created_at,ends_at)
+                VALUES(?,?,?,?,?,'draft',?,?)""", (uid, f["title"], f["winner_count"], duration, f["exclude_previous"], now(), ends))
+            gid = cur.lastrowid
+            audit(con, uid, "create", gid, str(target))
         try:
-            sent=await context.bot.send_message(chat_id=target,text=post_text(gid),parse_mode="HTML",reply_markup=post_keyboard(gid,"open"))
+            sent = await context.bot.send_message(chat_id=target, text=post_text(gid), parse_mode="HTML", reply_markup=post_keyboard(gid, "open"))
             with database() as con:
                 con.execute("UPDATE giveaways SET chat_id=?,chat_title=?,message_id=?,status='open' WHERE id=?",
-                    (sent.chat_id,sent.chat.title or sent.chat.username or str(sent.chat_id),sent.message_id,gid))
-                audit(con,uid,"publish",gid)
-            await refresh_post(context,gid)
-            if duration: context.job_queue.run_once(timer_close,when=duration,data={"gid":gid},name=f"giveaway-{gid}")
-            await message.reply_text(f"✅ تم نشر السحب #{gid} بنجاح.\nإغلاق التسجيل: /close {gid}\nسحب الفائزين: /draw {gid}",reply_markup=main_keyboard(uid))
+                    (sent.chat_id, sent.chat.title or sent.chat.username or str(sent.chat_id), sent.message_id, gid))
+                audit(con, uid, "publish", gid)
+            await refresh_post(context, gid)
+            if duration:
+                context.job_queue.run_once(timer_close, when=duration, data={"gid": gid}, name=f"giveaway-{gid}")
+            await message.reply_text(f"✅ تم نشر السحب #{gid} بنجاح.\nإغلاق التسجيل: /close {gid}\nسحب الفائزين: /draw {gid}", reply_markup=main_keyboard(uid))
         except TelegramError as exc:
             log.exception("فشل نشر السحب")
             with database() as con:
-                con.execute("UPDATE giveaways SET status='draft',chat_id=NULL,message_id=NULL WHERE id=?",(gid,))
-                audit(con,uid,"publish_failed",gid,str(exc)[:250])
-            await message.reply_text("تعذر النشر. تحقق من الوجهة وصلاحيات البوت والاتصال بتيليجرام.",reply_markup=main_keyboard(uid))
-        finally: flows.pop(uid,None)
+                con.execute("UPDATE giveaways SET status='draft',chat_id=NULL,message_id=NULL WHERE id=?", (gid,))
+                audit(con, uid, "publish_failed", gid, str(exc)[:250])
+            await message.reply_text("تعذر النشر. تحقق من الوجهة وصلاحيات البوت والاتصال بتيليجرام.", reply_markup=main_keyboard(uid))
+        finally:
+            context.user_data.pop("flow", None)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.error("خطأ غير معالج أثناء استقبال تحديث: %r",context.error,exc_info=context.error)
+    log.error("خطأ غير معالج أثناء استقبال تحديث: %r", context.error, exc_info=context.error)
 
 async def post_init(app: Application):
     await restore_timers(app)
@@ -405,19 +463,19 @@ def main():
     if not TOKEN:
         raise SystemExit("لم يتم العثور على BOT_TOKEN.\nفي Termux نفّذ: export BOT_TOKEN='توكن_البوت' ثم أعد التشغيل.")
     init_db()
-    app=Application.builder().token(TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start",start))
-    app.add_handler(CommandHandler("cancel",cancel))
-    app.add_handler(CommandHandler("close",close_command))
-    app.add_handler(CommandHandler("draw",draw_command))
-    app.add_handler(CommandHandler("exclude",exclude_command))
-    app.add_handler(CommandHandler("addadmin",addadmin_command))
-    app.add_handler(CommandHandler("deladmin",deladmin_command))
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("close", close_command))
+    app.add_handler(CommandHandler("draw", draw_command))
+    app.add_handler(CommandHandler("exclude", exclude_command))
+    app.add_handler(CommandHandler("addadmin", addadmin_command))
+    app.add_handler(CommandHandler("deladmin", deladmin_command))
     app.add_handler(CallbackQueryHandler(callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,flow_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, flow_message))
     app.add_error_handler(error_handler)
-    log.info("بدأ تشغيل بوت الروليت. Owner ID: %s",OWNER_ID)
+    log.info("بدأ تشغيل بوت الروليت. Owner ID: %s", OWNER_ID)
     app.run_polling(drop_pending_updates=False)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
