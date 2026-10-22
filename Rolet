@@ -1,19 +1,24 @@
-import os, html, time, sqlite3, logging, secrets, asyncio
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""بوت روليت تيليجرام. يتطلب Python 3.10+ و python-telegram-bot[job-queue]."""
+import os, html, time, sqlite3, logging, secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ChatType
-from telegram.error import TelegramError, BadRequest
+from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-OWNER_ID = int(os.getenv('OWNER_ID', '1537665613'))
-TOKEN = os.getenv('BOT_TOKEN', '8906278700:AAGf5AZs6tKkPtROSxYjJPjLS4cuHX8tW5E').strip()
-DB_PATH = os.getenv('DB_PATH', 'roulette.sqlite3')
+OWNER_ID = 1537665613
+TOKEN = os.getenv("BOT_TOKEN", "8906278700:AAGf5AZs6tKkPtROSxYjJPjLS4cuHX8tW5E").strip()
+DB_PATH = os.getenv("DB_PATH", "roulette.sqlite3")
 MAX_WINNERS, MAX_DURATION_MINUTES, MAX_TITLE_LENGTH = 100, 10080, 180
-MENU_CREATE, MENU_MINE, MENU_STATS = '🎡 إنشاء روليت', '📋 سحوباتي', '📊 الإحصائيات'
-MENU_HISTORY, MENU_ADMINS, MENU_CANCEL = '🏆 سجل النتائج', '🛡 إدارة المشرفين', '❌ إلغاء'
-log = logging.getLogger('roulette')
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+MENU_CREATE, MENU_MINE, MENU_STATS = "🎡 إنشاء روليت", "📋 سحوباتي", "📊 الإحصائيات"
+MENU_HISTORY, MENU_ADMINS = "🏆 سجل النتائج", "🛡 إدارة المشرفين"
+MENU_CANCEL, MENU_HOME = "❌ إلغاء", "🏠 القائمة الرئيسية"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("roulette")
 flows = {}
 
 @contextmanager
@@ -21,295 +26,398 @@ def database():
     con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
     try:
-        con.execute('PRAGMA foreign_keys=ON')
-        con.execute('PRAGMA busy_timeout=30000')
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA busy_timeout=30000")
         yield con
         con.commit()
     except Exception:
-        con.rollback(); raise
-    finally: con.close()
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 def now(): return int(time.time())
+
 def init_db():
-    with database() as c:
-        c.execute('PRAGMA journal_mode=WAL')
-        c.executescript('''
-        CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY, added_at INTEGER NOT NULL, added_by INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS giveaways(id INTEGER PRIMARY KEY AUTOINCREMENT, creator_id INTEGER NOT NULL, chat_id INTEGER, chat_title TEXT, message_id INTEGER, title TEXT NOT NULL, winner_count INTEGER NOT NULL, duration_seconds INTEGER NOT NULL, exclude_previous INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'draft', created_at INTEGER NOT NULL, ends_at INTEGER, closed_at INTEGER, drawn_at INTEGER);
-        CREATE TABLE IF NOT EXISTS participants(giveaway_id INTEGER NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE, user_id INTEGER NOT NULL, username TEXT, full_name TEXT NOT NULL, joined_at INTEGER NOT NULL, excluded INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(giveaway_id,user_id));
-        CREATE TABLE IF NOT EXISTS winners(giveaway_id INTEGER NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE, user_id INTEGER NOT NULL, username TEXT, full_name TEXT NOT NULL, place INTEGER NOT NULL, drawn_at INTEGER NOT NULL, PRIMARY KEY(giveaway_id,user_id), UNIQUE(giveaway_id,place));
+    with database() as con:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY,added_at INTEGER NOT NULL,added_by INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS giveaways(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,creator_id INTEGER NOT NULL,chat_id INTEGER,chat_title TEXT,message_id INTEGER,
+          title TEXT NOT NULL,winner_count INTEGER NOT NULL,duration_seconds INTEGER NOT NULL DEFAULT 0,
+          exclude_previous INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'draft',created_at INTEGER NOT NULL,
+          ends_at INTEGER,closed_at INTEGER,drawn_at INTEGER);
+        CREATE TABLE IF NOT EXISTS participants(
+          giveaway_id INTEGER NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,user_id INTEGER NOT NULL,
+          username TEXT,full_name TEXT NOT NULL,joined_at INTEGER NOT NULL,excluded INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY(giveaway_id,user_id));
+        CREATE TABLE IF NOT EXISTS winners(
+          giveaway_id INTEGER NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,user_id INTEGER NOT NULL,
+          username TEXT,full_name TEXT NOT NULL,place INTEGER NOT NULL,drawn_at INTEGER NOT NULL,
+          PRIMARY KEY(giveaway_id,user_id),UNIQUE(giveaway_id,place));
         CREATE TABLE IF NOT EXISTS previous_winners(user_id INTEGER PRIMARY KEY,last_won_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_id INTEGER NOT NULL,action TEXT NOT NULL,giveaway_id INTEGER,details TEXT,created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS audit_log(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,actor_id INTEGER NOT NULL,action TEXT NOT NULL,
+          giveaway_id INTEGER,details TEXT,created_at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_giveaway_status ON giveaways(status);
         CREATE INDEX IF NOT EXISTS idx_participants_giveaway ON participants(giveaway_id);
-        ''')
-def audit(c, actor, action, gid=None, details=None):
-    c.execute('INSERT INTO audit_log(actor_id,action,giveaway_id,details,created_at) VALUES(?,?,?,?,?)',(actor,action,gid,details,now()))
+        """)
+
+def audit(con, actor, action, gid=None, details=None):
+    con.execute("INSERT INTO audit_log(actor_id,action,giveaway_id,details,created_at) VALUES(?,?,?,?,?)",
+                (actor, action, gid, details, now()))
+
 def get_giveaway(gid):
-    with database() as c: return c.execute('SELECT * FROM giveaways WHERE id=?',(gid,)).fetchone()
+    with database() as con: return con.execute("SELECT * FROM giveaways WHERE id=?", (gid,)).fetchone()
+
 def is_owner(uid): return uid == OWNER_ID
+
 def is_admin(uid):
     if is_owner(uid): return True
-    with database() as c: return c.execute('SELECT 1 FROM admins WHERE user_id=?',(uid,)).fetchone() is not None
-def can_manage(uid,g): return bool(g and (is_owner(uid) or (is_admin(uid) and g['creator_id']==uid)))
+    with database() as con: return con.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone() is not None
+
+def can_manage(uid, g):
+    return bool(g and (is_owner(uid) or (is_admin(uid) and g["creator_id"] == uid)))
+
 def participant_count(gid):
-    with database() as c: return c.execute('SELECT COUNT(*) FROM participants WHERE giveaway_id=? AND excluded=0',(gid,)).fetchone()[0]
+    with database() as con:
+        return con.execute("SELECT COUNT(*) FROM participants WHERE giveaway_id=? AND excluded=0", (gid,)).fetchone()[0]
+
 def main_keyboard(uid):
-    rows=[[KeyboardButton(MENU_CREATE)],[KeyboardButton(MENU_MINE),KeyboardButton(MENU_STATS)],[KeyboardButton(MENU_HISTORY)]]
+    rows = [[KeyboardButton(MENU_CREATE)], [KeyboardButton(MENU_MINE), KeyboardButton(MENU_STATS)],
+            [KeyboardButton(MENU_HISTORY)]]
     if is_owner(uid): rows.append([KeyboardButton(MENU_ADMINS)])
     rows.append([KeyboardButton(MENU_CANCEL)])
-    return ReplyKeyboardMarkup(rows,resize_keyboard=True,is_persistent=True,input_field_placeholder='اختر عملية من القائمة')
-def post_keyboard(gid,status):
-    rows=[]
-    if status=='open': rows.append([InlineKeyboardButton('🎟 انضمام',callback_data=f'join:{gid}'),InlineKeyboardButton('🚪 مغادرة',callback_data=f'leave:{gid}')])
-    if status in ('open','closed'): rows.append([InlineKeyboardButton('🔒 إغلاق التسجيل',callback_data=f'close:{gid}'),InlineKeyboardButton('🏆 سحب الفائزين',callback_data=f'draw:{gid}')])
-    return InlineKeyboardMarkup(rows) if rows else None
-def post_text(gid):
-    g=get_giveaway(gid)
-    if not g: return 'هذا السحب غير موجود.'
-    states={'draft':'مسودة','open':'🟢 التسجيل مفتوح','closed':'🔒 التسجيل مغلق','drawn':'🏆 انتهى السحب'}
-    end_line=''
-    if g['ends_at']:
-        end=datetime.fromtimestamp(g['ends_at'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-        end_line=f'\n⏳ نهاية التسجيل: <code>{end}</code>'
-    return f"🎡 <b>روليت #{gid}</b>\n\n🎁 <b>{html.escape(g['title'])}</b>\n🏆 عدد الفائزين: <b>{g['winner_count']}</b>\n👥 المشاركون: <b>{participant_count(gid)}</b>\n📌 الحالة: <b>{states.get(g['status'],g['status'])}</b>{end_line}\n\nاستخدم الأزرار أدناه للمشاركة."
-async def refresh_post(context,gid):
-    g=get_giveaway(gid)
-    if not g or g['chat_id'] is None or g['message_id'] is None: return
-    try: await context.bot.edit_message_text(chat_id=g['chat_id'],message_id=g['message_id'],text=post_text(gid),parse_mode='HTML',reply_markup=post_keyboard(gid,g['status']))
-    except BadRequest as e:
-        if 'message is not modified' not in str(e).lower(): log.warning('Post update failed for %s: %s',gid,e)
-    except TelegramError as e: log.warning('Post update failed for %s: %s',gid,e)
-def cancel_job(app,gid):
-    for job in app.job_queue.get_jobs_by_name(f'giveaway-{gid}'): job.schedule_removal()
-def schedule_close(app,gid,ends_at):
-    cancel_job(app,gid)
-    app.job_queue.run_once(timer_close,max(0,ends_at-now()),data={'gid':gid},name=f'giveaway-{gid}')
-async def close_giveaway(context,gid,actor_id=None):
-    with database() as c:
-        c.execute('BEGIN IMMEDIATE')
-        row=c.execute('SELECT status FROM giveaways WHERE id=?',(gid,)).fetchone()
-        if not row or row['status']!='open': return False
-        c.execute("UPDATE giveaways SET status='closed',closed_at=? WHERE id=? AND status='open'",(now(),gid))
-        audit(c,actor_id or OWNER_ID,'close',gid)
-    cancel_job(context.application,gid)
-    await refresh_post(context,gid)
-    return True
-async def timer_close(context):
-    gid=context.job.data['gid']; g=get_giveaway(gid)
-    if not g or g['status']!='open': return
-    if g['ends_at'] and now()<g['ends_at']:
-        schedule_close(context.application,gid,g['ends_at']); return
-    if await close_giveaway(context,gid):
-        g=get_giveaway(gid)
-        try: await context.bot.send_message(g['creator_id'],f'⏰ انتهى التسجيل في السحب #{gid}. استخدم /draw {gid} لسحب الفائزين.')
-        except TelegramError: pass
-async def restore_timers(app):
-    with database() as c: rows=c.execute("SELECT id,ends_at FROM giveaways WHERE status='open' AND ends_at IS NOT NULL").fetchall()
-    for r in rows: schedule_close(app,r['id'],r['ends_at'])
-def perform_draw(gid,actor_id):
-    with database() as c:
-        c.execute('BEGIN IMMEDIATE'); g=c.execute('SELECT * FROM giveaways WHERE id=?',(gid,)).fetchone()
-        if not g: return 'السحب غير موجود.'
-        if g['status'] not in ('open','closed'): return 'تم السحب مسبقاً أو أن السحب غير جاهز.'
-        if not can_manage(actor_id,g): return 'ليس لديك صلاحية إدارة هذا السحب.'
-        if g['ends_at'] and now()<g['ends_at'] and g['status']=='open': return 'لم تنتهِ مدة التسجيل بعد. أغلق التسجيل أولاً إذا أردت السحب المبكر.'
-        people=c.execute('SELECT user_id,username,full_name FROM participants WHERE giveaway_id=? AND excluded=0',(gid,)).fetchall()
-        if g['exclude_previous']:
-            prev={r[0] for r in c.execute('SELECT user_id FROM previous_winners')}; people=[p for p in people if p['user_id'] not in prev]
-        if not people: return 'لا يوجد مشاركون مؤهلون للسحب.'
-        picks=secrets.SystemRandom().sample(list(people),min(g['winner_count'],len(people))); t=now()
-        c.execute("UPDATE giveaways SET status='drawn',closed_at=COALESCE(closed_at,?),drawn_at=? WHERE id=?",(t,t,gid))
-        for place,p in enumerate(picks,1):
-            c.execute('INSERT INTO winners(giveaway_id,user_id,username,full_name,place,drawn_at) VALUES(?,?,?,?,?,?)',(gid,p['user_id'],p['username'],p['full_name'],place,t))
-            c.execute('INSERT INTO previous_winners(user_id,last_won_at) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_won_at=excluded.last_won_at',(p['user_id'],t))
-        audit(c,actor_id,'draw',gid,f'winners={len(picks)}')
-        return picks
-def format_winners(gid,picks):
-    g=get_giveaway(gid); lines=[f'🏆 <b>نتائج الروليت #{gid}</b>',f"🎁 {html.escape(g['title'])}",'']
-    for i,p in enumerate(picks,1):
-        name=html.escape(p['full_name'])
-        if p['username']: name+=f" (@{html.escape(p['username'])})"
-        lines.append(f"{i}. {name} — <code>{p['user_id']}</code>")
-    lines.append(f'\n👥 عدد الفائزين: {len(picks)}'); return '\n'.join(lines)
-async def publish_results(context,gid,picks,reply_message=None):
-    cancel_job(context.application,gid); await refresh_post(context,gid); message=format_winners(gid,picks)
-    if reply_message:
-        try: await reply_message.reply_text(message,parse_mode='HTML')
-        except TelegramError: pass
-    g=get_giveaway(gid)
-    if g and g['chat_id'] is not None:
-        try: await context.bot.send_message(g['chat_id'],message,parse_mode='HTML')
-        except TelegramError as e: log.warning('Publishing results failed: %s',e)
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True,
+                               input_field_placeholder="اختر عملية من القائمة")
 
-async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type!=ChatType.PRIVATE: await update.effective_message.reply_text('افتح البوت في الخاص واستخدم /start.'); return
-    uid=update.effective_user.id
-    await update.effective_message.reply_text('🎡 <b>مرحباً بك في بوت الروليت</b>\n\nاختر أحد الأزرار الموجودة أسفل الشاشة.',parse_mode='HTML',reply_markup=main_keyboard(uid))
-async def cancel(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_user.id; flows.pop(uid,None); await update.effective_message.reply_text('تم إلغاء العملية الحالية.',reply_markup=main_keyboard(uid))
-async def close_command(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_user.id
-    if not is_admin(uid): await update.effective_message.reply_text('ليس لديك صلاحية.'); return
-    if not context.args or not context.args[0].isdigit(): await update.effective_message.reply_text('الاستخدام: /close رقم_السحب'); return
-    gid=int(context.args[0]); g=get_giveaway(gid)
-    if not can_manage(uid,g): await update.effective_message.reply_text('السحب غير موجود أو ليس لديك صلاحية إدارته.'); return
-    ok=await close_giveaway(context,gid,uid); await update.effective_message.reply_text('تم إغلاق التسجيل.' if ok else 'التسجيل مغلق مسبقاً أو غير نشط.')
-async def draw_command(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_user.id
-    if not is_admin(uid): await update.effective_message.reply_text('ليس لديك صلاحية.'); return
-    if not context.args or not context.args[0].isdigit(): await update.effective_message.reply_text('الاستخدام: /draw رقم_السحب'); return
-    gid=int(context.args[0]); result=perform_draw(gid,uid)
-    if isinstance(result,str): await update.effective_message.reply_text(result); return
-    await publish_results(context,gid,result,update.effective_message)
-async def addadmin_command(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_user.id
-    if not is_owner(uid): await update.effective_message.reply_text('هذه العملية للمالك فقط.'); return
-    if not context.args or not context.args[0].isdigit(): await update.effective_message.reply_text('الاستخدام: /addadmin USER_ID'); return
-    target=int(context.args[0])
-    if target==OWNER_ID: await update.effective_message.reply_text('المالك لديه الصلاحيات مسبقاً.'); return
-    with database() as c: c.execute('INSERT OR IGNORE INTO admins(user_id,added_at,added_by) VALUES(?,?,?)',(target,now(),uid)); audit(c,uid,'add_admin',details=str(target))
-    await update.effective_message.reply_text('تمت إضافة المشرف.')
-async def deladmin_command(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_user.id
-    if not is_owner(uid): await update.effective_message.reply_text('هذه العملية للمالك فقط.'); return
-    if not context.args or not context.args[0].isdigit(): await update.effective_message.reply_text('الاستخدام: /deladmin USER_ID'); return
-    target=int(context.args[0])
-    with database() as c: c.execute('DELETE FROM admins WHERE user_id=?',(target,)); audit(c,uid,'delete_admin',details=str(target))
-    await update.effective_message.reply_text('تم حذف المشرف إن كان مسجلاً.')
-async def exclude_command(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_user.id
-    if not is_admin(uid): await update.effective_message.reply_text('ليس لديك صلاحية.'); return
-    if len(context.args)!=2 or not all(x.isdigit() for x in context.args): await update.effective_message.reply_text('الاستخدام: /exclude USER_ID GIVEAWAY_ID'); return
-    user_id,gid=map(int,context.args)
-    with database() as c:
-        c.execute('BEGIN IMMEDIATE'); g=c.execute('SELECT * FROM giveaways WHERE id=?',(gid,)).fetchone()
-        if not can_manage(uid,g) or g['status']!='open': await update.effective_message.reply_text('لا يمكن استبعاد مشارك من هذا السحب.'); return
-        cur=c.execute('UPDATE participants SET excluded=1 WHERE giveaway_id=? AND user_id=?',(gid,user_id))
-        if cur.rowcount: audit(c,uid,'exclude',gid,str(user_id))
-    if cur.rowcount: await refresh_post(context,gid); await update.effective_message.reply_text('تم استبعاد المشارك.')
-    else: await update.effective_message.reply_text('المشارك غير موجود.')
-async def show_mine(message,uid):
-    with database() as c: rows=c.execute('SELECT id,title,status,winner_count FROM giveaways WHERE creator_id=? ORDER BY id DESC LIMIT 20',(uid,)).fetchall()
-    if not rows: await message.reply_text('لا توجد سحوبات مسجلة.'); return
-    lines=['📋 <b>سحوباتك</b>\n']
-    for r in rows: lines.append(f"🎡 #{r['id']} — {html.escape(r['title'])}\nالحالة: {html.escape(r['status'])} | الفائزون: {r['winner_count']}\n/close {r['id']} | /draw {r['id']}\n")
-    await message.reply_text('\n'.join(lines),parse_mode='HTML')
+def post_keyboard(gid, status):
+    rows = [[InlineKeyboardButton("🎟 انضمام", callback_data=f"join:{gid}"),
+             InlineKeyboardButton("🚪 مغادرة", callback_data=f"leave:{gid}")]] if status == "open" else []
+    return InlineKeyboardMarkup(rows)
+
+def post_text(gid):
+    g = get_giveaway(gid)
+    if not g: return "هذا السحب غير موجود."
+    states = {"draft":"مسودة", "open":"🟢 التسجيل مفتوح", "closed":"🔒 التسجيل مغلق", "drawn":"🏆 انتهى السحب"}
+    end_line = ""
+    if g["ends_at"]:
+        end_line = "\n⏳ نهاية التسجيل: <code>" + datetime.fromtimestamp(g["ends_at"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC") + "</code>"
+    return (f"🎡 <b>روليت #{gid}</b>\n\n🎁 <b>{html.escape(g['title'])}</b>\n"
+            f"🏆 عدد الفائزين: <b>{g['winner_count']}</b>\n👥 المشاركون: <b>{participant_count(gid)}</b>\n"
+            f"📌 الحالة: <b>{states.get(g['status'], g['status'])}</b>{end_line}\n\nاضغط انضمام للمشاركة.")
+
+async def refresh_post(context, gid):
+    g = get_giveaway(gid)
+    if not g or not g["chat_id"] or not g["message_id"]: return
+    try:
+        await context.bot.edit_message_text(chat_id=g["chat_id"], message_id=g["message_id"],
+            text=post_text(gid), parse_mode="HTML", reply_markup=post_keyboard(gid, g["status"]))
+    except TelegramError as exc: log.warning("تعذر تحديث منشور السحب %s: %s", gid, exc)
+
+async def close_giveaway(context, gid, actor_id=None):
+    with database() as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM giveaways WHERE id=?", (gid,)).fetchone()
+        if not row or row["status"] != "open": return False
+        con.execute("UPDATE giveaways SET status='closed',closed_at=? WHERE id=? AND status='open'", (now(), gid))
+        audit(con, actor_id or OWNER_ID, "close", gid)
+    await refresh_post(context, gid)
+    return True
+
+async def timer_close(context):
+    gid = context.job.data["gid"]
+    if await close_giveaway(context, gid):
+        g = get_giveaway(gid)
+        if g:
+            try: await context.bot.send_message(g["creator_id"], f"⏰ انتهى التسجيل في السحب #{gid}. استخدم /draw {gid} لسحب الفائزين.")
+            except TelegramError: pass
+
+async def restore_timers(app):
+    with database() as con: rows = con.execute("SELECT id,ends_at FROM giveaways WHERE status='open'").fetchall()
+    for r in rows:
+        if r["ends_at"] is not None:
+            app.job_queue.run_once(timer_close, when=max(0, r["ends_at"]-now()), data={"gid":r["id"]}, name=f"giveaway-{r['id']}")
+    log.info("تم استرجاع مؤقتات السحوبات.")
+
+def perform_draw(gid, actor_id):
+    with database() as con:
+        con.execute("BEGIN IMMEDIATE")
+        g = con.execute("SELECT * FROM giveaways WHERE id=?", (gid,)).fetchone()
+        if not g: return "السحب غير موجود."
+        if g["status"] not in ("open","closed"): return "تم السحب مسبقاً أو أن السحب غير جاهز."
+        if not can_manage(actor_id, g): return "ليس لديك صلاحية إدارة هذا السحب."
+        people = con.execute("SELECT user_id,username,full_name FROM participants WHERE giveaway_id=? AND excluded=0", (gid,)).fetchall()
+        if g["exclude_previous"]:
+            previous = {r["user_id"] for r in con.execute("SELECT user_id FROM previous_winners").fetchall()}
+            people = [p for p in people if p["user_id"] not in previous]
+        if not people: return "لا يوجد مشاركون مؤهلون للسحب."
+        picks = secrets.SystemRandom().sample(list(people), min(g["winner_count"], len(people)))
+        stamp = now()
+        con.execute("UPDATE giveaways SET status='drawn',closed_at=COALESCE(closed_at,?),drawn_at=? WHERE id=?", (stamp, stamp, gid))
+        for place,p in enumerate(picks,1):
+            con.execute("INSERT INTO winners(giveaway_id,user_id,username,full_name,place,drawn_at) VALUES(?,?,?,?,?,?)",
+                        (gid,p["user_id"],p["username"],p["full_name"],place,stamp))
+            con.execute("""INSERT INTO previous_winners(user_id,last_won_at) VALUES(?,?)
+                           ON CONFLICT(user_id) DO UPDATE SET last_won_at=excluded.last_won_at""", (p["user_id"],stamp))
+        audit(con, actor_id, "draw", gid, f"winners={len(picks)}")
+        return picks
+
+def format_winners(gid, picks):
+    g = get_giveaway(gid)
+    lines = [f"🏆 <b>نتائج الروليت #{gid}</b>", f"🎁 {html.escape(g['title'])}", ""]
+    for place,p in enumerate(picks,1):
+        name = html.escape(p["full_name"])
+        if p["username"]: name += f" (@{html.escape(p['username'])})"
+        lines.append(f"{place}. {name}")
+    lines.append(f"\n👥 عدد الفائزين: {len(picks)}")
+    return "\n".join(lines)
+
+async def publish_results(context, gid, picks, reply_message=None):
+    await refresh_post(context, gid)
+    text = format_winners(gid, picks)
+    if reply_message: await reply_message.reply_text(text, parse_mode="HTML")
+    g = get_giveaway(gid)
+    if g and g["chat_id"]:
+        try: await context.bot.send_message(g["chat_id"], text, parse_mode="HTML")
+        except TelegramError as exc: log.warning("تعذر نشر النتائج: %s", exc)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.effective_message: return
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text("افتح البوت في الخاص واستخدم /start.")
+        return
+    uid = update.effective_user.id
+    log.info("وصل /start من user_id=%s", uid)
+    await update.effective_message.reply_text(
+        "🎡 <b>مرحباً بك في بوت الروليت</b>\n\nاختر أحد الأزرار أسفل الشاشة.\n"
+        "إذا لم تظهر القائمة، اضغط أيقونة لوحة المفاتيح بجانب خانة الكتابة.",
+        parse_mode="HTML", reply_markup=main_keyboard(uid))
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    flows.pop(uid, None)
+    await update.effective_message.reply_text("تم إلغاء العملية الحالية.", reply_markup=main_keyboard(uid))
+
+async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid): await update.effective_message.reply_text("ليس لديك صلاحية."); return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("الاستخدام: /close رقم_السحب"); return
+    gid = int(context.args[0])
+    if not can_manage(uid, get_giveaway(gid)):
+        await update.effective_message.reply_text("السحب غير موجود أو ليس لديك صلاحية إدارته."); return
+    ok = await close_giveaway(context, gid, uid)
+    await update.effective_message.reply_text("تم إغلاق التسجيل." if ok else "التسجيل مغلق مسبقاً أو غير نشط.")
+
+async def draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid): await update.effective_message.reply_text("ليس لديك صلاحية."); return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("الاستخدام: /draw رقم_السحب"); return
+    gid = int(context.args[0])
+    result = perform_draw(gid, uid)
+    if isinstance(result, str): await update.effective_message.reply_text(result); return
+    await publish_results(context, gid, result, update.effective_message)
+
+async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_owner(uid): await update.effective_message.reply_text("هذه العملية للمالك فقط."); return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("الاستخدام: /addadmin USER_ID"); return
+    target = int(context.args[0])
+    if target == OWNER_ID: await update.effective_message.reply_text("المالك لديه الصلاحيات مسبقاً."); return
+    with database() as con:
+        con.execute("INSERT OR IGNORE INTO admins(user_id,added_at,added_by) VALUES(?,?,?)", (target,now(),uid))
+        audit(con,uid,"add_admin",details=str(target))
+    await update.effective_message.reply_text("تمت إضافة المشرف.")
+
+async def deladmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_owner(uid): await update.effective_message.reply_text("هذه العملية للمالك فقط."); return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("الاستخدام: /deladmin USER_ID"); return
+    target = int(context.args[0])
+    with database() as con:
+        con.execute("DELETE FROM admins WHERE user_id=?", (target,))
+        audit(con,uid,"delete_admin",details=str(target))
+    await update.effective_message.reply_text("تم حذف المشرف إن كان مسجلاً.")
+
+async def exclude_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid): await update.effective_message.reply_text("ليس لديك صلاحية."); return
+    if len(context.args)!=2 or not all(x.isdigit() for x in context.args):
+        await update.effective_message.reply_text("الاستخدام: /exclude USER_ID GIVEAWAY_ID"); return
+    user_id,gid = map(int,context.args)
+    g = get_giveaway(gid)
+    if not can_manage(uid,g) or g["status"]!="open":
+        await update.effective_message.reply_text("لا يمكن استبعاد مشارك من هذا السحب."); return
+    with database() as con:
+        cur=con.execute("UPDATE participants SET excluded=1 WHERE giveaway_id=? AND user_id=?",(gid,user_id))
+        if cur.rowcount: audit(con,uid,"exclude",gid,str(user_id))
+    if cur.rowcount:
+        await refresh_post(context,gid); await update.effective_message.reply_text("تم استبعاد المشارك.")
+    else: await update.effective_message.reply_text("المشارك غير موجود.")
+
+async def show_mine(message, uid):
+    with database() as con:
+        rows=con.execute("SELECT id,title,status,winner_count FROM giveaways WHERE creator_id=? ORDER BY id DESC LIMIT 20",(uid,)).fetchall()
+    if not rows: await message.reply_text("لا توجد سحوبات مسجلة."); return
+    lines=["📋 <b>سحوباتك</b>\n"]
+    for r in rows:
+        lines.append(f"🎡 #{r['id']} — {html.escape(r['title'])}\nالحالة: {html.escape(r['status'])} | الفائزون: {r['winner_count']}\n/close {r['id']} | /draw {r['id']}\n")
+    await message.reply_text("\n".join(lines),parse_mode="HTML")
+
 async def show_stats(message):
-    with database() as c:
-        total=c.execute('SELECT COUNT(*) FROM giveaways').fetchone()[0]; opened=c.execute("SELECT COUNT(*) FROM giveaways WHERE status='open'").fetchone()[0]; entries=c.execute('SELECT COUNT(*) FROM participants WHERE excluded=0').fetchone()[0]; winners=c.execute('SELECT COUNT(*) FROM winners').fetchone()[0]
-    await message.reply_text(f'📊 <b>إحصائيات البوت</b>\n\n🎡 جميع السحوبات: {total}\n🟢 السحوبات المفتوحة: {opened}\n👥 المشاركات الفعالة: {entries}\n🏆 سجلات الفائزين: {winners}',parse_mode='HTML')
+    with database() as con:
+        total=con.execute("SELECT COUNT(*) FROM giveaways").fetchone()[0]
+        opened=con.execute("SELECT COUNT(*) FROM giveaways WHERE status='open'").fetchone()[0]
+        entries=con.execute("SELECT COUNT(*) FROM participants WHERE excluded=0").fetchone()[0]
+        winners=con.execute("SELECT COUNT(*) FROM winners").fetchone()[0]
+    await message.reply_text(f"📊 <b>إحصائيات البوت</b>\n\n🎡 جميع السحوبات: {total}\n🟢 السحوبات المفتوحة: {opened}\n👥 المشاركات الفعالة: {entries}\n🏆 سجلات الفائزين: {winners}",parse_mode="HTML")
+
 async def show_history(message):
-    with database() as c:
-        rows=c.execute("SELECT id,title FROM giveaways WHERE status='drawn' ORDER BY drawn_at DESC LIMIT 10").fetchall(); results=[]
-        for r in rows: results.append((r,c.execute('SELECT full_name,username,place FROM winners WHERE giveaway_id=? ORDER BY place',(r['id'],)).fetchall()))
-    if not results: await message.reply_text('لا توجد نتائج حتى الآن.'); return
-    lines=['🏆 <b>آخر نتائج الروليت</b>\n']
+    with database() as con:
+        rows=con.execute("SELECT id,title FROM giveaways WHERE status='drawn' ORDER BY drawn_at DESC LIMIT 10").fetchall()
+        results=[]
+        for r in rows:
+            ws=con.execute("SELECT full_name,username,place FROM winners WHERE giveaway_id=? ORDER BY place",(r["id"],)).fetchall()
+            results.append((r,ws))
+    if not results: await message.reply_text("لا توجد نتائج حتى الآن."); return
+    lines=["🏆 <b>آخر نتائج الروليت</b>\n"]
     for r,ws in results:
         lines.append(f"\n🎡 <b>#{r['id']}</b> — {html.escape(r['title'])}")
         for w in ws:
-            name=html.escape(w['full_name'])
-            if w['username']: name+=f" (@{html.escape(w['username'])})"
+            name=html.escape(w["full_name"])
+            if w["username"]: name+=f" (@{html.escape(w['username'])})"
             lines.append(f"{w['place']}. {name}")
-    await message.reply_text('\n'.join(lines),parse_mode='HTML')
+    await message.reply_text("\n".join(lines),parse_mode="HTML")
 
-async def callback(update:Update,context:ContextTypes.DEFAULT_TYPE):
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if not q: return
-    uid=q.from_user.id; data=q.data or ''; alert=None; reply=None
+    data=q.data or ""; uid=q.from_user.id
     try:
-        if ':' not in data: await q.answer('طلب غير صالح.',show_alert=True); return
-        action,gid_text=data.split(':',1)
-        if not gid_text.isdigit(): await q.answer('طلب غير صالح.',show_alert=True); return
+        if not data.startswith(("join:","leave:")):
+            await q.answer(); return
+        action,gid_text=data.split(":",1)
+        if not gid_text.isdigit(): await q.answer("طلب غير صالح.",show_alert=True); return
         gid=int(gid_text); g=get_giveaway(gid)
-        if action in ('join','leave'):
-            if q.from_user.is_bot: await q.answer('حسابات البوتات لا تشارك.',show_alert=True); return
-            with database() as c:
-                c.execute('BEGIN IMMEDIATE'); current=c.execute('SELECT * FROM giveaways WHERE id=?',(gid,)).fetchone()
-                if not current or current['status']!='open' or (current['ends_at'] and now()>=current['ends_at']):
-                    if current and current['status']=='open' and current['ends_at'] and now()>=current['ends_at']:
-                        c.execute("UPDATE giveaways SET status='closed',closed_at=? WHERE id=? AND status='open'",(now(),gid)); audit(c,OWNER_ID,'auto_close',gid)
-                    alert='انتهى التسجيل أو أن السحب مغلق.'
-                elif action=='join':
-                    old=c.execute('SELECT excluded FROM participants WHERE giveaway_id=? AND user_id=?',(gid,uid)).fetchone()
-                    c.execute('INSERT INTO participants(giveaway_id,user_id,username,full_name,joined_at,excluded) VALUES(?,?,?,?,?,0) ON CONFLICT(giveaway_id,user_id) DO UPDATE SET username=excluded.username,full_name=excluded.full_name,joined_at=excluded.joined_at,excluded=0',(gid,uid,q.from_user.username,q.from_user.full_name,now()))
-                    audit(c,uid,'join',gid); alert='تم تسجيل مشاركتك 🎟' if not old else 'تم تحديث مشاركتك.'
-                else:
-                    cur=c.execute('DELETE FROM participants WHERE giveaway_id=? AND user_id=?',(gid,uid)); audit(c,uid,'leave',gid); alert='تم إلغاء مشاركتك.' if cur.rowcount else 'أنت غير مسجل في هذا السحب.'
-            await q.answer(alert,show_alert=True); await refresh_post(context,gid); return
-        if action in ('close','draw'):
-            if not can_manage(uid,g): await q.answer('هذا الزر مخصص لمدير السحب.',show_alert=True); return
-            await q.answer()
-            if action=='close':
-                changed=await close_giveaway(context,gid,uid); reply='تم إغلاق التسجيل.' if changed else 'التسجيل مغلق مسبقاً أو غير نشط.'
-                await q.message.reply_text(reply); return
-            result=perform_draw(gid,uid)
-            if isinstance(result,str): await q.message.reply_text(result); return
-            await publish_results(context,gid,result,q.message); return
-        await q.answer('زر غير معروف.',show_alert=True)
-    except TelegramError as e: log.warning('Telegram callback error: %s',e)
-    except Exception: log.exception('Callback failed')
+        if not g or g["status"]!="open": await q.answer("التسجيل مغلق.",show_alert=True); return
+        if q.from_user.is_bot: await q.answer("حسابات البوتات لا تشارك.",show_alert=True); return
+        with database() as con:
+            con.execute("BEGIN IMMEDIATE")
+            current=con.execute("SELECT status FROM giveaways WHERE id=?",(gid,)).fetchone()
+            if not current or current["status"]!="open":
+                await q.answer("التسجيل مغلق.",show_alert=True); return
+            if action=="join":
+                con.execute("""INSERT INTO participants(giveaway_id,user_id,username,full_name,joined_at,excluded)
+                    VALUES(?,?,?,?,?,0) ON CONFLICT(giveaway_id,user_id) DO UPDATE SET
+                    username=excluded.username,full_name=excluded.full_name,joined_at=excluded.joined_at,excluded=0""",
+                    (gid,uid,q.from_user.username,q.from_user.full_name,now()))
+                audit(con,uid,"join",gid); answer="تم تسجيل مشاركتك 🎟"
+            else:
+                con.execute("DELETE FROM participants WHERE giveaway_id=? AND user_id=?",(gid,uid))
+                audit(con,uid,"leave",gid); answer="تم إلغاء مشاركتك."
+        await q.answer(answer,show_alert=True)
+        await refresh_post(context,gid)
+    except TelegramError as exc: log.warning("خطأ Telegram في الزر: %s",exc)
+    except Exception: log.exception("فشل تنفيذ زر المشاركة")
 
-async def flow_message(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.effective_message or update.effective_chat.type!=ChatType.PRIVATE: return
-    uid=update.effective_user.id; m=update.effective_message; text=(m.text or '').strip()
-    if text==MENU_CANCEL: flows.pop(uid,None); await m.reply_text('تم إلغاء العملية.',reply_markup=main_keyboard(uid)); return
-    if text in ('/start','🏠 القائمة الرئيسية'): flows.pop(uid,None); await m.reply_text('القائمة الرئيسية:',reply_markup=main_keyboard(uid)); return
+async def flow_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.effective_message: return
+    message=update.effective_message; uid=update.effective_user.id
+    if message.chat.type!=ChatType.PRIVATE: return
+    text=(message.text or "").strip()
+    if text in (MENU_CANCEL,MENU_HOME):
+        flows.pop(uid,None)
+        await message.reply_text("تم إلغاء العملية." if text==MENU_CANCEL else "القائمة الرئيسية:",reply_markup=main_keyboard(uid)); return
     if text==MENU_CREATE:
-        if not is_admin(uid): await m.reply_text('هذه الميزة للمشرفين فقط.',reply_markup=main_keyboard(uid)); return
-        flows[uid]={'step':'title'}; await m.reply_text('🎁 أرسل عنوان الجائزة أو السحب:'); return
-    if text==MENU_MINE: await show_mine(m,uid); return
-    if text==MENU_STATS: await show_stats(m); return
-    if text==MENU_HISTORY: await show_history(m); return
+        if not is_admin(uid): await message.reply_text("إنشاء السحوبات متاح للمالك والمشرفين فقط.",reply_markup=main_keyboard(uid)); return
+        flows[uid]={"step":"title"}; await message.reply_text("🎁 أرسل عنوان الجائزة أو السحب:"); return
+    if text==MENU_MINE: await show_mine(message,uid); return
+    if text==MENU_STATS: await show_stats(message); return
+    if text==MENU_HISTORY: await show_history(message); return
     if text==MENU_ADMINS:
-        if is_owner(uid): await m.reply_text('🛡 إدارة المشرفين\n/addadmin USER_ID لإضافة مشرف\n/deladmin USER_ID لحذفه')
-        else: await m.reply_text('هذه الميزة للمالك فقط.')
-        return
+        if not is_owner(uid): await message.reply_text("هذه الميزة للمالك فقط."); return
+        await message.reply_text("🛡 إدارة المشرفين\nإضافة: /addadmin USER_ID\nحذف: /deladmin USER_ID"); return
     f=flows.get(uid)
     if not f: return
-    if not is_admin(uid): flows.pop(uid,None); await m.reply_text('ليس لديك صلاحية.'); return
-    step=f.get('step')
-    if step=='title':
-        if not text or len(text)>MAX_TITLE_LENGTH: await m.reply_text(f'العنوان يجب أن يكون بين 1 و{MAX_TITLE_LENGTH} حرفاً.'); return
-        f.update(title=text,step='winners'); await m.reply_text('🏆 كم عدد الفائزين؟ أرسل رقماً من 1 إلى 100.'); return
-    if step=='winners':
-        if not text.isdigit() or not 1<=int(text)<=MAX_WINNERS: await m.reply_text('أرسل رقماً من 1 إلى 100.'); return
-        f.update(winner_count=int(text),step='duration'); await m.reply_text('⏳ مدة التسجيل بالدقائق (0 دون مؤقت):'); return
-    if step=='duration':
-        if not text.isdigit() or int(text)>MAX_DURATION_MINUTES: await m.reply_text(f'أرسل رقماً من 0 إلى {MAX_DURATION_MINUTES}.'); return
-        f.update(duration=int(text)*60,step='exclude_previous'); await m.reply_text('هل تريد استبعاد الفائزين السابقين؟ أرسل نعم أو لا.'); return
-    if step=='exclude_previous':
-        if text.casefold() not in ('نعم','لا','yes','no'): await m.reply_text('أرسل نعم أو لا.'); return
-        f.update(exclude_previous=int(text.casefold() in ('نعم','yes')),step='destination'); await m.reply_text('📍 أرسل @اسم_القناة أو معرّف القناة/المجموعة الرقمي، وتأكد من صلاحيات البوت.'); return
-    if step=='destination':
-        if text.startswith('@') and 2<len(text)<=64 and text[1:].replace('_','').isalnum(): target=text
+    if not is_admin(uid): flows.pop(uid,None); await message.reply_text("ليس لديك صلاحية."); return
+    step=f["step"]
+    if step=="title":
+        if not text or len(text)>MAX_TITLE_LENGTH: await message.reply_text(f"العنوان يجب أن يكون بين 1 و{MAX_TITLE_LENGTH} حرفاً."); return
+        f["title"]=text; f["step"]="winners"; await message.reply_text("🏆 كم عدد الفائزين؟ أرسل رقماً من 1 إلى 100."); return
+    if step=="winners":
+        if not text.isdigit() or not 1<=int(text)<=MAX_WINNERS: await message.reply_text("أرسل رقماً من 1 إلى 100."); return
+        f["winner_count"]=int(text); f["step"]="duration"; await message.reply_text("⏳ مدة التسجيل بالدقائق. أرسل 0 للتسجيل دون مؤقت."); return
+    if step=="duration":
+        if not text.isdigit() or int(text)>MAX_DURATION_MINUTES: await message.reply_text(f"أرسل رقماً من 0 إلى {MAX_DURATION_MINUTES}."); return
+        f["duration"]=int(text)*60; f["step"]="exclude_previous"; await message.reply_text("استبعاد الفائزين السابقين؟ أرسل نعم أو لا."); return
+    if step=="exclude_previous":
+        ans=text.casefold()
+        if ans not in ("نعم","لا","yes","no"): await message.reply_text("أرسل نعم أو لا."); return
+        f["exclude_previous"]=int(ans in ("نعم","yes")); f["step"]="destination"
+        await message.reply_text("📍 أرسل @اسم_القناة أو المعرّف الرقمي للقناة/المجموعة. أضف البوت إليها وامنحه صلاحية النشر."); return
+    if step=="destination":
+        if text.startswith("@") and len(text)>1: target=text
         else:
             try: target=int(text)
-            except ValueError: await m.reply_text('أرسل @username أو معرّفاً رقمياً صالحاً.'); return
-        f.update(target=target,step='confirm'); await m.reply_text(f"📋 تأكيد السحب\n\n🎁 {html.escape(f['title'])}\n🏆 الفائزون: {f['winner_count']}\n⏳ المدة: {f['duration']//60} دقيقة\n📍 الوجهة: <code>{html.escape(str(target))}</code>\n\nأرسل نعم للنشر أو لا للإلغاء.",parse_mode='HTML'); return
-    if step=='confirm':
-        if text.casefold() not in ('نعم','yes'): flows.pop(uid,None); await m.reply_text('تم إلغاء إنشاء السحب.',reply_markup=main_keyboard(uid)); return
-        target=f['target']; duration=f['duration']; ends=now()+duration if duration else None
-        with database() as c:
-            cur=c.execute("INSERT INTO giveaways(creator_id,title,winner_count,duration_seconds,exclude_previous,status,created_at,ends_at) VALUES(?,?,?,?,?,'draft',?,?)",(uid,f['title'],f['winner_count'],duration,f['exclude_previous'],now(),ends)); gid=cur.lastrowid; audit(c,uid,'create',gid,str(target))
+            except ValueError: await message.reply_text("أرسل @username أو معرّفاً رقمياً صالحاً."); return
+        f["target"]=target; f["step"]="confirm"
+        await message.reply_text("📋 <b>تأكيد السحب</b>\n\n"
+            f"🎁 {html.escape(f['title'])}\n🏆 عدد الفائزين: {f['winner_count']}\n"
+            f"⏳ المدة: {f['duration']//60} دقيقة\n📍 الوجهة: <code>{html.escape(str(target))}</code>\n\nأرسل نعم للنشر أو لا للإلغاء.",parse_mode="HTML"); return
+    if step=="confirm":
+        if text.casefold() not in ("نعم","yes"):
+            flows.pop(uid,None); await message.reply_text("تم إلغاء إنشاء السحب.",reply_markup=main_keyboard(uid)); return
+        target=f["target"]; duration=f["duration"]; ends=now()+duration if duration else None
+        with database() as con:
+            cur=con.execute("""INSERT INTO giveaways(creator_id,title,winner_count,duration_seconds,exclude_previous,status,created_at,ends_at)
+                VALUES(?,?,?,?,?,'draft',?,?)""",(uid,f["title"],f["winner_count"],duration,f["exclude_previous"],now(),ends))
+            gid=cur.lastrowid; audit(con,uid,"create",gid,str(target))
         try:
-            sent=await context.bot.send_message(chat_id=target,text=post_text(gid),parse_mode='HTML',reply_markup=post_keyboard(gid,'open'))
-            with database() as c:
-                c.execute("UPDATE giveaways SET chat_id=?,chat_title=?,message_id=?,status='open' WHERE id=? AND status='draft'",(sent.chat_id,sent.chat.title or sent.chat.username or str(sent.chat_id),sent.message_id,gid)); audit(c,uid,'publish',gid)
+            sent=await context.bot.send_message(chat_id=target,text=post_text(gid),parse_mode="HTML",reply_markup=post_keyboard(gid,"open"))
+            with database() as con:
+                con.execute("UPDATE giveaways SET chat_id=?,chat_title=?,message_id=?,status='open' WHERE id=?",
+                    (sent.chat_id,sent.chat.title or sent.chat.username or str(sent.chat_id),sent.message_id,gid))
+                audit(con,uid,"publish",gid)
             await refresh_post(context,gid)
-            if ends: schedule_close(context.application,gid,ends)
-            await m.reply_text(f'✅ تم نشر السحب #{gid} بنجاح.\n/close {gid}\n/draw {gid}',reply_markup=main_keyboard(uid))
-        except TelegramError as e:
-            log.warning('Publishing failed: %s',e)
-            with database() as c: c.execute("UPDATE giveaways SET status='draft' WHERE id=?",(gid,)); audit(c,uid,'publish_failed',gid,str(e)[:250])
-            await m.reply_text('تعذر النشر. تحقق من الوجهة وصلاحيات البوت.',reply_markup=main_keyboard(uid))
+            if duration: context.job_queue.run_once(timer_close,when=duration,data={"gid":gid},name=f"giveaway-{gid}")
+            await message.reply_text(f"✅ تم نشر السحب #{gid} بنجاح.\nإغلاق التسجيل: /close {gid}\nسحب الفائزين: /draw {gid}",reply_markup=main_keyboard(uid))
+        except TelegramError as exc:
+            log.exception("فشل نشر السحب")
+            with database() as con:
+                con.execute("UPDATE giveaways SET status='draft',chat_id=NULL,message_id=NULL WHERE id=?",(gid,))
+                audit(con,uid,"publish_failed",gid,str(exc)[:250])
+            await message.reply_text("تعذر النشر. تحقق من الوجهة وصلاحيات البوت والاتصال بتيليجرام.",reply_markup=main_keyboard(uid))
         finally: flows.pop(uid,None)
 
-async def post_init(app:Application): await restore_timers(app); log.info('Timers restored')
-async def error_handler(update:object,context:ContextTypes.DEFAULT_TYPE): log.error('Unhandled update exception',exc_info=context.error)
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("خطأ غير معالج أثناء استقبال تحديث: %r",context.error,exc_info=context.error)
+
+async def post_init(app: Application):
+    await restore_timers(app)
+    log.info("تم تهيئة البوت بنجاح.")
+
 def main():
-    if not TOKEN: raise SystemExit('BOT_TOKEN غير موجود. عيّن رمز البوت في متغير البيئة.')
-    init_db(); app=Application.builder().token(TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler('start',start)); app.add_handler(CommandHandler('cancel',cancel)); app.add_handler(CommandHandler('close',close_command)); app.add_handler(CommandHandler('draw',draw_command)); app.add_handler(CommandHandler('exclude',exclude_command)); app.add_handler(CommandHandler('addadmin',addadmin_command)); app.add_handler(CommandHandler('deladmin',deladmin_command)); app.add_handler(CallbackQueryHandler(callback)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,flow_message)); app.add_error_handler(error_handler)
-    log.info('Roulette bot started. Owner ID: %s',OWNER_ID); app.run_polling()
-if __name__=='__main__': main()
+    if not TOKEN:
+        raise SystemExit("لم يتم العثور على BOT_TOKEN.\nفي Termux نفّذ: export BOT_TOKEN='توكن_البوت' ثم أعد التشغيل.")
+    init_db()
+    app=Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("cancel",cancel))
+    app.add_handler(CommandHandler("close",close_command))
+    app.add_handler(CommandHandler("draw",draw_command))
+    app.add_handler(CommandHandler("exclude",exclude_command))
+    app.add_handler(CommandHandler("addadmin",addadmin_command))
+    app.add_handler(CommandHandler("deladmin",deladmin_command))
+    app.add_handler(CallbackQueryHandler(callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,flow_message))
+    app.add_error_handler(error_handler)
+    log.info("بدأ تشغيل بوت الروليت. Owner ID: %s",OWNER_ID)
+    app.run_polling(drop_pending_updates=False)
+
+if __name__=="__main__":
+    main()
