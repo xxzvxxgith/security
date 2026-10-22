@@ -1,35 +1,59 @@
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Cleaner Telegram Bot
+Python 3.10+
+Requires:
+    pip install "python-telegram-bot[job-queue]>=20,<23"
+
+Environment:
+    BOT_TOKEN=YOUR_BOT_TOKEN
+    OWNER_ID=YOUR_TELEGRAM_USER_ID
+"""
+
 import os
-import sys
 import time
 import html
 import sqlite3
 import logging
-from datetime import datetime, timezone
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.constants import ChatType, ChatMemberStatus
 from telegram.error import TelegramError
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
 
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TOKEN = os.getenv("BOT_TOKEN", "8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "1537665613"))
 DEFAULT_ADMINS = {OWNER_ID, 6369115613}
+
 DB_PATH = "bot.db"
 CLEAN_HOURS = 24
+TRACK_RETENTION_HOURS = 48
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("Cleaner")
 
+
+# =========================================================
+# قاعدة البيانات
+# =========================================================
 
 def db():
     con = sqlite3.connect(DB_PATH, timeout=30)
@@ -43,6 +67,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS bot_admins(
             user_id INTEGER PRIMARY KEY
         );
+
         CREATE TABLE IF NOT EXISTS groups(
             chat_id INTEGER PRIMARY KEY,
             title TEXT DEFAULT '',
@@ -61,6 +86,7 @@ def init_db():
             subscription_channel TEXT DEFAULT '',
             subscription_link TEXT DEFAULT ''
         );
+
         CREATE TABLE IF NOT EXISTS users(
             chat_id INTEGER,
             user_id INTEGER,
@@ -68,6 +94,7 @@ def init_db():
             messages INTEGER DEFAULT 0,
             PRIMARY KEY(chat_id,user_id)
         );
+
         CREATE TABLE IF NOT EXISTS tracked_messages(
             chat_id INTEGER,
             message_id INTEGER,
@@ -76,16 +103,19 @@ def init_db():
             kind TEXT DEFAULT 'text',
             PRIMARY KEY(chat_id,message_id)
         );
+
         CREATE TABLE IF NOT EXISTS auto_replies(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER DEFAULT 0,
             keyword TEXT NOT NULL,
             response TEXT NOT NULL
         );
+
         CREATE TABLE IF NOT EXISTS bot_settings(
             key TEXT PRIMARY KEY,
             value TEXT DEFAULT ''
         );
+
         CREATE TABLE IF NOT EXISTS subscription(
             chat_id INTEGER PRIMARY KEY,
             enabled INTEGER DEFAULT 0,
@@ -93,10 +123,13 @@ def init_db():
             group_link TEXT DEFAULT ''
         );
         """)
-        # ترقية قواعد البيانات القديمة من دون حذف البيانات.
-        columns = {r["name"] for r in con.execute(
-            "PRAGMA table_info(groups)"
-        )}
+
+        # ترقية قاعدة البيانات القديمة دون حذف بياناتها.
+        columns = {
+            row["name"]
+            for row in con.execute("PRAGMA table_info(groups)")
+        }
+
         additions = {
             "title": "TEXT DEFAULT ''",
             "enabled": "INTEGER DEFAULT 1",
@@ -114,21 +147,24 @@ def init_db():
             "subscription_channel": "TEXT DEFAULT ''",
             "subscription_link": "TEXT DEFAULT ''",
         }
+
         for name, definition in additions.items():
             if name not in columns:
                 con.execute(
                     f"ALTER TABLE groups ADD COLUMN {name} {definition}"
                 )
+
         for admin_id in DEFAULT_ADMINS:
             con.execute(
                 "INSERT OR IGNORE INTO bot_admins(user_id) VALUES(?)",
-                (admin_id,)
+                (admin_id,),
             )
+
         con.execute("""
             INSERT OR IGNORE INTO bot_settings(key,value)
             VALUES('enabled','1')
         """)
-        # ضمان وجود جدول الإعدادات العامة في الكودين القديمين.
+
         con.execute("""
             INSERT OR IGNORE INTO groups(chat_id,title)
             VALUES(0,'الإعدادات العامة')
@@ -138,16 +174,20 @@ def init_db():
 def setting(key, default=""):
     with db() as con:
         row = con.execute(
-            "SELECT value FROM bot_settings WHERE key=?", (key,)
+            "SELECT value FROM bot_settings WHERE key=?",
+            (key,),
         ).fetchone()
+
     return row["value"] if row else default
 
 
 def set_setting(key, value):
     with db() as con:
         con.execute("""
-            INSERT INTO bot_settings(key,value) VALUES(?,?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            INSERT INTO bot_settings(key,value)
+            VALUES(?,?)
+            ON CONFLICT(key)
+            DO UPDATE SET value=excluded.value
         """, (key, str(value)))
 
 
@@ -158,110 +198,167 @@ def is_owner(uid):
 def is_bot_admin(uid):
     if uid in DEFAULT_ADMINS:
         return True
+
     with db() as con:
         return con.execute(
-            "SELECT 1 FROM bot_admins WHERE user_id=?", (uid,)
+            "SELECT 1 FROM bot_admins WHERE user_id=?",
+            (uid,),
         ).fetchone() is not None
 
 
 def ensure_group(chat_id, title=""):
     with db() as con:
         con.execute("""
-            INSERT OR IGNORE INTO groups(chat_id,title) VALUES(?,?)
+            INSERT OR IGNORE INTO groups(chat_id,title)
+            VALUES(?,?)
         """, (chat_id, title))
+
         if title:
             con.execute(
                 "UPDATE groups SET title=? WHERE chat_id=?",
-                (title, chat_id)
+                (title, chat_id),
             )
 
 
 def get_group(chat_id):
     with db() as con:
         row = con.execute(
-            "SELECT * FROM groups WHERE chat_id=?", (chat_id,)
+            "SELECT * FROM groups WHERE chat_id=?",
+            (chat_id,),
         ).fetchone()
+
     return dict(row) if row else {}
 
 
 def update_group(chat_id, field, value):
     allowed = {
-        "title", "enabled", "replies_enabled", "delete_message",
-        "delete_links", "delete_photos", "delete_videos",
-        "delete_stickers", "delete_gifs", "delete_audio",
-        "delete_files", "delete_forwarded", "subscription_enabled",
-        "subscription_channel", "subscription_link"
+        "title",
+        "enabled",
+        "replies_enabled",
+        "delete_message",
+        "delete_links",
+        "delete_photos",
+        "delete_videos",
+        "delete_stickers",
+        "delete_gifs",
+        "delete_audio",
+        "delete_files",
+        "delete_forwarded",
+        "subscription_enabled",
+        "subscription_channel",
+        "subscription_link",
     }
+
     if field not in allowed:
         return
+
     ensure_group(chat_id)
+
     with db() as con:
         con.execute(
             f"UPDATE groups SET {field}=? WHERE chat_id=?",
-            (value, chat_id)
+            (value, chat_id),
         )
 
+
+# =========================================================
+# الصلاحيات والحذف
+# =========================================================
 
 async def is_group_admin(update, context):
     user = update.effective_user
     chat = update.effective_chat
+
     if not user or not chat:
         return False
+
     if is_owner(user.id):
         return True
+
     if chat.type == ChatType.PRIVATE:
         return is_bot_admin(user.id)
+
     try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
-        return member.status in (
-            ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER
+        member = await context.bot.get_chat_member(
+            chat.id, user.id
         )
+
+        return member.status in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        )
+
     except TelegramError:
         return False
 
 
 async def bot_can_delete(chat_id, context):
     try:
-        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+        me = await context.bot.get_chat_member(
+            chat_id, context.bot.id
+        )
+
         return (
             me.status == ChatMemberStatus.OWNER
             or (
                 me.status == ChatMemberStatus.ADMINISTRATOR
-                and bool(getattr(me, "can_delete_messages", False))
+                and bool(
+                    getattr(me, "can_delete_messages", False)
+                )
             )
         )
+
     except TelegramError:
         return False
 
 
 async def safe_delete(chat_id, message_id, context):
     try:
-        await context.bot.delete_message(chat_id, message_id)
+        await context.bot.delete_message(
+            chat_id, message_id
+        )
         return True
+
     except TelegramError as exc:
-        log.debug("تعذر حذف الرسالة %s: %s", message_id, exc)
+        log.debug(
+            "تعذر حذف الرسالة %s: %s",
+            message_id,
+            exc,
+        )
         return False
 
 
-# ---------------- لوحة الأزرار العائمة ----------------
+# =========================================================
+# لوحة التحكم
+# =========================================================
 
 def kb(rows):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label, callback_data=data)
-         for label, data in row]
+        [
+            InlineKeyboardButton(label, callback_data=data)
+            for label, data in row
+        ]
         for row in rows
     ])
 
 
 def home_kb():
     return kb([
-        [("⚙️ إعدادات الحذف", "settings"),
-         ("📊 حالة Cleaner", "stats")],
-        [("💬 الردود التلقائية", "replies"),
-         ("🔔 الاشتراك الإجباري", "subscription")],
-        [("👥 إدارة المشرفين", "admins"),
-         ("🏆 التوب", "topmenu")],
-        [("🟢 تشغيل / إيقاف البوت", "global_toggle")],
+        [
+            ("⚙️ إعدادات الحذف", "settings"),
+            ("📊 حالة Cleaner", "stats"),
+        ],
+        [
+            ("💬 الردود التلقائية", "replies"),
+            ("🔔 الاشتراك الإجباري", "subscription"),
+        ],
+        [
+            ("👥 إدارة المشرفين", "admins"),
+            ("🏆 التوب", "topmenu"),
+        ],
+        [
+            ("🟢 تشغيل / إيقاف البوت", "global_toggle"),
+        ],
     ])
 
 
@@ -270,10 +367,10 @@ def back_kb(destination="home"):
 
 
 def settings_kb(chat_id):
-    g = get_group(chat_id)
+    group = get_group(chat_id)
 
     def state(key):
-        return "✅" if g.get(key, 0) else "❌"
+        return "✅" if group.get(key, 0) else "❌"
 
     fields = [
         ("enabled", "تفعيل وظائف الكروب"),
@@ -287,116 +384,330 @@ def settings_kb(chat_id):
         ("delete_files", "حذف الملفات"),
         ("delete_forwarded", "حذف الرسائل المحوّلة"),
     ]
+
     rows = [
-        [(f"{state(field)} {label}", f"toggle:{chat_id}:{field}")]
+        [(
+            f"{state(field)} {label}",
+            f"toggle:{chat_id}:{field}",
+        )]
         for field, label in fields
     ]
-    rows.append([("✏️ تعيين كليشة الحذف", f"delete_text:{chat_id}")])
+
+    rows.append([
+        ("✏️ تعيين كليشة الحذف", f"delete_text:{chat_id}")
+    ])
     rows.append([("⬅️ رجوع", "settings")])
+
     return kb(rows)
 
 
 def groups_kb(action):
     with db() as con:
-        rows = con.execute(
-            "SELECT chat_id,title FROM groups WHERE chat_id<>0 ORDER BY title"
-        ).fetchall()
+        rows = con.execute("""
+            SELECT chat_id,title
+            FROM groups
+            WHERE chat_id<>0
+            ORDER BY title
+        """).fetchall()
+
     buttons = []
+
     for row in rows[:40]:
         title = row["title"] or str(row["chat_id"])
-        buttons.append([(title[:45], f"{action}:{row['chat_id']}")])
+        buttons.append([
+            (title[:45], f"{action}:{row['chat_id']}")
+        ])
+
     buttons.append([("⬅️ رجوع", "home")])
+
     return kb(buttons)
 
 
 async def show_home(query, user_id):
-    state = "🟢 مفعّل" if setting("enabled", "1") == "1" else "🔴 متوقف"
+    state = (
+        "🟢 مفعّل"
+        if setting("enabled", "1") == "1"
+        else "🔴 متوقف"
+    )
+
     await query.edit_message_text(
         "🤖 <b>لوحة إدارة Cleaner</b>\n\n"
         f"الحالة العامة: {state}\n"
-        f"الصلاحية: {'👑 المالك' if is_owner(user_id) else '🛡 مشرف بوت'}\n\n"
+        f"الصلاحية: "
+        f"{'👑 المالك' if is_owner(user_id) else '🛡 مشرف بوت'}\n\n"
         "اختَر الوظيفة من الأزرار:",
         parse_mode="HTML",
-        reply_markup=home_kb()
+        reply_markup=home_kb(),
     )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
+    message = update.effective_message
+
     if chat and chat.type != ChatType.PRIVATE:
         ensure_group(chat.id, chat.title or "")
-        await update.effective_message.reply_text("أهلاً بك في Cleaner.")
+        await message.reply_text("أهلاً بك في Cleaner.")
         return
+
     if user and is_bot_admin(user.id):
-        await update.effective_message.reply_text(
-            "أهلاً بك في لوحة Cleaner العائمة.",
-            reply_markup=home_kb()
+        await message.reply_text(
+            "أهلاً بك في لوحة Cleaner.",
+            reply_markup=home_kb(),
         )
     else:
-        await update.effective_message.reply_text(
-            "أهلاً بك في بوت Cleaner."
+        await message.reply_text("أهلاً بك في بوت Cleaner.")
+
+
+# =========================================================
+# الروابط وأنواع الرسائل
+# =========================================================
+
+def contains_link(text):
+    if not text:
+        return False
+
+    low = text.lower()
+
+    return any(value in low for value in (
+        "http://",
+        "https://",
+        "t.me/",
+        "www.",
+    ))
+
+
+def message_has_link(message):
+    text = message.text or message.caption or ""
+
+    if contains_link(text):
+        return True
+
+    # دعم الروابط المخفية وروابط النصوص في تيليجرام.
+    entities = (
+        list(message.entities or [])
+        + list(message.caption_entities or [])
+    )
+
+    for entity in entities:
+        if entity.type in ("url", "text_link"):
+            return True
+
+    return False
+
+
+def message_kind(message):
+    if message.photo:
+        return "صورة"
+
+    if message.video:
+        return "فيديو"
+
+    if message.animation:
+        return "GIF"
+
+    if message.sticker:
+        return "ملصق"
+
+    if message.voice:
+        return "رسالة صوتية"
+
+    if message.audio:
+        return "أغنية/صوت"
+
+    if message.video_note:
+        return "فيديو دائري"
+
+    if message.document:
+        return "ملف"
+
+    if message.contact:
+        return "جهة اتصال"
+
+    if message.location or message.venue:
+        return "موقع"
+
+    if message_has_link(message):
+        return "رابط"
+
+    return "رسالة"
+
+
+def is_trackable_message(message):
+    """
+    True فقط للرسائل المطلوب تسجيلها للتنظيف.
+    الرسائل النصية العادية لا تدخل سجل التنظيف.
+    """
+
+    return any((
+        bool(message.photo),
+        bool(message.video),
+        bool(message.video_note),
+        bool(message.animation),
+        bool(message.sticker),
+        bool(message.audio),
+        bool(message.voice),
+        bool(message.document),
+        bool(message.contact),
+        bool(message.location),
+        bool(message.venue),
+        message_has_link(message),
+        bool(getattr(message, "forward_origin", None)),
+        bool(getattr(message, "forward_date", None)),
+    ))
+
+
+# =========================================================
+# تسجيل الرسائل: التوب منفصل عن سجل التنظيف
+# =========================================================
+
+async def track_message(update):
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not message or not chat or not user or user.is_bot:
+        return
+
+    if chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    ):
+        return
+
+    ensure_group(chat.id, chat.title or "")
+
+    # -----------------------------------------------------
+    # أولاً: التوب يحتسب جميع رسائل الأعضاء.
+    # يشمل النصوص العادية والميديا والروابط وغيرها.
+    # -----------------------------------------------------
+
+    with db() as con:
+        con.execute("""
+            INSERT INTO users(chat_id,user_id,name,messages)
+            VALUES(?,?,?,1)
+            ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                name=excluded.name,
+                messages=users.messages+1
+        """, (
+            chat.id,
+            user.id,
+            user.full_name or str(user.id),
+        ))
+
+    # -----------------------------------------------------
+    # ثانياً: سجل التنظيف يسجل أنواعاً محددة فقط.
+    # لا تُسجل الرسائل النصية العادية.
+    # -----------------------------------------------------
+
+    if not is_trackable_message(message):
+        return
+
+    timestamp = int(message.date.timestamp())
+
+    with db() as con:
+        con.execute("""
+            INSERT OR IGNORE INTO tracked_messages
+            (chat_id,message_id,user_id,message_date,kind)
+            VALUES(?,?,?,?,?)
+        """, (
+            chat.id,
+            message.message_id,
+            user.id,
+            timestamp,
+            message_kind(message),
+        ))
+
+        # الاحتفاظ بسجلات تكفي لآخر 24 ساعة مع هامش.
+        retention_cutoff = (
+            int(time.time()) - TRACK_RETENTION_HOURS * 3600
         )
 
+        con.execute("""
+            DELETE FROM tracked_messages
+            WHERE message_date<?
+        """, (retention_cutoff,))
 
-# ---------------- الحالة والإحصائيات ----------------
+
+# =========================================================
+# الحالة والإحصائيات والتوب
+# =========================================================
 
 def recent_count(chat_id=None):
     cutoff = int(time.time()) - CLEAN_HOURS * 3600
+
     with db() as con:
         if chat_id is None:
-            row = con.execute(
-                "SELECT COUNT(*) FROM tracked_messages WHERE message_date>=?",
-                (cutoff,)
-            ).fetchone()
+            row = con.execute("""
+                SELECT COUNT(*)
+                FROM tracked_messages
+                WHERE message_date>=?
+            """, (cutoff,)).fetchone()
         else:
-            row = con.execute(
-                """SELECT COUNT(*) FROM tracked_messages
-                   WHERE chat_id=? AND message_date>=?""",
-                (chat_id, cutoff)
-            ).fetchone()
+            row = con.execute("""
+                SELECT COUNT(*)
+                FROM tracked_messages
+                WHERE chat_id=? AND message_date>=?
+            """, (chat_id, cutoff)).fetchone()
+
     return row[0]
 
 
 def cleaner_status(chat_id=None):
     enabled = setting("enabled", "1") == "1"
     count = recent_count(chat_id)
+
     return (
         "📊 <b>حالة Cleaner:</b>\n"
         f"• الحالة: {'مفعّل ✅' if enabled else 'متوقف ❌'}\n"
-        f"• الرسائل المسجلة خلال 24 ساعة: {count}"
+        f"• الرسائل المسجلة للتنظيف خلال 24 ساعة: {count}"
     )
 
 
 def stats_text():
     cutoff = int(time.time()) - CLEAN_HOURS * 3600
+
     with db() as con:
-        groups_count = con.execute(
-            "SELECT COUNT(*) FROM groups WHERE chat_id<>0"
-        ).fetchone()[0]
-        users_count = con.execute(
-            "SELECT COUNT(DISTINCT user_id) FROM users"
-        ).fetchone()[0]
-        messages_count = con.execute(
-            "SELECT COALESCE(SUM(messages),0) FROM users"
-        ).fetchone()[0]
-        replies_count = con.execute(
-            "SELECT COUNT(*) FROM auto_replies"
-        ).fetchone()[0]
-        admins_count = con.execute(
-            "SELECT COUNT(*) FROM bot_admins"
-        ).fetchone()[0]
-        tracked = con.execute(
-            "SELECT COUNT(*) FROM tracked_messages WHERE message_date>=?",
-            (cutoff,)
-        ).fetchone()[0]
+        groups_count = con.execute("""
+            SELECT COUNT(*) FROM groups WHERE chat_id<>0
+        """).fetchone()[0]
+
+        users_count = con.execute("""
+            SELECT COUNT(DISTINCT user_id) FROM users
+        """).fetchone()[0]
+
+        messages_count = con.execute("""
+            SELECT COALESCE(SUM(messages),0) FROM users
+        """).fetchone()[0]
+
+        replies_count = con.execute("""
+            SELECT COUNT(*) FROM auto_replies
+        """).fetchone()[0]
+
+        admins_count = con.execute("""
+            SELECT COUNT(*) FROM bot_admins
+        """).fetchone()[0]
+
+        tracked = con.execute("""
+            SELECT COUNT(*)
+            FROM tracked_messages
+            WHERE message_date>=?
+        """, (cutoff,)).fetchone()[0]
+
+    state = (
+        "مفعّل ✅"
+        if setting("enabled", "1") == "1"
+        else "متوقف ❌"
+    )
+
     return (
         "📊 <b>حالة البوت</b>\n\n"
-        f"• الحالة: {'مفعّل ✅' if setting('enabled','1')=='1' else 'متوقف ❌'}\n"
+        f"• الحالة: {state}\n"
         f"• الكروبات المسجلة: {groups_count}\n"
         f"• المستخدمون المسجلون: {users_count}\n"
-        f"• الرسائل المسجلة إحصائياً: {messages_count}\n"
-        f"• المسجلة للتنظيف خلال 24 ساعة: {tracked}\n"
+        f"• جميع الرسائل المحتسبة في التوب: {messages_count}\n"
+        f"• الرسائل المسجلة للتنظيف خلال 24 ساعة: {tracked}\n"
         f"• الردود التلقائية: {replies_count}\n"
         f"• مشرفو البوت: {admins_count}"
     )
@@ -405,115 +716,79 @@ def stats_text():
 async def show_top(chat_id, context, message=None):
     with db() as con:
         rows = con.execute("""
-            SELECT name,messages FROM users WHERE chat_id=?
-            ORDER BY messages DESC LIMIT 10
+            SELECT name,messages
+            FROM users
+            WHERE chat_id=?
+            ORDER BY messages DESC
+            LIMIT 10
         """, (chat_id,)).fetchall()
+
     if not rows:
         text = "لا توجد إحصائيات تفاعل حتى الآن."
     else:
         lines = ["🏆 <b>توب 10 المتفاعلين:</b>\n"]
+
         for i, row in enumerate(rows, 1):
             lines.append(
                 f"{i}. {html.escape(row['name'] or 'عضو')} — "
                 f"{row['messages']} رسالة"
             )
+
         text = "\n".join(lines)
+
     if message:
         await message.reply_text(text, parse_mode="HTML")
     else:
-        await context.bot.send_message(chat_id, text, parse_mode="HTML")
+        await context.bot.send_message(
+            chat_id,
+            text,
+            parse_mode="HTML",
+        )
 
 
 async def reset_top(update, context):
     chat = update.effective_chat
-    if not await is_group_admin(update, context):
-        await update.effective_message.reply_text("هذا الأمر للمشرفين فقط.")
-        return
-    with db() as con:
-        con.execute("DELETE FROM users WHERE chat_id=?", (chat.id,))
-    await update.effective_message.reply_text("✅ تم تصفير توب المتفاعلين.")
-
-
-# ---------------- التنظيف خلال 24 ساعة ----------------
-
-def message_kind(message):
-    if message.photo:
-        return "صورة"
-    if message.video:
-        return "فيديو"
-    if message.animation:
-        return "GIF"
-    if message.sticker:
-        return "ملصق"
-    if message.voice:
-        return "رسالة صوتية"
-    if message.audio:
-        return "أغنية/صوت"
-    if message.video_note:
-        return "فيديو دائري"
-    if message.document:
-        return "ملف"
-    if message.contact:
-        return "جهة اتصال"
-    if message.location or message.venue:
-        return "موقع"
-    text = message.text or message.caption or ""
-    if contains_link(text):
-        return "رابط"
-    return "رسالة"
-
-
-def contains_link(text):
-    if not text:
-        return False
-    low = text.lower()
-    return any(x in low for x in (
-        "http://", "https://", "t.me/", "www."
-    ))
-
-
-async def track_message(update):
     message = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if not message or not chat or not user or user.is_bot:
-        return
-    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+
+    if not chat or chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    ):
+        await message.reply_text("هذا الأمر مخصص للكروبات.")
         return
 
-    ensure_group(chat.id, chat.title or "")
-    timestamp = int(message.date.timestamp())
+    if not await is_group_admin(update, context):
+        await message.reply_text("هذا الأمر للمشرفين فقط.")
+        return
+
     with db() as con:
-        con.execute("""
-            INSERT OR IGNORE INTO tracked_messages
-            (chat_id,message_id,user_id,message_date,kind)
-            VALUES(?,?,?,?,?)
-        """, (
-            chat.id, message.message_id, user.id,
-            timestamp, message_kind(message)
-        ))
-        con.execute("""
-            INSERT INTO users(chat_id,user_id,name,messages)
-            VALUES(?,?,?,1)
-            ON CONFLICT(chat_id,user_id) DO UPDATE SET
-                name=excluded.name,messages=users.messages+1
-        """, (chat.id, user.id, user.full_name or str(user.id)))
-        # احتفظ بسجلات تكفي لتنظيف آخر 24 ساعة مع هامش إضافي.
         con.execute(
-            "DELETE FROM tracked_messages WHERE message_date<?",
-            (int(time.time()) - 48 * 3600,)
+            "DELETE FROM users WHERE chat_id=?",
+            (chat.id,),
         )
 
+    await message.reply_text("✅ تم تصفير توب المتفاعلين.")
+
+
+# =========================================================
+# تنظيف الرسائل المسجلة خلال آخر 24 ساعة
+# =========================================================
 
 async def clean_24h(update, context):
     message = update.effective_message
     chat = update.effective_chat
-    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+
+    if not chat or chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    ):
         await message.reply_text("هذا الأمر مخصص للكروبات.")
         return
+
     if not await is_group_admin(update, context):
         await message.reply_text("هذا الأمر للمشرفين فقط.")
         return
+
     if not await bot_can_delete(chat.id, context):
         await message.reply_text(
             "❌ ارفع البوت مشرفاً وامنحه صلاحية حذف الرسائل."
@@ -521,22 +796,32 @@ async def clean_24h(update, context):
         return
 
     cutoff = int(time.time()) - CLEAN_HOURS * 3600
+
+    # حذف أمر التنظيف نفسه قبل بدء التنظيف.
     await safe_delete(chat.id, message.message_id, context)
 
     with db() as con:
         rows = con.execute("""
-            SELECT message_id FROM tracked_messages
+            SELECT message_id
+            FROM tracked_messages
             WHERE chat_id=? AND message_date>=?
             ORDER BY message_id DESC
         """, (chat.id, cutoff)).fetchall()
 
-    deleted = failed = 0
+    deleted = 0
+    failed = 0
+
     for row in rows:
-        if await safe_delete(chat.id, row["message_id"], context):
+        if await safe_delete(
+            chat.id,
+            row["message_id"],
+            context,
+        ):
             deleted += 1
         else:
             failed += 1
 
+    # حذف السجلات القديمة فقط.
     with db() as con:
         con.execute("""
             DELETE FROM tracked_messages
@@ -549,81 +834,137 @@ async def clean_24h(update, context):
             "🧹 انتهى التنظيف.\n"
             f"• المحذوف: {deleted}\n"
             f"• تعذّر حذفه: {failed}\n"
-            "يشمل هذا فقط الرسائل التي سجلها البوت خلال آخر 24 ساعة."
+            "• النطاق: الرسائل المسجلة خلال آخر 24 ساعة.\n"
+            "• الرسائل النصية العادية غير المسجلة لا يحذفها هذا الأمر.",
         )
     except TelegramError:
         pass
 
 
-# ---------------- الاشتراك الإجباري ----------------
+# =========================================================
+# الاشتراك الإجباري
+# =========================================================
 
 async def subscription_gate(update, context, group):
     message = update.effective_message
     user = update.effective_user
     chat = update.effective_chat
+
     if not group.get("subscription_enabled") or not user:
         return False
-    channel = (group.get("subscription_channel") or "").strip()
-    link = (group.get("subscription_link") or "").strip()
+
+    channel = (
+        group.get("subscription_channel") or ""
+    ).strip()
+
+    link = (
+        group.get("subscription_link") or ""
+    ).strip()
+
     if not channel:
         return False
+
     try:
-        member = await context.bot.get_chat_member(channel, user.id)
+        member = await context.bot.get_chat_member(
+            channel, user.id
+        )
+
         if member.status in (
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER
+            ChatMemberStatus.OWNER,
         ):
             return False
+
+        # LEFT أو BANNED يعني أن المستخدم ليس مشتركاً.
+
     except TelegramError as exc:
-        log.warning("تعذر التحقق من اشتراك القناة %s: %s", channel, exc)
+        log.warning(
+            "تعذر التحقق من اشتراك القناة %s: %s",
+            channel,
+            exc,
+        )
+        # لا نحذف رسالة المستخدم عند فشل التحقق.
         return False
 
-    await safe_delete(chat.id, message.message_id, context)
-    buttons = [[InlineKeyboardButton(
-        "📢 اشترك بالقناة", url=link
-    )]] if link else []
+    await safe_delete(
+        chat.id,
+        message.message_id,
+        context,
+    )
+
+    buttons = []
+
+    if link:
+        buttons.append([
+            InlineKeyboardButton(
+                "📢 اشترك بالقناة",
+                url=link,
+            )
+        ])
+
     try:
         await context.bot.send_message(
             chat.id,
             f"{user.mention_html()}، يجب الاشتراك بالقناة أولاً.",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
+            reply_markup=(
+                InlineKeyboardMarkup(buttons)
+                if buttons else None
+            ),
         )
     except TelegramError:
         pass
+
     return True
 
 
-# ---------------- استقبال رسائل الكروبات والردود ----------------
+# =========================================================
+# الردود التلقائية والإشراف على الكروبات
+# =========================================================
 
 async def moderate_message(update, context):
     message = update.effective_message
     chat = update.effective_chat
     user = update.effective_user
+
     if not message or not chat:
         return
-    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+
+    if chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    ):
         return
+
     if not user or user.is_bot:
         return
 
+    # مهم:
+    # التوب يحسب كل الرسائل.
+    # سجل التنظيف يستقبل الأنواع المحددة فقط.
     await track_message(update)
 
     if setting("enabled", "1") != "1":
         return
 
     group = get_group(chat.id)
+
     if not group or not group.get("enabled", 1):
         return
 
     # استثناء مشرفي الكروب من الحذف والاشتراك الإجباري.
     try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
+        member = await context.bot.get_chat_member(
+            chat.id, user.id
+        )
+
         if member.status in (
-            ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
         ):
             return
+
     except TelegramError:
         pass
 
@@ -633,66 +974,99 @@ async def moderate_message(update, context):
     text = message.text or message.caption or ""
     delete = False
 
-    if group.get("delete_links") and contains_link(text):
+    if group.get("delete_links") and message_has_link(message):
         delete = True
+
     if group.get("delete_photos") and message.photo:
         delete = True
-    if group.get("delete_videos") and (message.video or message.video_note):
+
+    if group.get("delete_videos") and (
+        message.video or message.video_note
+    ):
         delete = True
+
     if group.get("delete_stickers") and message.sticker:
         delete = True
+
     if group.get("delete_gifs") and message.animation:
         delete = True
-    if group.get("delete_audio") and (message.audio or message.voice):
+
+    if group.get("delete_audio") and (
+        message.audio or message.voice
+    ):
         delete = True
+
     if group.get("delete_files") and message.document:
         delete = True
+
     if group.get("delete_forwarded") and (
         getattr(message, "forward_origin", None)
         or getattr(message, "forward_date", None)
     ):
         delete = True
 
-    # حذف الرد على رسالة عضو آخر، كما في الكود الذي أرسلته.
+    # حذف الرد على رسالة عضو آخر.
     if (
         group.get("replies_enabled", 1)
         and message.reply_to_message
         and message.reply_to_message.from_user
         and message.reply_to_message.from_user.id != user.id
     ):
-        delete_text = group.get("delete_message") or ""
-        if not delete_text or delete_text == "ممنوع إرسال الردود":
+        delete_text = (
+            group.get("delete_message")
+            or "ممنوع إرسال الردود"
+        )
+
+        if delete_text == "ممنوع إرسال الردود":
             with db() as con:
-                row = con.execute(
-                    "SELECT delete_message FROM groups WHERE chat_id=0"
-                ).fetchone()
+                row = con.execute("""
+                    SELECT delete_message
+                    FROM groups
+                    WHERE chat_id=0
+                """).fetchone()
+
             if row and row["delete_message"]:
                 delete_text = row["delete_message"]
-        delete_text = delete_text or "ممنوع الرد"
 
-        if await safe_delete(chat.id, message.message_id, context):
+        if await safe_delete(
+            chat.id,
+            message.message_id,
+            context,
+        ):
             try:
                 await context.bot.send_message(
                     chat.id,
-                    f"{user.mention_html()} {html.escape(delete_text)}",
-                    parse_mode="HTML"
+                    f"{user.mention_html()} "
+                    f"{html.escape(delete_text)}",
+                    parse_mode="HTML",
                 )
             except TelegramError:
                 pass
+
         return
 
     if delete:
-        await safe_delete(chat.id, message.message_id, context)
+        await safe_delete(
+            chat.id,
+            message.message_id,
+            context,
+        )
         return
 
-    # الردود العامة أو ردود الكروب، والأولوية لرد الكروب.
+    # الردود العامة أو الخاصة بالكروب.
     if message.text:
         with db() as con:
             reply = con.execute("""
-                SELECT response FROM auto_replies
+                SELECT response
+                FROM auto_replies
                 WHERE keyword=? AND chat_id IN (0,?)
-                ORDER BY chat_id DESC LIMIT 1
-            """, (message.text.strip(), chat.id)).fetchone()
+                ORDER BY chat_id DESC
+                LIMIT 1
+            """, (
+                message.text.strip(),
+                chat.id,
+            )).fetchone()
+
         if reply:
             try:
                 await message.reply_text(reply["response"])
@@ -703,369 +1077,553 @@ async def moderate_message(update, context):
 async def group_text_commands(update, context):
     message = update.effective_message
     chat = update.effective_chat
-    if not message or not message.text or chat.type == ChatType.PRIVATE:
+
+    if (
+        not message
+        or not message.text
+        or not chat
+        or chat.type == ChatType.PRIVATE
+    ):
         return
+
     text = message.text.strip()
 
     if text == "تنظيف":
         await clean_24h(update, context)
+
     elif text == "حالة":
         await message.reply_text(
-            cleaner_status(chat.id), parse_mode="HTML"
+            cleaner_status(chat.id),
+            parse_mode="HTML",
         )
+
     elif text == "توب":
-        await show_top(chat.id, context, message)
-    elif text in ("تصفير التوب", "تصفير توب المتفاعلين"):
+        await show_top(
+            chat.id,
+            context,
+            message,
+        )
+
+    elif text in (
+        "تصفير التوب",
+        "تصفير توب المتفاعلين",
+    ):
         await reset_top(update, context)
+
     elif text in ("تفعيل", "/تفعيل"):
         if not await is_group_admin(update, context):
             await message.reply_text("هذا الأمر للمشرفين فقط.")
             return
+
         update_group(chat.id, "enabled", 1)
         update_group(chat.id, "replies_enabled", 1)
-        await message.reply_text("✅ تم تفعيل البوت وحذف الردود في هذا الكروب.")
+
+        await message.reply_text(
+            "✅ تم تفعيل البوت وحذف الردود في هذا الكروب."
+        )
+
     elif text in ("إيقاف", "/إيقاف"):
         if not await is_group_admin(update, context):
             await message.reply_text("هذا الأمر للمشرفين فقط.")
             return
+
         update_group(chat.id, "replies_enabled", 0)
-        await message.reply_text("⏸ تم إيقاف حذف الردود في هذا الكروب.")
+
+        await message.reply_text(
+            "⏸ تم إيقاف حذف الردود في هذا الكروب."
+        )
 
 
-# ---------------- لوحة الردود ----------------
+# =========================================================
+# قوائم لوحة التحكم
+# =========================================================
 
 async def replies_menu(query):
     with db() as con:
         rows = con.execute("""
-            SELECT id,keyword,response FROM auto_replies
-            WHERE chat_id=0 ORDER BY id DESC LIMIT 40
+            SELECT id,keyword,response
+            FROM auto_replies
+            WHERE chat_id=0
+            ORDER BY id DESC
+            LIMIT 40
         """).fetchall()
+
     rows_kb = [[("➕ إضافة رد", "reply_add")]]
+
     if not rows:
         text = "💬 لا توجد ردود عامة محفوظة."
     else:
         lines = ["💬 <b>الردود العامة:</b>\n"]
+
         for row in rows:
             lines.append(
-                f"• <code>{html.escape(row['keyword'])}</code> → "
-                f"{html.escape(row['response'][:80])}"
+                f"• <code>{html.escape(row['keyword'])}</code>"
+                f" → {html.escape(row['response'][:80])}"
             )
-            rows_kb.append([(
-                f"🗑 حذف: {row['keyword'][:25]}",
-                f"reply_del:{row['id']}"
-            )])
+
+            rows_kb.append([
+                (
+                    f"🗑 حذف: {row['keyword'][:25]}",
+                    f"reply_del:{row['id']}",
+                )
+            ])
+
         text = "\n".join(lines)
+
     rows_kb.append([("⬅️ رجوع", "home")])
+
     await query.edit_message_text(
-        text, parse_mode="HTML", reply_markup=kb(rows_kb)
+        text,
+        parse_mode="HTML",
+        reply_markup=kb(rows_kb),
     )
 
 
 async def admins_menu(query):
     with db() as con:
-        rows = con.execute(
-            "SELECT user_id FROM bot_admins ORDER BY user_id"
-        ).fetchall()
+        rows = con.execute("""
+            SELECT user_id
+            FROM bot_admins
+            ORDER BY user_id
+        """).fetchall()
+
     buttons = []
+
     for row in rows:
         uid = row["user_id"]
+
         if uid not in DEFAULT_ADMINS:
-            buttons.append([(f"🗑 تنزيل {uid}", f"admin_del:{uid}")])
+            buttons.append([
+                (f"🗑 تنزيل {uid}", f"admin_del:{uid}")
+            ])
+
     buttons.extend([
         [("➕ رفع مشرف", "admin_add")],
-        [("⬅️ رجوع", "home")]
+        [("⬅️ رجوع", "home")],
     ])
+
     await query.edit_message_text(
-        "👥 <b>إدارة مشرفي البوت</b>\nالرفع والتنزيل متاحان للمالك فقط.",
-        parse_mode="HTML", reply_markup=kb(buttons)
+        "👥 <b>إدارة مشرفي البوت</b>\n"
+        "الرفع والتنزيل متاحان للمالك فقط.",
+        parse_mode="HTML",
+        reply_markup=kb(buttons),
     )
 
 
 async def subscription_menu(query):
     with db() as con:
         rows = con.execute("""
-            SELECT chat_id,title,subscription_enabled,subscription_channel
-            FROM groups WHERE chat_id<>0 ORDER BY title
+            SELECT chat_id,title,subscription_enabled,
+                   subscription_channel
+            FROM groups
+            WHERE chat_id<>0
+            ORDER BY title
         """).fetchall()
+
     buttons = []
+
     for row in rows[:40]:
         status = "✅" if row["subscription_enabled"] else "❌"
         title = row["title"] or str(row["chat_id"])
-        buttons.append([(
-            f"{status} {title[:30]}",
-            f"subgroup:{row['chat_id']}"
-        )])
-    buttons.append([("➕ إعداد اشتراك لكروب", "sub_add")])
-    buttons.append([("🗑 إلغاء الاشتراك العام", "sub_remove_global")])
-    buttons.append([("⬅️ رجوع", "home")])
+
+        buttons.append([
+            (
+                f"{status} {title[:30]}",
+                f"subgroup:{row['chat_id']}",
+            )
+        ])
+
+    buttons.extend([
+        [("➕ إعداد اشتراك لكروب", "sub_add")],
+        [("🗑 إلغاء الاشتراك العام", "sub_remove_global")],
+        [("⬅️ رجوع", "home")],
+    ])
+
     await query.edit_message_text(
-        "🔔 <b>الاشتراك الإجباري</b>\nاختر كروباً أو أضف إعداداً.",
-        parse_mode="HTML", reply_markup=kb(buttons)
+        "🔔 <b>الاشتراك الإجباري</b>\n"
+        "اختر كروباً أو أضف إعداداً.",
+        parse_mode="HTML",
+        reply_markup=kb(buttons),
     )
 
 
-# ---------------- callbacks ----------------
+# =========================================================
+# معالجة أزرار لوحة التحكم
+# =========================================================
 
-async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def panel_callback(update, context):
     query = update.callback_query
     user = query.from_user
     data = query.data or ""
-    await query.answer()
 
     if not is_bot_admin(user.id):
-        await query.answer("هذه اللوحة للمشرفين المعتمدين فقط.", show_alert=True)
+        await query.answer(
+            "هذه اللوحة للمشرفين المعتمدين فقط.",
+            show_alert=True,
+        )
         return
+
+    await query.answer()
 
     if data == "home":
         await show_home(query, user.id)
 
     elif data == "stats":
         await query.edit_message_text(
-            stats_text(), parse_mode="HTML", reply_markup=back_kb()
+            stats_text(),
+            parse_mode="HTML",
+            reply_markup=back_kb(),
         )
 
     elif data == "settings":
         await query.edit_message_text(
             "⚙️ اختر الكروب لتعديل إعدادات الحذف:",
-            reply_markup=groups_kb("setgroup")
+            reply_markup=groups_kb("setgroup"),
         )
 
     elif data.startswith("setgroup:"):
         chat_id = int(data.split(":", 1)[1])
+
         await query.edit_message_text(
             f"⚙️ إعدادات الكروب {chat_id}",
-            reply_markup=settings_kb(chat_id)
+            reply_markup=settings_kb(chat_id),
         )
 
     elif data.startswith("toggle:"):
-        _, chat_id, field = data.split(":")
-        chat_id = int(chat_id)
+        _, chat_id_text, field = data.split(":")
+        chat_id = int(chat_id_text)
+
         allowed = {
-            "enabled", "replies_enabled", "delete_links", "delete_photos",
-            "delete_videos", "delete_stickers", "delete_gifs",
-            "delete_audio", "delete_files", "delete_forwarded"
+            "enabled",
+            "replies_enabled",
+            "delete_links",
+            "delete_photos",
+            "delete_videos",
+            "delete_stickers",
+            "delete_gifs",
+            "delete_audio",
+            "delete_files",
+            "delete_forwarded",
         }
+
         if field not in allowed:
             return
-        g = get_group(chat_id)
-        update_group(chat_id, field, 0 if g.get(field, 0) else 1)
+
+        group = get_group(chat_id)
+
+        update_group(
+            chat_id,
+            field,
+            0 if group.get(field, 0) else 1,
+        )
+
         await query.edit_message_reply_markup(
-            reply_markup=settings_kb(chat_id)
+            reply_markup=settings_kb(chat_id),
         )
 
     elif data.startswith("delete_text:"):
         chat_id = int(data.split(":", 1)[1])
+
         context.user_data["pending"] = {
-            "action": "delete_text", "chat_id": chat_id
+            "action": "delete_text",
+            "chat_id": chat_id,
         }
+
         await query.edit_message_text(
             "أرسل كليشة حذف الردود الجديدة:",
-            reply_markup=back_kb()
+            reply_markup=back_kb(),
         )
 
     elif data == "replies":
         await replies_menu(query)
 
     elif data == "reply_add":
-        context.user_data["pending"] = {"action": "reply_keyword"}
+        context.user_data["pending"] = {
+            "action": "reply_keyword"
+        }
+
         await query.edit_message_text(
             "أرسل الكلمة المفتاحية للرد:",
-            reply_markup=back_kb()
+            reply_markup=back_kb(),
         )
 
     elif data.startswith("reply_del:"):
         reply_id = int(data.split(":", 1)[1])
+
         with db() as con:
-            con.execute(
-                "DELETE FROM auto_replies WHERE id=? AND chat_id=0",
-                (reply_id,)
-            )
+            con.execute("""
+                DELETE FROM auto_replies
+                WHERE id=? AND chat_id=0
+            """, (reply_id,))
+
         await replies_menu(query)
 
     elif data == "subscription":
         await subscription_menu(query)
 
     elif data == "sub_add":
-        context.user_data["pending"] = {"action": "sub_chat"}
+        context.user_data["pending"] = {
+            "action": "sub_chat"
+        }
+
         await query.edit_message_text(
             "أرسل آيدي الكروب الذي تريد إعداد الاشتراك له:",
-            reply_markup=back_kb()
+            reply_markup=back_kb(),
         )
 
     elif data == "sub_remove_global":
+        # إزالة إعداد الاشتراك العام القديم.
         with db() as con:
-            con.execute("DELETE FROM subscription WHERE chat_id=0")
-        await query.answer("تم حذف إعداد الاشتراك العام.", show_alert=True)
-        await subscription_menu(query)
+            con.execute("""
+                DELETE FROM subscription
+                WHERE chat_id=0
+            """)
+
+        await query.edit_message_text(
+            "تم حذف سجل الاشتراك العام القديم.",
+            reply_markup=back_kb("subscription"),
+        )
 
     elif data.startswith("subgroup:"):
         chat_id = int(data.split(":", 1)[1])
-        g = get_group(chat_id)
+        group = get_group(chat_id)
+
         await query.edit_message_text(
             f"🔔 إعداد الاشتراك للكروب {chat_id}\n"
-            f"الحالة: {'مفعّل' if g.get('subscription_enabled') else 'متوقف'}\n"
-            f"القناة: {html.escape(g.get('subscription_channel') or 'غير محددة')}",
+            f"الحالة: "
+            f"{'مفعّل' if group.get('subscription_enabled') else 'متوقف'}\n"
+            f"القناة: "
+            f"{html.escape(group.get('subscription_channel') or 'غير محددة')}",
             parse_mode="HTML",
             reply_markup=kb([
                 [("🔄 تفعيل / إيقاف", f"subtoggle:{chat_id}")],
                 [("✏️ تحديد القناة", f"subchannel:{chat_id}")],
                 [("🔗 تحديد رابط الاشتراك", f"sublink:{chat_id}")],
-                [("⬅️ رجوع", "subscription")]
-            ])
+                [("⬅️ رجوع", "subscription")],
+            ]),
         )
 
     elif data.startswith("subtoggle:"):
         chat_id = int(data.split(":", 1)[1])
-        g = get_group(chat_id)
+        group = get_group(chat_id)
+
         update_group(
-            chat_id, "subscription_enabled",
-            0 if g.get("subscription_enabled") else 1
+            chat_id,
+            "subscription_enabled",
+            0 if group.get("subscription_enabled") else 1,
         )
-        g = get_group(chat_id)
+
+        group = get_group(chat_id)
+
         await query.edit_message_text(
-            f"حالة الاشتراك: {'مفعّل' if g.get('subscription_enabled') else 'متوقف'}",
+            f"حالة الاشتراك: "
+            f"{'مفعّل' if group.get('subscription_enabled') else 'متوقف'}",
             reply_markup=kb([
                 [("✏️ تحديد القناة", f"subchannel:{chat_id}")],
                 [("🔗 تحديد الرابط", f"sublink:{chat_id}")],
-                [("⬅️ رجوع", f"subgroup:{chat_id}")]
-            ])
+                [("⬅️ رجوع", f"subgroup:{chat_id}")],
+            ]),
         )
 
     elif data.startswith("subchannel:"):
         chat_id = int(data.split(":", 1)[1])
+
         context.user_data["pending"] = {
-            "action": "sub_channel", "chat_id": chat_id
+            "action": "sub_channel",
+            "chat_id": chat_id,
         }
+
         await query.edit_message_text(
             "أرسل يوزر القناة أو آيديها، مثل @MyChannel:",
-            reply_markup=back_kb()
+            reply_markup=back_kb(),
         )
 
     elif data.startswith("sublink:"):
         chat_id = int(data.split(":", 1)[1])
+
         context.user_data["pending"] = {
-            "action": "sub_link", "chat_id": chat_id
+            "action": "sub_link",
+            "chat_id": chat_id,
         }
+
         await query.edit_message_text(
             "أرسل رابط الاشتراك:",
-            reply_markup=back_kb()
+            reply_markup=back_kb(),
         )
 
     elif data == "admins":
         if not is_owner(user.id):
             await query.answer("المالك فقط.", show_alert=True)
             return
+
         await admins_menu(query)
 
     elif data == "admin_add":
         if not is_owner(user.id):
+            await query.answer("المالك فقط.", show_alert=True)
             return
-        context.user_data["pending"] = {"action": "admin_add"}
+
+        context.user_data["pending"] = {
+            "action": "admin_add"
+        }
+
         await query.edit_message_text(
             "أرسل آيدي المستخدم لإضافته مشرفاً:",
-            reply_markup=back_kb()
+            reply_markup=back_kb(),
         )
 
     elif data.startswith("admin_del:"):
         if not is_owner(user.id):
             await query.answer("المالك فقط.", show_alert=True)
             return
+
         uid = int(data.split(":", 1)[1])
+
         if uid in DEFAULT_ADMINS:
-            await query.answer("لا يمكن تنزيل مالك أساسي.", show_alert=True)
+            await query.answer(
+                "لا يمكن تنزيل مشرف أساسي.",
+                show_alert=True,
+            )
             return
+
         with db() as con:
-            con.execute("DELETE FROM bot_admins WHERE user_id=?", (uid,))
+            con.execute(
+                "DELETE FROM bot_admins WHERE user_id=?",
+                (uid,),
+            )
+
         await admins_menu(query)
 
     elif data == "global_toggle":
         if not is_owner(user.id):
             await query.answer("المالك فقط.", show_alert=True)
             return
+
         set_setting(
-            "enabled", "0" if setting("enabled", "1") == "1" else "1"
+            "enabled",
+            "0" if setting("enabled", "1") == "1" else "1",
         )
+
         await show_home(query, user.id)
 
     elif data == "topmenu":
         await query.edit_message_text(
             "🏆 اختر الكروب لعرض التوب:",
-            reply_markup=groups_kb("topgroup")
+            reply_markup=groups_kb("topgroup"),
         )
 
     elif data.startswith("topgroup:"):
         chat_id = int(data.split(":", 1)[1])
+
         with db() as con:
             rows = con.execute("""
-                SELECT name,user_id,messages FROM users WHERE chat_id=?
-                ORDER BY messages DESC LIMIT 10
+                SELECT name,user_id,messages
+                FROM users
+                WHERE chat_id=?
+                ORDER BY messages DESC
+                LIMIT 10
             """, (chat_id,)).fetchall()
+
         lines = ["🏆 <b>توب الكروب</b>\n"]
+
         if not rows:
             lines.append("لا توجد بيانات مسجلة.")
+
         for i, row in enumerate(rows, 1):
-            lines.append(
-                f"{i}. {html.escape(row['name'] or str(row['user_id']))}"
-                f" — {row['messages']}"
+            name = html.escape(
+                row["name"] or str(row["user_id"])
             )
+
+            lines.append(
+                f"{i}. {name} — {row['messages']} رسالة"
+            )
+
         await query.edit_message_text(
-            "\n".join(lines), parse_mode="HTML", reply_markup=back_kb("topmenu")
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=back_kb("topmenu"),
         )
 
 
-# ---------------- استقبال إجابات لوحة التحكم ----------------
+# =========================================================
+# استقبال إجابات لوحة التحكم في الخاص
+# =========================================================
 
-async def private_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def private_pending(update, context):
     message = update.effective_message
     user = update.effective_user
     chat = update.effective_chat
-    if not message or not message.text or chat.type != ChatType.PRIVATE:
+
+    if (
+        not message
+        or not message.text
+        or not chat
+        or chat.type != ChatType.PRIVATE
+    ):
         return
+
     if not user or not is_bot_admin(user.id):
         return
 
     state = context.user_data.get("pending")
+
     if not state:
         return
+
     action = state.get("action")
     value = message.text.strip()
 
     if action == "reply_keyword":
+        if not value:
+            await message.reply_text("أرسل كلمة مفتاحية صحيحة.")
+            return
+
         context.user_data["pending"] = {
-            "action": "reply_response", "keyword": value
+            "action": "reply_response",
+            "keyword": value,
         }
-        await message.reply_text("أرسل الرد الذي تريد أن يرسله البوت.")
+
+        await message.reply_text(
+            "أرسل الرد الذي تريد أن يرسله البوت."
+        )
         return
 
     if action == "reply_response":
         keyword = state["keyword"]
+
         with db() as con:
-            con.execute("""
-                INSERT INTO auto_replies(chat_id,keyword,response)
-                VALUES(0,?,?)
-                ON CONFLICT(id) DO NOTHING
-            """, (keyword, value))
             # استبدال الرد العام الموجود للكلمة نفسها.
             con.execute("""
                 DELETE FROM auto_replies
-                WHERE chat_id=0 AND keyword=? AND id NOT IN (
-                    SELECT MAX(id) FROM auto_replies
-                    WHERE chat_id=0 AND keyword=?
-                )
-            """, (keyword, keyword))
+                WHERE chat_id=0 AND keyword=?
+            """, (keyword,))
+
+            con.execute("""
+                INSERT INTO auto_replies(chat_id,keyword,response)
+                VALUES(0,?,?)
+            """, (keyword, value))
+
         context.user_data.pop("pending", None)
+
         await message.reply_text(
             f"✅ تم حفظ الرد للكلمة: {html.escape(keyword)}",
-            parse_mode="HTML", reply_markup=home_kb()
+            parse_mode="HTML",
+            reply_markup=home_kb(),
         )
         return
 
     if action == "delete_text":
-        update_group(state["chat_id"], "delete_message", value)
+        update_group(
+            state["chat_id"],
+            "delete_message",
+            value,
+        )
+
         context.user_data.pop("pending", None)
+
         await message.reply_text(
             "✅ تم حفظ كليشة الحذف.",
-            reply_markup=home_kb()
+            reply_markup=home_kb(),
         )
         return
 
@@ -1073,32 +1631,62 @@ async def private_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             chat_id = int(value)
         except ValueError:
-            await message.reply_text("آيدي غير صحيح. أرسل أرقام آيدي الكروب.")
+            await message.reply_text(
+                "آيدي غير صحيح. أرسل آيدي الكروب بالأرقام."
+            )
             return
+
         ensure_group(chat_id)
+
         context.user_data["pending"] = {
-            "action": "sub_channel", "chat_id": chat_id
+            "action": "sub_channel",
+            "chat_id": chat_id,
         }
-        await message.reply_text("أرسل يوزر القناة أو آيديها.")
+
+        await message.reply_text(
+            "أرسل يوزر القناة أو آيديها."
+        )
         return
 
     if action == "sub_channel":
         chat_id = state["chat_id"]
-        update_group(chat_id, "subscription_channel", value)
+
+        update_group(
+            chat_id,
+            "subscription_channel",
+            value,
+        )
+
         context.user_data["pending"] = {
-            "action": "sub_link", "chat_id": chat_id
+            "action": "sub_link",
+            "chat_id": chat_id,
         }
-        await message.reply_text("أرسل رابط القناة أو الاشتراك.")
+
+        await message.reply_text(
+            "أرسل رابط القناة أو الاشتراك."
+        )
         return
 
     if action == "sub_link":
         chat_id = state["chat_id"]
-        update_group(chat_id, "subscription_link", value)
-        update_group(chat_id, "subscription_enabled", 1)
+
+        update_group(
+            chat_id,
+            "subscription_link",
+            value,
+        )
+
+        update_group(
+            chat_id,
+            "subscription_enabled",
+            1,
+        )
+
         context.user_data.pop("pending", None)
+
         await message.reply_text(
             "✅ تم حفظ إعدادات الاشتراك وتفعيلها.",
-            reply_markup=home_kb()
+            reply_markup=home_kb(),
         )
         return
 
@@ -1106,25 +1694,39 @@ async def private_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_owner(user.id):
             context.user_data.pop("pending", None)
             return
+
         try:
             uid = int(value)
         except ValueError:
-            try:
-                info = await context.bot.get_chat(value)
-                uid = info.id
-            except TelegramError:
-                await message.reply_text("لم أتعرف على المستخدم. أرسل آيدي صحيحاً.")
-                return
+            await message.reply_text(
+                "أرسل آيدي المستخدم الرقمي."
+            )
+            return
+
+        if uid in DEFAULT_ADMINS:
+            await message.reply_text(
+                "هذا المستخدم مشرف أساسي بالفعل."
+            )
+            context.user_data.pop("pending", None)
+            return
+
         with db() as con:
             con.execute(
                 "INSERT OR IGNORE INTO bot_admins(user_id) VALUES(?)",
-                (uid,)
+                (uid,),
             )
+
         context.user_data.pop("pending", None)
+
         await message.reply_text(
-            f"✅ تمت إضافة المشرف {uid}.", reply_markup=home_kb()
+            f"✅ تمت إضافة المشرف {uid}.",
+            reply_markup=home_kb(),
         )
 
+
+# =========================================================
+# الأوامر
+# =========================================================
 
 async def clean_command(update, context):
     await clean_24h(update, context)
@@ -1132,47 +1734,79 @@ async def clean_command(update, context):
 
 async def top_command(update, context):
     chat = update.effective_chat
-    if chat:
-        await show_top(chat.id, context, update.effective_message)
+
+    if chat and chat.type in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    ):
+        await show_top(
+            chat.id,
+            context,
+            update.effective_message,
+        )
 
 
 async def status_command(update, context):
     chat = update.effective_chat
-    if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await update.effective_message.reply_text(
-            cleaner_status(chat.id), parse_mode="HTML"
+    message = update.effective_message
+
+    if chat and chat.type in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    ):
+        await message.reply_text(
+            cleaner_status(chat.id),
+            parse_mode="HTML",
         )
     else:
-        await update.effective_message.reply_text(
-            stats_text(), parse_mode="HTML"
+        await message.reply_text(
+            stats_text(),
+            parse_mode="HTML",
         )
 
 
 async def enable_command(update, context):
-    if await is_group_admin(update, context):
-        chat = update.effective_chat
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if await is_group_admin(update, context) and chat:
         update_group(chat.id, "enabled", 1)
         update_group(chat.id, "replies_enabled", 1)
-        await update.effective_message.reply_text("✅ تم التفعيل.")
+
+        await message.reply_text("✅ تم التفعيل.")
 
 
 async def disable_command(update, context):
-    if await is_group_admin(update, context):
-        update_group(update.effective_chat.id, "replies_enabled", 0)
-        await update.effective_message.reply_text("⏸ تم إيقاف حذف الردود.")
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if await is_group_admin(update, context) and chat:
+        update_group(chat.id, "replies_enabled", 0)
+
+        await message.reply_text(
+            "⏸ تم إيقاف حذف الردود."
+        )
 
 
 async def error_handler(update, context):
-    log.error("خطأ أثناء معالجة تحديث", exc_info=context.error)
+    log.error(
+        "خطأ أثناء معالجة تحديث",
+        exc_info=context.error,
+    )
 
+
+# =========================================================
+# التشغيل
+# =========================================================
 
 def main():
     if not TOKEN:
         raise RuntimeError(
-            "عيّن توكن جديداً في متغير البيئة BOT_TOKEN قبل تشغيل Cleaner."
+            "عيّن توكن البوت في متغير البيئة BOT_TOKEN."
         )
 
     init_db()
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -1182,29 +1816,49 @@ def main():
     app.add_handler(CommandHandler("enable", enable_command))
     app.add_handler(CommandHandler("disable", disable_command))
     app.add_handler(CommandHandler("reset_top", reset_top))
-    app.add_handler(CallbackQueryHandler(panel_callback))
 
-    # رسائل الخاص: إجابات إعدادات اللوحة فقط.
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-        private_pending
-    ), group=0)
+    app.add_handler(
+        CallbackQueryHandler(panel_callback)
+    )
 
-    # استقبال الرسائل النصية بالكروب، بما فيها الكلمات العربية والأوامر.
-    app.add_handler(MessageHandler(
-        filters.ChatType.GROUPS & filters.TEXT,
-        group_text_commands
-    ), group=1)
+    # إجابات لوحة التحكم في الخاص.
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE
+            & filters.TEXT
+            & ~filters.COMMAND,
+            private_pending,
+        ),
+        group=0,
+    )
 
-    # تسجيل الرسائل وتطبيق التنظيف التلقائي.
-    app.add_handler(MessageHandler(
-        filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL,
-        moderate_message
-    ), group=2)
+    # أوامر النصوص في الكروبات.
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & filters.TEXT,
+            group_text_commands,
+        ),
+        group=1,
+    )
+
+    # معالجة جميع الرسائل، بما فيها الميديا.
+    # هذا المعالج منفصل عن معالج الأوامر أعلاه.
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS
+            & ~filters.StatusUpdate.ALL,
+            moderate_message,
+        ),
+        group=2,
+    )
 
     app.add_error_handler(error_handler)
+
     log.info("Cleaner started.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
