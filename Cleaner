@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -102,6 +101,14 @@ def init_db():
             message_date INTEGER,
             kind TEXT DEFAULT 'text',
             PRIMARY KEY(chat_id,message_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS admin_messages(
+            chat_id INTEGER,
+            user_id INTEGER,
+            name TEXT DEFAULT '',
+            messages INTEGER DEFAULT 0,
+            PRIMARY KEY(chat_id,user_id)
         );
 
         CREATE TABLE IF NOT EXISTS auto_replies(
@@ -562,7 +569,7 @@ def is_trackable_message(message):
 # تسجيل الرسائل: التوب منفصل عن سجل التنظيف
 # =========================================================
 
-async def track_message(update):
+async def track_message(update, context):
     message = update.effective_message
     chat = update.effective_chat
     user = update.effective_user
@@ -595,6 +602,28 @@ async def track_message(update):
             user.id,
             user.full_name or str(user.id),
         ))
+
+    # عدّاد مستقل لرسائل مشرفي الكروب؛ لا يؤثر في التوب العام.
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        ):
+            with db() as con:
+                con.execute("""
+                    INSERT INTO admin_messages(chat_id,user_id,name,messages)
+                    VALUES(?,?,?,1)
+                    ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                        name=excluded.name,
+                        messages=admin_messages.messages+1
+                """, (
+                    chat.id,
+                    user.id,
+                    user.full_name or str(user.id),
+                ))
+    except TelegramError as exc:
+        log.debug("تعذر تسجيل رسالة المشرف %s: %s", user.id, exc)
 
     # -----------------------------------------------------
     # ثانياً: سجل التنظيف يسجل أنواعاً محددة فقط.
@@ -943,7 +972,7 @@ async def moderate_message(update, context):
     # مهم:
     # التوب يحسب كل الرسائل.
     # سجل التنظيف يستقبل الأنواع المحددة فقط.
-    await track_message(update)
+    await track_message(update, context)
 
     if setting("enabled", "1") != "1":
         return
@@ -1074,6 +1103,66 @@ async def moderate_message(update, context):
                 pass
 
 
+async def admin_top_command(update, context):
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("هذا الأمر مخصص للكروبات.")
+        return
+
+    try:
+        administrators = await context.bot.get_chat_administrators(chat.id)
+        admins = [item.user for item in administrators if not item.user.is_bot]
+
+        if not admins:
+            await message.reply_text("لا يوجد مشرفون لعرض التوب.")
+            return
+
+        with db() as con:
+            rows = con.execute(
+                "SELECT user_id,name,messages FROM admin_messages WHERE chat_id=?",
+                (chat.id,),
+            ).fetchall()
+
+        saved = {row["user_id"]: row for row in rows}
+        results = []
+        for admin in admins:
+            row = saved.get(admin.id)
+            results.append((
+                row["name"] if row and row["name"] else admin.full_name,
+                row["messages"] if row else 0,
+            ))
+
+        results.sort(key=lambda item: item[1], reverse=True)
+        lines = ["🏆 <b>توب مشرفي الكروب</b>", f"👥 عدد المشرفين: {len(admins)}", ""]
+        for rank, (name, count) in enumerate(results, 1):
+            lines.append(f"{rank}. {html.escape(name or 'مشرف')} — {count} رسالة")
+
+        await message.reply_text("\n".join(lines), parse_mode="HTML")
+    except TelegramError as exc:
+        log.warning("تعذر جلب مشرفي الكروب %s: %s", chat.id, exc)
+        await message.reply_text("تعذر جلب قائمة المشرفين. تأكد من صلاحيات البوت.")
+
+
+async def reset_admin_top(update, context):
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("هذا الأمر مخصص للكروبات.")
+        return
+
+    if not await is_group_admin(update, context):
+        await message.reply_text("هذا الأمر للمشرفين فقط.")
+        return
+
+    with db() as con:
+        con.execute("DELETE FROM admin_messages WHERE chat_id=?", (chat.id,))
+
+    await message.reply_text("✅ تم تصفير توب المشرفين فقط.\nالتوب العام لم يتغير.")
+
+
 async def group_text_commands(update, context):
     message = update.effective_message
     chat = update.effective_chat
@@ -1103,6 +1192,12 @@ async def group_text_commands(update, context):
             context,
             message,
         )
+
+    elif text == "توب المشرفين":
+        await admin_top_command(update, context)
+
+    elif text == "تصفير توب المشرفين":
+        await reset_admin_top(update, context)
 
     elif text in (
         "تصفير التوب",
@@ -1816,6 +1911,8 @@ def main():
     app.add_handler(CommandHandler("enable", enable_command))
     app.add_handler(CommandHandler("disable", disable_command))
     app.add_handler(CommandHandler("reset_top", reset_top))
+    app.add_handler(CommandHandler("admin_top", admin_top_command))
+    app.add_handler(CommandHandler("reset_admin_top", reset_admin_top))
 
     app.add_handler(
         CallbackQueryHandler(panel_callback)
