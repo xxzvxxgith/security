@@ -1,887 +1,2182 @@
-code = r'''#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-بوت روليت وسحوبات تيليجرام
-Python 3.10+
-Install: python -m pip install -U "python-telegram-bot[job-queue]"
-Set token: export BOT_TOKEN="YOUR_BOT_TOKEN"
-Run: python -u Rolet.py
-"""
-import os
-import html
+
+import subprocess
+import sys
+
+def _ensure_installed(pip_name, import_name=None):
+    import_name = import_name or pip_name
+    try:
+        __import__(import_name)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+
+_ensure_installed("pyTelegramBotAPI", "telebot")
+_ensure_installed("pytz")
+
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+import uuid
+import re
+import random
+import threading
 import time
-import sqlite3
 import logging
-import secrets
-from contextlib import contextmanager
-from datetime import datetime, timezone
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
-from telegram.constants import ChatType
-from telegram.error import TelegramError, Conflict, InvalidToken
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-
-# -------------------- CONFIG --------------------
-OWNER_ID = 1537665613
-TOKEN = os.getenv("BOT_TOKEN", "8906278700:AAGf5AZs6tKkPtROSxYjJPjLS4cuHX8tW5E").strip()
-DB_PATH = os.getenv("DB_PATH", "roulette.sqlite3")
-
-MAX_WINNERS = 100
-MAX_DURATION_MINUTES = 10080
-MAX_TITLE_LENGTH = 180
-
-MENU_CREATE = "🎡 إنشاء روليت"
-MENU_MINE = "📋 سحوباتي"
-MENU_STATS = "📊 الإحصائيات"
-MENU_HISTORY = "🏆 سجل النتائج"
-MENU_ADMINS = "🛡 إدارة المشرفين"
-MENU_CANCEL = "❌ إلغاء"
-MENU_HOME = "🏠 القائمة الرئيسية"
+from datetime import datetime
+import pytz
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger("roulette")
+logger = logging.getLogger("RouletteBot")
 
+class RouletteBot:
+    API_TOKEN = '8906278700:AAGf5AZs6tKkPtROSxYjJPjLS4cuHX8tW5E'
+    ADMIN_ID = 1537665613
 
-# -------------------- DATABASE --------------------
-@contextmanager
-def database():
-    con = sqlite3.connect(DB_PATH, timeout=30)
-    con.row_factory = sqlite3.Row
-    try:
-        con.execute("PRAGMA foreign_keys=ON")
-        con.execute("PRAGMA busy_timeout=30000")
-        yield con
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
+    def __init__(self):
+        self.bot = telebot.TeleBot(self.API_TOKEN)
+        self.user_states = {}
+        self.user_temp_data = {}
+        self.user_bound_channels = {}
+        self.active_roulettes = {}
+        self.banned_from_creator_roulettes = {}
+        self.global_forced_channels = {}
+        self.baghdad_tz = pytz.timezone('Asia/Baghdad')
+        self.bot_active = True
+        self.total_users_count = 0
+        self.known_users = set()
+        
+        self.active_contests = {}
+        self.contest_participants = {}
+        self.contest_votes = {}
+        self.user_votes = {}
+        self.contest_verification = {}
+        self.contest_participant_messages = {}
 
-
-def now():
-    return int(time.time())
-
-
-def init_db():
-    with database() as con:
-        con.execute("PRAGMA journal_mode=WAL")
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS admins(
-            user_id INTEGER PRIMARY KEY,
-            added_at INTEGER NOT NULL,
-            added_by INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS giveaways(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            creator_id INTEGER NOT NULL,
-            chat_id INTEGER,
-            chat_title TEXT,
-            message_id INTEGER,
-            title TEXT NOT NULL,
-            winner_count INTEGER NOT NULL,
-            duration_seconds INTEGER NOT NULL DEFAULT 0,
-            exclude_previous INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'draft',
-            created_at INTEGER NOT NULL,
-            ends_at INTEGER,
-            closed_at INTEGER,
-            drawn_at INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS participants(
-            giveaway_id INTEGER NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            full_name TEXT NOT NULL,
-            joined_at INTEGER NOT NULL,
-            excluded INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY(giveaway_id,user_id)
-        );
-        CREATE TABLE IF NOT EXISTS winners(
-            giveaway_id INTEGER NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            full_name TEXT NOT NULL,
-            place INTEGER NOT NULL,
-            drawn_at INTEGER NOT NULL,
-            PRIMARY KEY(giveaway_id,user_id),
-            UNIQUE(giveaway_id,place)
-        );
-        CREATE TABLE IF NOT EXISTS previous_winners(
-            user_id INTEGER PRIMARY KEY,
-            last_won_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS audit_log(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            actor_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            giveaway_id INTEGER,
-            details TEXT,
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_giveaway_status ON giveaways(status);
-        CREATE INDEX IF NOT EXISTS idx_participants_giveaway ON participants(giveaway_id);
-        """)
-
-
-def audit(con, actor, action, gid=None, details=None):
-    con.execute(
-        "INSERT INTO audit_log(actor_id,action,giveaway_id,details,created_at) VALUES(?,?,?,?,?)",
-        (actor, action, gid, details, now()),
-    )
-
-
-def get_giveaway(gid):
-    with database() as con:
-        return con.execute("SELECT * FROM giveaways WHERE id=?", (gid,)).fetchone()
-
-
-def is_owner(uid):
-    return uid == OWNER_ID
-
-
-def is_admin(uid):
-    if is_owner(uid):
-        return True
-    with database() as con:
-        return con.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone() is not None
-
-
-def can_manage(uid, giveaway):
-    return bool(
-        giveaway
-        and (is_owner(uid) or (is_admin(uid) and giveaway["creator_id"] == uid))
-    )
-
-
-def participant_count(gid):
-    with database() as con:
-        return con.execute(
-            "SELECT COUNT(*) FROM participants WHERE giveaway_id=? AND excluded=0",
-            (gid,),
-        ).fetchone()[0]
-
-
-# -------------------- KEYBOARDS --------------------
-def main_keyboard(uid):
-    rows = [
-        [KeyboardButton(MENU_CREATE)],
-        [KeyboardButton(MENU_MINE), KeyboardButton(MENU_STATS)],
-        [KeyboardButton(MENU_HISTORY)],
-    ]
-    if is_owner(uid):
-        rows.append([KeyboardButton(MENU_ADMINS)])
-    rows.append([KeyboardButton(MENU_CANCEL)])
-    return ReplyKeyboardMarkup(
-        rows,
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="اختر عملية من القائمة",
-    )
-
-
-def post_keyboard(gid, status, manager=False):
-    rows = []
-    if status == "open":
-        rows.append([
-            InlineKeyboardButton("🎟 انضمام", callback_data=f"join:{gid}"),
-            InlineKeyboardButton("🚪 مغادرة", callback_data=f"leave:{gid}"),
-        ])
-    if manager and status in ("open", "closed"):
-        rows.append([
-            InlineKeyboardButton("🔒 إغلاق التسجيل", callback_data=f"close:{gid}"),
-            InlineKeyboardButton("🏆 سحب الفائزين", callback_data=f"draw:{gid}"),
-        ])
-    return InlineKeyboardMarkup(rows) if rows else None
-
-
-# -------------------- GIVEAWAY POSTS --------------------
-def post_text(gid):
-    g = get_giveaway(gid)
-    if not g:
-        return "هذا السحب غير موجود."
-    count = participant_count(gid)
-    states = {
-        "draft": "مسودة",
-        "open": "🟢 التسجيل مفتوح",
-        "closed": "🔒 التسجيل مغلق",
-        "drawn": "🏆 انتهى السحب",
-    }
-    end_line = ""
-    if g["ends_at"]:
-        end = datetime.fromtimestamp(g["ends_at"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        end_line = f"\n⏳ نهاية التسجيل: <code>{end}</code>"
-    return (
-        f"🎡 <b>روليت #{gid}</b>\n\n"
-        f"🎁 <b>{html.escape(g['title'])}</b>\n"
-        f"🏆 عدد الفائزين: <b>{g['winner_count']}</b>\n"
-        f"👥 المشاركون: <b>{count}</b>\n"
-        f"📌 الحالة: <b>{states.get(g['status'], g['status'])}</b>"
-        f"{end_line}\n\n"
-        "استخدم الأزرار أدناه للمشاركة."
-    )
-
-
-async def refresh_post(context, gid):
-    g = get_giveaway(gid)
-    if not g or not g["chat_id"] or not g["message_id"]:
-        return
-    try:
-        manager = True
-        await context.bot.edit_message_text(
-            chat_id=g["chat_id"],
-            message_id=g["message_id"],
-            text=post_text(gid),
-            parse_mode="HTML",
-            reply_markup=post_keyboard(gid, g["status"], manager=manager),
+        self.ROULETTE_TEXT_PROMPT = (
+            "أرسل كليشة السحب\n\n"
+            "1 - للتشويش: <code>&lt;tg-spoiler&gt;&lt;/tg-spoiler&gt;</code>\n"
+            "<tg-spoiler>مثال</tg-spoiler>\n\n"
+            "2 - للتعريض: <code>&lt;b&gt;&lt;/b&gt;</code>\n"
+            "<b>مثال</b>\n\n"
+            "3 - لجعل النص مائل: <code>&lt;i&gt;&lt;/i&gt;</code>\n"
+            "<i>مثال</i>\n\n"
+            "4 - للاقتباس: <code>&lt;blockquote&gt;&lt;/blockquote&gt;</code>\n"
+            "<blockquote>مثال</blockquote>\n\n"
+            "رجاءً عدم إرسال روابط نهائياً 🚫"
         )
-    except TelegramError as exc:
-        log.warning("تعذر تحديث منشور السحب %s: %s", gid, exc)
 
-
-# -------------------- CLOSE / TIMER --------------------
-async def close_giveaway(context, gid, actor_id=None):
-    with database() as con:
-        con.execute("BEGIN IMMEDIATE")
-        row = con.execute("SELECT * FROM giveaways WHERE id=?", (gid,)).fetchone()
-        if not row or row["status"] != "open":
-            return False
-        con.execute(
-            "UPDATE giveaways SET status='closed',closed_at=? WHERE id=? AND status='open'",
-            (now(), gid),
+        self.CHANNEL_BINDING_INSTRUCTIONS = (
+            "1️⃣ أضف البوت كمشرف في قناتك.\n"
+            "2️⃣ قم بإعادة توجيه أي رسالة من قناتك إلى البوت.\n\n"
+            "📌 ملاحظة:\n"
+            "جميع المشرفين الآخرين في القناة سيتمكنون أيضًا من استخدام البوت بعد إضافته."
         )
-        audit(con, actor_id or OWNER_ID, "close", gid)
-    await refresh_post(context, gid)
-    return True
 
+        self.CONDITIONAL_CHANNEL_QUESTION = "هل تريد إضافة قناة شرط؟\n\nعند إضافة قناة شرط لن يتمكن أحد من المشاركة في السحب قبل الانضمام لقناة الشرط."
+        self.SEND_CONDITIONAL_CHANNEL_LINK = "أرسل رابط القناة الشرطية (مثال: @VIP_C20 / https://t.me/VIP_C20)"
+        self.NOT_YOUR_COMMAND_MSG = "هذا الأمر مخصص لمنشئ الروليت فقط. "
+        self.BOT_MAINTENANCE_MSG = "البوت متوقف حالياً للصيانة."
+        self.FORCED_CHANNEL_PROMPT_MSG = "عليك الانضمام إلى القنوات الإجبارية التالية للمتابعة:"
+        self.ROULETTE_TYPE_TEXT_NORMAL = "الروليت العادي: سحب مجاني بدون شروط خاصة"
+        self.ROULETTE_TYPE_TEXT_PROTECTED = "الروليت المحمي: سحب محمي ضد الرشق"
+        self.DRAW_METHOD_TEXT_MANUAL = "• سحب يدوي: تحكم كامل في توقيت السحب من ادوس بدء روليت يبدء"
+        self.DRAW_METHOD_TEXT_AUTOMATIC = "• سحب تلقائي: سحب آلي بعد انتهاء المدة "
 
-async def timer_close(context):
-    gid = context.job.data["gid"]
-    if await close_giveaway(context, gid):
-        g = get_giveaway(gid)
-        if g:
-            try:
-                await context.bot.send_message(
-                    chat_id=g["creator_id"],
-                    text=f"⏰ انتهى التسجيل في السحب #{gid}.\nاستخدم /draw {gid} لسحب الفائزين.",
-                )
-            except TelegramError as exc:
-                log.warning("تعذر إرسال تنبيه انتهاء السحب: %s", exc)
+        self.register_handlers()
 
+    def main_menu_kb(self, user_id):
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(InlineKeyboardButton("🏆 مسابقة تصويتات", callback_data="start_contest_select_channel", style="primary"))
+        kb.add(InlineKeyboardButton("🎰 بدء روليت", callback_data="start_roulette_select_channel_prompt", style="danger"))
+        kb.add(InlineKeyboardButton("📢 قنواتي", callback_data="my_channels_menu", style="success"),
+               InlineKeyboardButton("🔔 ذكرني إذا فزت", callback_data="remind_me_global_info", style="success"))
+        kb.add(InlineKeyboardButton("👤 مطور البوت", url="t.me/ham_4T", style="danger"), 
+               InlineKeyboardButton("📢 قناه البوت", url="https://t.me/ham_5t", style="danger"))
+        kb.add(InlineKeyboardButton("❓ المساعدة", callback_data="show_help_info", style="danger"))
+        if user_id == self.ADMIN_ID:
+            kb.add(InlineKeyboardButton("⚙️ لوحة الأدمن", callback_data="admin_panel", style="success"))
+        return kb
 
-async def restore_timers(app):
-    with database() as con:
-        rows = con.execute("SELECT id,ends_at FROM giveaways WHERE status='open'").fetchall()
-    if app.job_queue is None:
-        log.error("JobQueue غير متاحة. ثبّت: pip install 'python-telegram-bot[job-queue]'")
-        return
-    for row in rows:
-        if row["ends_at"] is not None:
-            app.job_queue.run_once(
-                timer_close,
-                when=max(0, row["ends_at"] - now()),
-                data={"gid": row["id"]},
-                name=f"giveaway-{row['id']}",
-            )
-    log.info("تم استرجاع مؤقتات السحوبات.")
+    def admin_panel_kb(self):
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(InlineKeyboardButton("📊 عرض الإحصائيات", callback_data="show_bot_stats", style="danger"))
+        kb.add(InlineKeyboardButton("➕ إضافة قناة اشتراك إجباري", callback_data="add_global_forced_channel_prompt", style="success"))
+        kb.add(InlineKeyboardButton("➖ إزالة قناة اشتراك إجباري", callback_data="remove_global_forced_channel_prompt", style="success"))
+        if self.bot_active:
+            kb.add(InlineKeyboardButton("⏹ إيقاف البوت", callback_data="stop_bot_for_maintenance", style="success"))
+        else:
+            kb.add(InlineKeyboardButton("▶️ تشغيل البوت", callback_data="start_bot_from_maintenance", style="primary"))
+        kb.add(InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main_menu", style="primary"))
+        return kb
 
+    def my_channels_kb(self):
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(InlineKeyboardButton("➕ إضافة قناة", callback_data="add_channel_prompt", style="primary"))
+        kb.add(InlineKeyboardButton("📋 عرض قنواتي", callback_data="view_my_channels", style="danger"))
+        kb.add(InlineKeyboardButton("🗑️ حذف قناة", callback_data="delete_channel_prompt", style="success"))
+        kb.add(InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main_menu", style="danger"))
+        return kb
 
-# -------------------- DRAWING --------------------
-def perform_draw(gid, actor_id):
-    with database() as con:
-        con.execute("BEGIN IMMEDIATE")
-        g = con.execute("SELECT * FROM giveaways WHERE id=?", (gid,)).fetchone()
-        if not g:
-            return "السحب غير موجود."
-        if g["status"] not in ("open", "closed"):
-            return "تم السحب مسبقاً أو أن السحب غير جاهز."
-        if not can_manage(actor_id, g):
-            return "ليس لديك صلاحية إدارة هذا السحب."
-        people = con.execute(
-            "SELECT user_id,username,full_name FROM participants WHERE giveaway_id=? AND excluded=0",
-            (gid,),
-        ).fetchall()
-        if g["exclude_previous"]:
-            previous = {
-                r["user_id"] for r in con.execute("SELECT user_id FROM previous_winners").fetchall()
-            }
-            people = [p for p in people if p["user_id"] not in previous]
-        if not people:
-            return "لا يوجد مشاركون مؤهلون للسحب."
-        picks = secrets.SystemRandom().sample(list(people), min(g["winner_count"], len(people)))
-        stamp = now()
-        con.execute(
-            "UPDATE giveaways SET status='drawn',closed_at=COALESCE(closed_at,?),drawn_at=? WHERE id=?",
-            (stamp, stamp, gid),
-        )
-        for place, person in enumerate(picks, 1):
-            con.execute(
-                "INSERT INTO winners(giveaway_id,user_id,username,full_name,place,drawn_at) VALUES(?,?,?,?,?,?)",
-                (gid, person["user_id"], person["username"], person["full_name"], place, stamp),
-            )
-            con.execute(
-                """INSERT INTO previous_winners(user_id,last_won_at) VALUES(?,?)
-                   ON CONFLICT(user_id) DO UPDATE SET last_won_at=excluded.last_won_at""",
-                (person["user_id"], stamp),
-            )
-        audit(con, actor_id, "draw", gid, f"winners={len(picks)}")
-        return picks
+    def roulette_type_selection_kb(self):
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(InlineKeyboardButton("الروليت العادي", callback_data="select_roulette_type_normal", style="success"))
+        kb.add(InlineKeyboardButton("الروليت المحمي", callback_data="select_roulette_type_protected", style="success"))
+        kb.add(InlineKeyboardButton("🔙 رجوع", callback_data="start_roulette_select_channel_prompt", style="danger"))
+        return kb
 
+    def draw_method_selection_kb(self):
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(InlineKeyboardButton("سحب يدوي", callback_data="select_draw_method_manual", style="primary"))
+        kb.add(InlineKeyboardButton("سحب تلقائي", callback_data="select_draw_method_automatic", style="danger"))
+        kb.add(InlineKeyboardButton("🔙 رجوع", callback_data="select_roulette_type_prompt", style="success"))
+        return kb
 
-def format_winners(gid, picks):
-    g = get_giveaway(gid)
-    lines = [f"🏆 <b>نتائج الروليت #{gid}</b>", f"🎁 {html.escape(g['title'])}", ""]
-    for place, person in enumerate(picks, 1):
-        name = html.escape(person["full_name"])
-        if person["username"]:
-            name += f" (@{html.escape(person['username'])})"
-        lines.append(f"{place}. {name} — <code>{person['user_id']}</code>")
-    lines.append(f"\n👥 عدد الفائزين: {len(picks)}")
-    return "\n".join(lines)
+    def auto_draw_duration_unit_kb(self):
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(InlineKeyboardButton("بالدقائق", callback_data="auto_draw_unit_minutes", style="primary"))
+        kb.add(InlineKeyboardButton("بالساعات", callback_data="auto_draw_unit_hours", style="primary"))
+        kb.add(InlineKeyboardButton("بالأيام", callback_data="auto_draw_unit_days", style="danger"))
+        kb.add(InlineKeyboardButton("🔙 رجوع", callback_data="select_draw_method_prompt", style="success"))
+        return kb
 
+    def roulette_creation_options_kb(self):
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(InlineKeyboardButton("تعديل الكليشة", callback_data="choose_style_instructions", style="success"))
+        kb.add(InlineKeyboardButton("إضافة قناة شرط", callback_data="prompt_conditional_channel", style="danger"))
+        kb.add(InlineKeyboardButton("تخطي", callback_data="skip_conditional_channel", style="danger"))
+        return kb
 
-async def publish_results(context, gid, picks, reply_message=None):
-    await refresh_post(context, gid)
-    result_text = format_winners(gid, picks)
-    if reply_message:
-        await reply_message.reply_text(result_text, parse_mode="HTML")
-    g = get_giveaway(gid)
-    if g and g["chat_id"]:
+    def conditional_channel_choice_kb(self):
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(InlineKeyboardButton("إضافة رابط قناة", callback_data="send_conditional_channel_link_prompt", style="danger"))
+        kb.add(InlineKeyboardButton("تخطي", callback_data="skip_conditional_channel", style="danger"))
+        kb.add(InlineKeyboardButton("🔙 رجوع", callback_data="back_to_roulette_creation_options", style="success"))
+        return kb
+
+    def get_channel_roulette_markup(self, roulette_id, is_active, is_draw_manual):
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(InlineKeyboardButton("🎯 المشاركة في السحب", callback_data=f"join_roulette_{roulette_id}", style="success"))
+        kb.add(InlineKeyboardButton("🔔 ذكرني إذا فزت", callback_data=f"remind_me_roulette_{roulette_id}", style="danger"))
+
+        r = self.active_roulettes.get(roulette_id)
+
+        if r and is_draw_manual and not r.get('final_winners_determined', False):
+            if r['active']:
+                kb.add(InlineKeyboardButton("⏹ إيقاف المشاركة", callback_data=f"toggle_participation_{roulette_id}", style="danger"))
+            else:
+                kb.add(InlineKeyboardButton("▶️ تشغيل المشاركة", callback_data=f"toggle_participation_{roulette_id}", style="danger"))
+
+            if len(r['participants']) > 0:
+                if r.get('draw_started_manually', False) and len(r.get('current_draw_pool', [])) > r['winners_count']:
+                    kb.add(InlineKeyboardButton("⚡ استبعاد مشارك آخر", callback_data=f"start_draw_{roulette_id}", style="success"))
+                elif not r.get('draw_started_manually', False) and len(r['participants']) > r['winners_count']:
+                    kb.add(InlineKeyboardButton("🚀 ابدأ السحب", callback_data=f"start_draw_{roulette_id}", style="success"))
+
+        kb.add(InlineKeyboardButton("📋 عرض المشاركين", callback_data=f"view_participants_{roulette_id}", style="danger"))
+        return kb
+
+    def creator_exclude_kb(self, roulette_id, participant_id):
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🚫 استبعاد هذا المشارك", callback_data=f"exclude_participant_{roulette_id}_{participant_id}", style="danger"))
+        return kb
+
+    def get_contest_markup(self, contest_id):
+        kb = InlineKeyboardMarkup(row_width=1)
+        bot_username = self.bot.get_me().username
+        kb.add(InlineKeyboardButton("🎯 المشاركة في المسابقة", url=f"https://t.me/{bot_username}?start=contest_{contest_id}"))
+        return kb
+
+    def get_participant_vote_markup(self, contest_id, participant_id, participant_name):
+        kb = InlineKeyboardMarkup(row_width=2)
+        bot_username = self.bot.get_me().username
+        kb.add(InlineKeyboardButton(f"👍 تصويت", url=f"https://t.me/{bot_username}?start=vote_{contest_id}_{participant_id}", style="danger"))
+        kb.add(InlineKeyboardButton("📊 عدد الأصوات", callback_data=f"contest_votes_{contest_id}_{participant_id}"))
+        return kb
+
+    def get_verification_markup(self, contest_id, participant_id):
+        emojis = ["🇨🇦", "👤", "🧐", "✅", "⭐", "❤️", "🔥", "💎", "🌟", "🎯"]
+        correct_emoji = random.choice(emojis)
+        options = random.sample(emojis, 3)
+        if correct_emoji not in options:
+            options[random.randint(0, 2)] = correct_emoji
+        random.shuffle(options)
+        
+        kb = InlineKeyboardMarkup(row_width=3)
+        for emoji in options:
+            kb.add(InlineKeyboardButton(emoji, callback_data=f"verify_{contest_id}_{participant_id}_{emoji}"))
+        return kb, correct_emoji
+
+    def _is_channel_member(self, channel_id, user_id):
         try:
-            await context.bot.send_message(chat_id=g["chat_id"], text=result_text, parse_mode="HTML")
-        except TelegramError as exc:
-            log.warning("تعذر نشر النتائج: %s", exc)
+            member = self.bot.get_chat_member(channel_id, user_id)
+            return member.status not in ['left', 'kicked']
+        except Exception:
+            return False
 
+    def _is_channel_admin_or_owner(self, channel_id, user_id):
+        try:
+            member = self.bot.get_chat_member(channel_id, user_id)
+            return member.status in ['administrator', 'creator']
+        except Exception:
+            return False
 
-# -------------------- COMMANDS --------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.effective_message or not update.effective_chat:
-        return
-    uid = update.effective_user.id
-    log.info("وصل /start من user_id=%s chat_type=%s", uid, update.effective_chat.type)
-    if update.effective_chat.type != ChatType.PRIVATE:
-        await update.effective_message.reply_text("افتح البوت في الخاص واستخدم /start.")
-        return
-    await update.effective_message.reply_text(
-        "🎡 <b>مرحباً بك في بوت الروليت</b>\n\n"
-        "اختر أحد الأزرار أسفل الشاشة.\n"
-        "إذا لم تظهر القائمة، اضغط أيقونة لوحة المفاتيح بجانب خانة الكتابة.",
-        parse_mode="HTML",
-        reply_markup=main_keyboard(uid),
-    )
+    def _get_channel_info_from_link(self, link):
+        match_username = re.match(r"^(?:https?://t\.me/)?@?([a-zA-Z0-9_]+)$", link)
+        if match_username:
+            return "@" + match_username.group(1)
+        return None
 
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    context.user_data.pop("flow", None)
-    await update.effective_message.reply_text("تم إلغاء العملية.", reply_markup=main_keyboard(uid))
-
-
-async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
-        await update.effective_message.reply_text("ليس لديك صلاحية.")
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.effective_message.reply_text("الاستخدام: /close رقم_السحب")
-        return
-    gid = int(context.args[0])
-    g = get_giveaway(gid)
-    if not can_manage(uid, g):
-        await update.effective_message.reply_text("السحب غير موجود أو ليس لديك صلاحية إدارته.")
-        return
-    changed = await close_giveaway(context, gid, uid)
-    await update.effective_message.reply_text(
-        "تم إغلاق التسجيل." if changed else "التسجيل مغلق مسبقاً أو غير نشط."
-    )
-
-
-async def draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
-        await update.effective_message.reply_text("ليس لديك صلاحية.")
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.effective_message.reply_text("الاستخدام: /draw رقم_السحب")
-        return
-    gid = int(context.args[0])
-    result = perform_draw(gid, uid)
-    if isinstance(result, str):
-        await update.effective_message.reply_text(result)
-        return
-    await publish_results(context, gid, result, update.effective_message)
-
-
-async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await update.effective_message.reply_text("هذه العملية للمالك فقط.")
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.effective_message.reply_text("الاستخدام: /addadmin USER_ID")
-        return
-    target = int(context.args[0])
-    if target == OWNER_ID:
-        await update.effective_message.reply_text("المالك لديه الصلاحيات مسبقاً.")
-        return
-    with database() as con:
-        con.execute(
-            "INSERT OR IGNORE INTO admins(user_id,added_at,added_by) VALUES(?,?,?)",
-            (target, now(), uid),
-        )
-        audit(con, uid, "add_admin", details=str(target))
-    await update.effective_message.reply_text("تمت إضافة المشرف.")
-
-
-async def deladmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_owner(uid):
-        await update.effective_message.reply_text("هذه العملية للمالك فقط.")
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.effective_message.reply_text("الاستخدام: /deladmin USER_ID")
-        return
-    target = int(context.args[0])
-    with database() as con:
-        con.execute("DELETE FROM admins WHERE user_id=?", (target,))
-        audit(con, uid, "delete_admin", details=str(target))
-    await update.effective_message.reply_text("تم حذف المشرف إن كان مسجلاً.")
-
-
-async def exclude_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
-        await update.effective_message.reply_text("ليس لديك صلاحية.")
-        return
-    if len(context.args) != 2 or not all(x.isdigit() for x in context.args):
-        await update.effective_message.reply_text("الاستخدام: /exclude USER_ID GIVEAWAY_ID")
-        return
-    user_id, gid = map(int, context.args)
-    g = get_giveaway(gid)
-    if not can_manage(uid, g) or g["status"] != "open":
-        await update.effective_message.reply_text("لا يمكن استبعاد مشارك من هذا السحب.")
-        return
-    with database() as con:
-        cur = con.execute(
-            "UPDATE participants SET excluded=1 WHERE giveaway_id=? AND user_id=?",
-            (gid, user_id),
-        )
-        if cur.rowcount:
-            audit(con, uid, "exclude", gid, str(user_id))
-    if cur.rowcount:
-        await refresh_post(context, gid)
-        await update.effective_message.reply_text("تم استبعاد المشارك.")
-    else:
-        await update.effective_message.reply_text("المشارك غير موجود.")
-
-
-# -------------------- MENU / WIZARD --------------------
-async def show_mine(message, uid):
-    with database() as con:
-        rows = con.execute(
-            "SELECT id,title,status,winner_count FROM giveaways WHERE creator_id=? ORDER BY id DESC LIMIT 20",
-            (uid,),
-        ).fetchall()
-    if not rows:
-        await message.reply_text("لا توجد سحوبات مسجلة.")
-        return
-    lines = ["📋 <b>سحوباتك</b>\n"]
-    for row in rows:
-        lines.append(
-            f"🎡 #{row['id']} — {html.escape(row['title'])}\n"
-            f"الحالة: {html.escape(row['status'])} | الفائزون: {row['winner_count']}\n"
-            f"/close {row['id']} | /draw {row['id']}\n"
-        )
-    await message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def show_stats(message):
-    with database() as con:
-        total = con.execute("SELECT COUNT(*) FROM giveaways").fetchone()[0]
-        opened = con.execute("SELECT COUNT(*) FROM giveaways WHERE status='open'").fetchone()[0]
-        entries = con.execute("SELECT COUNT(*) FROM participants WHERE excluded=0").fetchone()[0]
-        winners = con.execute("SELECT COUNT(*) FROM winners").fetchone()[0]
-    await message.reply_text(
-        "📊 <b>إحصائيات البوت</b>\n\n"
-        f"🎡 جميع السحوبات: {total}\n🟢 السحوبات المفتوحة: {opened}\n"
-        f"👥 المشاركات الفعالة: {entries}\n🏆 سجلات الفائزين: {winners}",
-        parse_mode="HTML",
-    )
-
-
-async def show_history(message):
-    with database() as con:
-        rows = con.execute(
-            "SELECT id,title FROM giveaways WHERE status='drawn' ORDER BY drawn_at DESC LIMIT 10"
-        ).fetchall()
-        results = []
-        for row in rows:
-            winners = con.execute(
-                "SELECT full_name,username,place FROM winners WHERE giveaway_id=? ORDER BY place",
-                (row["id"],),
-            ).fetchall()
-            results.append((row, winners))
-    if not results:
-        await message.reply_text("لا توجد نتائج حتى الآن.")
-        return
-    lines = ["🏆 <b>آخر نتائج الروليت</b>\n"]
-    for row, winners in results:
-        lines.append(f"\n🎡 <b>#{row['id']}</b> — {html.escape(row['title'])}")
-        for winner in winners:
-            name = html.escape(winner["full_name"])
-            if winner["username"]:
-                name += f" (@{html.escape(winner['username'])})"
-            lines.append(f"{winner['place']}. {name}")
-    await message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    data = query.data or ""
-    uid = query.from_user.id
-    try:
-        if data.startswith(("join:", "leave:")):
-            action, gid_text = data.split(":", 1)
-            if not gid_text.isdigit():
-                await query.answer("طلب غير صالح.", show_alert=True)
-                return
-            gid = int(gid_text)
-            giveaway = get_giveaway(gid)
-            if not giveaway or giveaway["status"] != "open":
-                await query.answer("التسجيل مغلق.", show_alert=True)
-                return
-            if query.from_user.is_bot:
-                await query.answer("حسابات البوتات لا تشارك.", show_alert=True)
-                return
-            with database() as con:
-                con.execute("BEGIN IMMEDIATE")
-                current = con.execute("SELECT status FROM giveaways WHERE id=?", (gid,)).fetchone()
-                if not current or current["status"] != "open":
-                    await query.answer("التسجيل مغلق.", show_alert=True)
-                    return
-                if action == "join":
-                    # Preserve original joined_at on repeat presses; update only profile/exclusion.
-                    con.execute(
-                        """INSERT INTO participants(giveaway_id,user_id,username,full_name,joined_at,excluded)
-                           VALUES(?,?,?,?,?,0)
-                           ON CONFLICT(giveaway_id,user_id) DO UPDATE SET
-                           username=excluded.username,full_name=excluded.full_name,excluded=0""",
-                        (gid, uid, query.from_user.username, query.from_user.full_name, now()),
-                    )
-                    audit(con, uid, "join", gid)
-                    answer = "تم تسجيل مشاركتك 🎟"
-                else:
-                    con.execute(
-                        "DELETE FROM participants WHERE giveaway_id=? AND user_id=?",
-                        (gid, uid),
-                    )
-                    audit(con, uid, "leave", gid)
-                    answer = "تم إلغاء مشاركتك."
-            await query.answer(answer, show_alert=True)
-            await refresh_post(context, gid)
+    def _update_roulette_message(self, roulette_id):
+        r = self.active_roulettes.get(roulette_id)
+        if not r:
             return
 
-        if data.startswith(("close:", "draw:")):
-            action, gid_text = data.split(":", 1)
-            if not gid_text.isdigit():
-                await query.answer("طلب غير صالح.", show_alert=True)
-                return
-            gid = int(gid_text)
-            giveaway = get_giveaway(gid)
-            if not can_manage(uid, giveaway):
-                await query.answer("هذا الزر مخصص لمدير السحب.", show_alert=True)
-                return
-            await query.answer()
-            if action == "close":
-                changed = await close_giveaway(context, gid, uid)
-                await query.message.reply_text(
-                    "تم إغلاق التسجيل." if changed else "التسجيل مغلق مسبقاً أو غير نشط."
-                )
-                return
-            result = perform_draw(gid, uid)
-            if isinstance(result, str):
-                await query.message.reply_text(result)
-                return
-            await publish_results(context, gid, result, query.message)
-            return
+        try:
+            initial_participants_count = len(r['participants'])
+            current_draw_pool_count = len(r['current_draw_pool']) if r.get('current_draw_pool') else 0
 
-        await query.answer()
-    except TelegramError as exc:
-        log.warning("خطأ Telegram في الزر: %s", exc)
-    except Exception:
-        log.exception("فشل تنفيذ زر المشاركة")
+            if r['main_channel_username']:
+                channel_display = f"<a href='https://t.me/{r['main_channel_username']}'>{r['main_channel_title']}</a>"
+            else:
+                channel_display = f"\"{r['main_channel_title']}\""
+            header_text = f"بدءَ روليت في قناة {channel_display} "
+            updated_text = f"{header_text}\n\n{r['text']}"
 
+            if r.get('final_winners_determined', False):
+                winners_usernames = []
+                for winner_id in r['winners']:
+                    try:
+                        winner_info = self.bot.get_chat(winner_id)
+                        winners_usernames.append(f"<a href='tg://user?id={winner_id}'>{winner_info.first_name or winner_info.username or f'المستخدم {winner_id}'}</a>")
+                    except Exception:
+                        winners_usernames.append(f"<a href='tg://user?id={winner_id}'>المستخدم {winner_id}</a>")
+                updated_text += "\n\nالفائزون بالروليت :\n" + "\n".join(winners_usernames)
+            elif r.get('draw_started_manually', False) or r['draw_method'] == 'automatic':
+                updated_text += f"\n\nعدد المشاركين في الروليت : \"{current_draw_pool_count}\" "
+                if len(r.get('current_draw_pool', [])) > r['winners_count']:
+                    if r.get('last_eliminated') is not None:
+                        try:
+                            eliminated_info = self.bot.get_chat(r['last_eliminated'])
+                            eliminated_name = eliminated_info.first_name if eliminated_info.first_name else f"المستخدم {r['last_eliminated']}"
+                            updated_text += f"\n\nآخر مستبعد : <a href='tg://user?id={r['last_eliminated']}'>{eliminated_name}</a>"
+                        except Exception:
+                            updated_text += f"\n\nآخر مستبعد : <a href='tg://user?id={r['last_eliminated']}'>المستخدم {r['last_eliminated']}</a>"
+                    updated_text += f"\nالمتبقون: {len(r['current_draw_pool'])}"
+                elif len(r.get('current_draw_pool', [])) == r['winners_count'] and r['winners_count'] > 0:
+                    r['winners'] = list(r['current_draw_pool'])
+                    r['final_winners_determined'] = True
+                    r['active'] = False
+                    winners_usernames = []
+                    for winner_id in r['winners']:
+                        try:
+                            winner_info = self.bot.get_chat(winner_id)
+                            winners_usernames.append(f"<a href='tg://user?id={winner_id}'>{winner_info.first_name or winner_info.username or f'المستخدم {winner_id}'}</a>")
+                        except Exception:
+                            winners_usernames.append(f"<a href='tg://user?id={winner_id}'>المستخدم {winner_id}</a>")
+                    updated_text += "\n\nالفائزون بالروليت :\n" + "\n".join(winners_usernames)
+            else:
+                updated_text += f"\n\nعدد المشاركين في الروليت : \"{initial_participants_count}\" "
+                updated_text += "\n\nحالة السحب : لم يبدأ بعد."
 
-async def flow_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.effective_message:
-        return
-    message = update.effective_message
-    uid = update.effective_user.id
-    if message.chat.type != ChatType.PRIVATE:
-        return
-    text = (message.text or "").strip()
+            if not r['active'] and not r.get('final_winners_determined', False) and not r.get('draw_started_manually', False):
+                updated_text += "\nالمشاركة متوقفة حالياً. "
 
-    if text == MENU_CANCEL:
-        context.user_data.pop("flow", None)
-        await message.reply_text("تم إلغاء العملية.", reply_markup=main_keyboard(uid))
-        return
-    if text == MENU_HOME:
-        context.user_data.pop("flow", None)
-        await message.reply_text("القائمة الرئيسية:", reply_markup=main_keyboard(uid))
-        return
-    if text == MENU_CREATE:
-        if not is_admin(uid):
-            await message.reply_text(
-                "إنشاء السحوبات متاح للمالك والمشرفين فقط.",
-                reply_markup=main_keyboard(uid),
+            if r['draw_method'] == 'automatic' and not r.get('final_winners_determined', False):
+                draw_time = datetime.fromtimestamp(r['draw_time_unix'], tz=pytz.utc).astimezone(self.baghdad_tz)
+                updated_text += f"\nموعد السحب النهائي : {draw_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                if r['active'] and r.get('draw_started_manually', False):
+                    updated_text += "\nالسحب التلقائي قيد التقدم... "
+
+            self.bot.edit_message_text(
+                chat_id=r['main_channel_id'],
+                message_id=r['channel_message_id'],
+                text=updated_text,
+                parse_mode="HTML",
+                reply_markup=self.get_channel_roulette_markup(roulette_id, r['active'], r['draw_method'] == 'manual')
             )
-            return
-        context.user_data["flow"] = {"step": "title"}
-        await message.reply_text("🎁 أرسل عنوان الجائزة أو السحب:")
-        return
-    if text == MENU_MINE:
-        await show_mine(message, uid)
-        return
-    if text == MENU_STATS:
-        await show_stats(message)
-        return
-    if text == MENU_HISTORY:
-        await show_history(message)
-        return
-    if text == MENU_ADMINS:
-        if not is_owner(uid):
-            await message.reply_text("هذه الميزة للمالك فقط.")
-            return
-        await message.reply_text(
-            "🛡 إدارة المشرفين\n\nإضافة مشرف:\n/addadmin USER_ID\n\nحذف مشرف:\n/deladmin USER_ID"
-        )
-        return
+        except Exception:
+            pass
 
-    flow = context.user_data.get("flow")
-    if not flow:
-        return
-    if not is_admin(uid):
-        context.user_data.pop("flow", None)
-        await message.reply_text("ليس لديك صلاحية.")
-        return
+    def _perform_draw(self, roulette_id):
+        r = self.active_roulettes.get(roulette_id)
+        if not r:
+            return
 
-    step = flow["step"]
-    if step == "title":
-        if not text or len(text) > MAX_TITLE_LENGTH:
-            await message.reply_text(f"العنوان يجب أن يكون بين 1 و{MAX_TITLE_LENGTH} حرفاً.")
+        if r['final_winners_determined']:
             return
-        flow["title"] = text
-        flow["step"] = "winners"
-        await message.reply_text(f"🏆 كم عدد الفائزين؟ أرسل رقماً من 1 إلى {MAX_WINNERS}.")
-        return
-    if step == "winners":
-        if not text.isdigit() or not 1 <= int(text) <= MAX_WINNERS:
-            await message.reply_text(f"أرسل رقماً من 1 إلى {MAX_WINNERS}.")
+
+        if not r.get('current_draw_pool'):
+            r['current_draw_pool'] = set(r['participants'])
+            r['last_eliminated'] = None
+
+        if len(r['current_draw_pool']) <= r['winners_count']:
+            r['winners'] = list(r['current_draw_pool'])
+            r['final_winners_determined'] = True
+            r['active'] = False
+            self._update_roulette_message(roulette_id)
+
+            try:
+                self.bot.send_message(r['creator_id'], "تم تحديد الفائزين النهائيين! ")
+            except Exception:
+                pass
+
+            for winner_id in r['winners']:
+                if winner_id in r['reminders']:
+                    try:
+                        winner_info = self.bot.get_chat(winner_id)
+                        self.bot.send_message(
+                            winner_id,
+                            f"تهانينا! لقد فزت في السحب! \n\n{r['text']}\n\nيمكنك التحقق من الفائزين في القناة: <a href='https://t.me/{r['main_channel_username']}'>{r['main_channel_title']}</a> ",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
             return
-        flow["winner_count"] = int(text)
-        flow["step"] = "duration"
-        await message.reply_text("⏳ مدة التسجيل بالدقائق. أرسل 0 للتسجيل دون مؤقت.")
-        return
-    if step == "duration":
-        if not text.isdigit() or int(text) > MAX_DURATION_MINUTES:
-            await message.reply_text(f"أرسل رقماً من 0 إلى {MAX_DURATION_MINUTES}.")
+
+        eliminated_id = random.choice(list(r['current_draw_pool']))
+        r['current_draw_pool'].discard(eliminated_id)
+        r['last_eliminated'] = eliminated_id
+
+        self._update_roulette_message(roulette_id)
+
+        try:
+            eliminated_info = self.bot.get_chat(eliminated_id)
+            eliminated_name = eliminated_info.first_name if eliminated_info.first_name else f"المستخدم {eliminated_id}"
+            self.bot.send_message(r['creator_id'], f"تم استبعاد: <a href='tg://user?id={eliminated_id}'>{eliminated_name}</a> \nالمتبقون: {len(r['current_draw_pool'])}", parse_mode="HTML")
+        except Exception:
+            pass
+
+        if r['draw_method'] == 'automatic' and not r['final_winners_determined']:
+            timer = threading.Timer(5, self._perform_draw, args=[roulette_id])
+            timer.start()
+            self.active_roulettes[roulette_id]['auto_draw_timer'] = timer
+
+    def _publish_roulette(self, user_id):
+        data = self.user_temp_data.get(user_id)
+        if not data or 'roulette_text' not in data or 'main_channel_id' not in data or 'winners_count' not in data or 'draw_method' not in data:
+            self.bot.send_message(user_id, "حدث خطأ: بيانات الروليت غير مكتملة. يرجى البدء من جديد عبر /start. ")
             return
-        flow["duration"] = int(text) * 60
-        flow["step"] = "exclude_previous"
-        await message.reply_text("هل تريد استبعاد الفائزين السابقين؟ أرسل نعم أو لا.")
-        return
-    if step == "exclude_previous":
-        answer = text.casefold()
-        if answer not in ("نعم", "لا", "yes", "no"):
-            await message.reply_text("أرسل نعم أو لا.")
+
+        roulette_id = uuid.uuid4().hex[:12]
+
+        if data['main_channel_username']:
+            channel_display = f"<a href='https://t.me/{data['main_channel_username']}'>{data['main_channel_title']}</a>"
+        else:
+            channel_display = f"\"{data['main_channel_title']}\""
+        header_text = f"بدءَ روليت في قناة {channel_display} "
+        initial_text = f"{header_text}\n\n{data['roulette_text']}\n\nعدد المشاركين في الروليت : \"0\" \n\nحالة السحب : لم يبدأ بعد."
+
+        if data['draw_method'] == 'automatic':
+            draw_time_utc = datetime.fromtimestamp(data['draw_time_unix'], tz=pytz.utc)
+            draw_time_baghdad = draw_time_utc.astimezone(self.baghdad_tz)
+            initial_text += f"\nموعد السحب النهائي : {draw_time_baghdad.strftime('%Y-%m-%d %H:%M:%S')} "
+
+        try:
+            channel_message = self.bot.send_message(
+                chat_id=data['main_channel_id'],
+                text=initial_text,
+                parse_mode="HTML",
+                reply_markup=self.get_channel_roulette_markup(roulette_id, True, data['draw_method'] == 'manual')
+            )
+
+            self.active_roulettes[roulette_id] = {
+                'creator_id': user_id,
+                'main_channel_id': data['main_channel_id'],
+                'main_channel_username': data['main_channel_username'],
+                'main_channel_title': data['main_channel_title'],
+                'channel_message_id': channel_message.message_id,
+                'text': data['roulette_text'],
+                'conditional_channel_id': data.get('conditional_channel_id'),
+                'conditional_channel_username': data.get('conditional_channel_username'),
+                'winners_count': data['winners_count'],
+                'participants': set(),
+                'current_draw_pool': set(),
+                'active': True,
+                'draw_started_manually': False,
+                'winners': [],
+                'last_eliminated': None,
+                'final_winners_determined': False,
+                'reminders': set(),
+                'roulette_type': data['roulette_type'],
+                'draw_method': data['draw_method'],
+                'draw_time_unix': data.get('draw_time_unix'),
+                'auto_draw_timer': None
+            }
+
+            if data['draw_method'] == 'automatic':
+                delay = data['draw_time_unix'] - time.time()
+                if delay < 0:
+                    delay = 1
+                    self.bot.send_message(user_id, "موعد السحب التلقائي كان في الماضي، سيتم بدء السحب تلقائياً بعد لحظات. ")
+                timer = threading.Timer(delay, self._start_automatic_draw_process, args=[roulette_id])
+                timer.start()
+                self.active_roulettes[roulette_id]['auto_draw_timer'] = timer
+
+            self.bot.send_message(
+                user_id,
+                f"تم نشر الروليت في القناة: @{data['main_channel_username']} \n\nتحكم بالروليت الخاص بك من خلال رسالة السحب في القناة (ID: {roulette_id})."
+            )
+            self.bot.send_message(user_id, "تم إنشاء الروليت بنجاح ونشره! ")
+
+        except Exception as e:
+            self.bot.send_message(user_id, f"فشل في النشر داخل القناة. تأكد أن البوت مشرف ولديه صلاحية إرسال الرسائل. \nالخطأ: {e}")
+            self.active_roulettes.pop(roulette_id, None)
+
+    def _start_automatic_draw_process(self, roulette_id):
+        r = self.active_roulettes.get(roulette_id)
+        if not r:
             return
-        flow["exclude_previous"] = int(answer in ("نعم", "yes"))
-        flow["step"] = "destination"
-        await message.reply_text(
-            "📍 أرسل @اسم_القناة أو المعرّف الرقمي للقناة/المجموعة. "
-            "أضف البوت إلى الوجهة وامنحه صلاحية النشر."
+
+        if not r['participants']:
+            try:
+                self.bot.send_message(r['creator_id'], "السحب التلقائي لم يبدأ: لا يوجد مشاركون. 🚫")
+            except Exception:
+                pass
+            r['active'] = False
+            r['final_winners_determined'] = True
+            self._update_roulette_message(roulette_id)
+            return
+
+        r['draw_started_manually'] = True
+        r['active'] = False
+        r['current_draw_pool'] = set(r['participants'])
+        self._update_roulette_message(roulette_id)
+        try:
+            self.bot.send_message(r['creator_id'], "بدأ السحب التلقائي الآن! ")
+        except Exception:
+            pass
+        self._perform_draw(roulette_id)
+
+    def _check_bot_status(self, message):
+        if not self.bot_active and message.from_user.id != self.ADMIN_ID:
+            self.bot.send_message(message.chat.id, self.BOT_MAINTENANCE_MSG)
+            return False
+        return True
+
+    def _check_bot_status_callback(self, call):
+        if not self.bot_active and call.from_user.id != self.ADMIN_ID:
+            try:
+                self.bot.answer_callback_query(call.id, self.BOT_MAINTENANCE_MSG, show_alert=True)
+            except:
+                pass
+            return False
+        return True
+    
+    def _check_global_forced_subscription_message(self, message):
+        user_id = message.from_user.id
+        if not self.global_forced_channels:
+            return True
+
+        missing_channels_info = []
+        for cid, c_info in self.global_forced_channels.items():
+            if not self._is_channel_member(cid, user_id):
+                link_to_send = f"https://t.me/{c_info['username']}" if c_info['username'] else f"{c_info['title']}"
+                missing_channels_info.append(link_to_send)
+        
+        if missing_channels_info:
+            message_text = f"{self.FORCED_CHANNEL_PROMPT_MSG}\n" + "\n".join(missing_channels_info)
+            self.bot.send_message(user_id, message_text, parse_mode="HTML")
+            return False
+        return True
+
+    def _check_global_forced_subscription_callback(self, call):
+        user_id = call.from_user.id
+        if not self.global_forced_channels:
+            return True
+
+        missing_channels_info = []
+        for cid, c_info in self.global_forced_channels.items():
+            if not self._is_channel_member(cid, user_id):
+                link_to_send = f"https://t.me/{c_info['username']}" if c_info['username'] else f"{c_info['title']}"
+                missing_channels_info.append(link_to_send)
+        
+        if missing_channels_info:
+            message_text = f"{self.FORCED_CHANNEL_PROMPT_MSG}\n" + "\n".join(missing_channels_info)
+            try:
+                self.bot.answer_callback_query(call.id, "عليك الاشتراك في القنوات الإجبارية. ", show_alert=True)
+            except:
+                pass
+            self.bot.send_message(user_id, message_text, parse_mode="HTML")
+            return False
+        return True
+
+    def _publish_contest(self, user_id):
+        data = self.user_temp_data.get(user_id)
+        if not data or 'contest_text' not in data or 'contest_main_channel_id' not in data:
+            self.bot.send_message(user_id, "❌ حدث خطأ: بيانات المسابقة غير مكتملة.")
+            return
+
+        contest_id = uuid.uuid4().hex[:12]
+        
+        contest_text = f"🏆 **مسابقة تصويتات** 🏆\n\n{data['contest_text']}\n\n📊 عدد المشاركين: 0"
+        
+        try:
+            channel_message = self.bot.send_message(
+                chat_id=data['contest_main_channel_id'],
+                text=contest_text,
+                parse_mode="Markdown",
+                reply_markup=self.get_contest_markup(contest_id)
+            )
+
+            self.active_contests[contest_id] = {
+                'creator_id': user_id,
+                'main_channel_id': data['contest_main_channel_id'],
+                'main_channel_username': data['contest_main_channel_username'],
+                'main_channel_title': data['contest_main_channel_title'],
+                'channel_message_id': channel_message.message_id,
+                'text': data['contest_text'],
+                'participants': {},
+                'votes': {},
+                'active': True
+            }
+            
+            self.contest_participants[contest_id] = {}
+            self.contest_votes[contest_id] = {}
+            
+            self.bot.send_message(
+                user_id,
+                f"✅ تم نشر المسابقة في القناة: @{data['contest_main_channel_username']}\n\n📋 سيتمكن الأعضاء من المشاركة والتصويت الآن."
+            )
+
+        except Exception as e:
+            self.bot.send_message(user_id, f"❌ فشل في النشر: {e}")
+
+    def _publish_participant_message(self, contest_id, user_id, display_name):
+        contest = self.active_contests.get(contest_id)
+        if not contest:
+            return
+        
+        try:
+            user_info = self.bot.get_chat(user_id)
+            user_full_name = user_info.first_name if user_info.first_name else "مستخدم"
+            username = user_info.username
+            
+            if username:
+                display_link = f"<a href='https://t.me/{username}'>{user_full_name}</a>"
+            else:
+                display_link = f"<a href='tg://user?id={user_id}'>{user_full_name}</a>"
+            
+            participant_text = (
+                f"👤 **مشارك جديد**\n\n"
+                f"{display_link} انضم إلى المسابقة 🎉\n\n"
+                f"📊 عدد المشاركين: {len(contest['participants'])}"
+            )
+            
+            sent_message = self.bot.send_message(
+                chat_id=contest['main_channel_id'],
+                text=participant_text,
+                parse_mode="HTML",
+                reply_markup=self.get_participant_vote_markup(contest_id, user_id, user_full_name)
+            )
+            
+            if contest_id not in self.contest_participant_messages:
+                self.contest_participant_messages[contest_id] = {}
+            self.contest_participant_messages[contest_id][user_id] = sent_message.message_id
+            
+        except Exception as e:
+            print(f"خطأ في نشر رسالة المشارك: {e}")
+
+    def _update_participant_message(self, contest_id, user_id):
+        contest = self.active_contests.get(contest_id)
+        if not contest:
+            return
+        
+        try:
+            message_id = self.contest_participant_messages.get(contest_id, {}).get(user_id)
+            if not message_id:
+                return
+            
+            user_info = self.bot.get_chat(user_id)
+            user_full_name = user_info.first_name if user_info.first_name else "مستخدم"
+            username = user_info.username
+            
+            if username:
+                display_link = f"<a href='https://t.me/{username}'>{user_full_name}</a>"
+            else:
+                display_link = f"<a href='tg://user?id={user_id}'>{user_full_name}</a>"
+            
+            votes_count = len(self.contest_votes.get(contest_id, {}).get(user_id, set()))
+            
+            updated_text = (
+                f"👤 **مشارك**\n\n"
+                f"{display_link}\n\n"
+                f"🎯 عدد الأصوات: {votes_count}"
+            )
+            
+            self.bot.edit_message_text(
+                chat_id=contest['main_channel_id'],
+                message_id=message_id,
+                text=updated_text,
+                parse_mode="HTML",
+                reply_markup=self.get_participant_vote_markup(contest_id, user_id, user_full_name)
+            )
+            
+        except Exception as e:
+            print(f"خطأ في تحديث رسالة المشارك: {e}")
+
+    def _update_contest_message(self, contest_id):
+        contest = self.active_contests.get(contest_id)
+        if not contest:
+            return
+        
+        participants_count = len(contest['participants'])
+        
+        updated_text = (
+            f"🏆 **مسابقة تصويتات** 🏆\n\n"
+            f"{contest['text']}\n\n"
+            f"📊 عدد المشاركين: {participants_count}\n\n"
+            f"📌 اضغط على زر المشاركة للانضمام!"
         )
-        return
-    if step == "destination":
-        if text.startswith("@") and len(text) > 1:
-            target = text
+        
+        try:
+            self.bot.edit_message_text(
+                chat_id=contest['main_channel_id'],
+                message_id=contest['channel_message_id'],
+                text=updated_text,
+                parse_mode="Markdown",
+                reply_markup=self.get_contest_markup(contest_id)
+            )
+        except Exception:
+            pass
+
+    def register_handlers(self):
+        self.bot.message_handler(commands=['start'])(self.start_cmd)
+        
+        self.bot.callback_query_handler(func=lambda c: c.data == "back_to_main_menu")(self.handle_back_to_main_menu)
+        self.bot.callback_query_handler(func=lambda c: c.data == "my_channels_menu")(self.handle_my_channels_menu)
+        self.bot.callback_query_handler(func=lambda c: c.data == "add_channel_prompt")(self.handle_add_channel_prompt)
+        self.bot.callback_query_handler(func=lambda c: c.data == "view_my_channels")(self.handle_view_my_channels)
+        self.bot.callback_query_handler(func=lambda c: c.data == "delete_channel_prompt")(self.handle_delete_channel_prompt)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("delete_channel__"))(self.handle_delete_channel_selection)
+        
+        self.bot.callback_query_handler(func=lambda c: c.data == "start_roulette_select_channel_prompt")(self.handle_start_roulette_select_channel_prompt)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("select_roulette_channel__"))(self.handle_select_roulette_channel)
+        self.bot.callback_query_handler(func=lambda c: c.data == "select_roulette_type_prompt")(self.handle_select_roulette_type_prompt_back)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("select_roulette_type_"))(self.handle_select_roulette_type)
+        self.bot.callback_query_handler(func=lambda c: c.data == "select_draw_method_prompt")(self.handle_select_draw_method_prompt_back)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("select_draw_method_"))(self.handle_select_draw_method)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("auto_draw_unit_"))(self.handle_auto_draw_unit)
+        self.bot.callback_query_handler(func=lambda c: c.data == "choose_style_instructions")(self.handle_choose_style_instructions)
+        self.bot.callback_query_handler(func=lambda c: c.data == "prompt_conditional_channel")(self.handle_prompt_conditional_channel)
+        self.bot.callback_query_handler(func=lambda c: c.data == "back_to_roulette_creation_options")(self.handle_back_to_roulette_creation_options)
+        self.bot.callback_query_handler(func=lambda c: c.data == "send_conditional_channel_link_prompt")(self.handle_send_conditional_channel_link_prompt)
+        self.bot.callback_query_handler(func=lambda c: c.data == "skip_conditional_channel")(self.handle_skip_conditional_channel)
+        
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("join_roulette_"))(self.handle_join_roulette)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("toggle_participation_"))(self.handle_toggle_participation)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("start_draw_"))(self.handle_start_draw)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("exclude_participant_"))(self.handle_exclude_participant)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("remind_me_roulette_"))(self.handle_remind_me_roulette)
+        self.bot.callback_query_handler(func=lambda c: c.data == "remind_me_global_info")(self.handle_remind_me_global_info)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("view_participants_"))(self.handle_view_participants)
+        self.bot.callback_query_handler(func=lambda c: c.data == "show_help_info")(self.handle_show_help_info)
+
+        self.bot.callback_query_handler(func=lambda c: c.data == "admin_panel")(self.handle_admin_panel)
+        self.bot.callback_query_handler(func=lambda c: c.data == "show_bot_stats")(self.handle_show_bot_stats)
+        self.bot.callback_query_handler(func=lambda c: c.data == "add_global_forced_channel_prompt")(self.handle_add_global_forced_channel_prompt)
+        self.bot.callback_query_handler(func=lambda c: c.data == "remove_global_forced_channel_prompt")(self.handle_remove_global_forced_channel_prompt)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("remove_global_channel__"))(self.handle_remove_global_channel_selection)
+        self.bot.callback_query_handler(func=lambda c: c.data == "stop_bot_for_maintenance")(self.handle_stop_bot_for_maintenance)
+        self.bot.callback_query_handler(func=lambda c: c.data == "start_bot_from_maintenance")(self.handle_start_bot_from_maintenance)
+
+        self.bot.callback_query_handler(func=lambda c: c.data == "start_contest_select_channel")(self.handle_start_contest_select_channel)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("select_contest_channel__"))(self.handle_select_contest_channel)
+        self.bot.message_handler(func=lambda m: self.user_states.get(m.from_user.id) == 'awaiting_contest_text')(self.handle_contest_text)
+        self.bot.message_handler(func=lambda m: m.text and m.text.startswith('/start contest_'))(self.handle_contest_start_link)
+        self.bot.message_handler(func=lambda m: m.text and m.text.startswith('/start vote_'))(self.handle_vote_start_link)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("confirm_contest_"))(self.handle_confirm_contest)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("cancel_contest_"))(self.handle_cancel_contest)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("verify_"))(self.handle_verification)
+        self.bot.callback_query_handler(func=lambda c: c.data.startswith("contest_votes_"))(self.handle_contest_votes)
+
+        self.bot.message_handler(content_types=['text', 'audio', 'photo', 'video', 'document'], func=lambda message: True)(self.handle_messages_by_state)
+
+    def start_cmd(self, message):
+        user_id = message.from_user.id
+        
+        if message.text and message.text.startswith('/start contest_'):
+            self.handle_contest_start_link(message)
+            return
+        if message.text and message.text.startswith('/start vote_'):
+            self.handle_vote_start_link(message)
+            return
+            
+        if not self._check_bot_status(message):
+            return
+        
+        if not self._check_global_forced_subscription_message(message):
+            return
+
+        if user_id not in self.known_users:
+            self.known_users.add(user_id)
+            self.total_users_count += 1
+            user_full_name = message.from_user.full_name or message.from_user.first_name or "غير معروف"
+            user_username = message.from_user.username if message.from_user.username else "لا يوجد"
+            try:
+                self.bot.send_message(
+                    self.ADMIN_ID,
+                    f"دخول مستخدم جديد للبوت! \n"
+                    f"الاسم: {user_full_name}\n"
+                    f"المعرف: @{user_username}\n"
+                    f"الآيدي: `{user_id}`\n"
+                    f"العدد الكلي للمستخدمين: {self.total_users_count}",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+        self.user_states.pop(user_id, None)
+        self.user_temp_data.pop(user_id, None)
+
+        user_full_name_fallback = message.from_user.full_name or message.from_user.first_name or "صديقي"
+
+        welcome_message_parts = []
+        welcome_message_parts.append("اهلا بكم في روليت BEN \n\n")
+        welcome_part = f"أهلاً بك <a href='tg://user?id={user_id}'>{user_full_name_fallback}</a>"
+        welcome_message_parts.append(welcome_part)
+        welcome_message_parts.append("، يسرني وجودك هنا! \n\n")
+        welcome_message_parts.append("هذا البوت يتيح لك تنظيم سحوبات وروليتات بسهولة وفعالية في قنواتك، مع خيارات متعددة لتلبية احتياجاتك. ")
+        welcome_message_parts.append("سواء كنت ترغب في سحب يدوي أو تلقائي، أو حتى سحب محمي، كل ذلك متاح لك.\n\n")
+        welcome_message_parts.append("ابدأ الآن بتحديد القناة التي تود إجراء السحب فيها، أو قم بإدارة قنواتك المضافة. ")
+        welcome_message_text = "".join(welcome_message_parts)
+
+        self.bot.send_message(
+            message.chat.id,
+            welcome_message_text,
+            reply_markup=self.main_menu_kb(user_id),
+            parse_mode="HTML"
+        )
+
+    def handle_contest_start_link(self, message):
+        user_id = message.from_user.id
+        
+        if not self._check_bot_status(message):
+            return
+        if not self._check_global_forced_subscription_message(message):
+            return
+        
+        contest_id = message.text.replace('/start contest_', '').strip()
+        
+        contest = self.active_contests.get(contest_id)
+        if not contest:
+            self.bot.send_message(user_id, "❌ المسابقة غير موجودة أو انتهت.")
+            return
+        
+        if not contest['active']:
+            self.bot.send_message(user_id, "❌ المسابقة منتهية.")
+            return
+        
+        if user_id in contest['participants']:
+            self.bot.send_message(user_id, "⚠️ أنت مشترك بالفعل في هذه المسابقة!")
+            return
+        
+        user_full_name = message.from_user.full_name or message.from_user.first_name or "مستخدم"
+        username = message.from_user.username
+        display_name = f"@{username}" if username else f"{user_full_name}"
+        
+        confirm_kb = InlineKeyboardMarkup(row_width=2)
+        confirm_kb.add(
+            InlineKeyboardButton("✅ تأكيد", callback_data=f"confirm_contest_{contest_id}", style="primary"),
+            InlineKeyboardButton("❌ إلغاء", callback_data=f"cancel_contest_{contest_id}")
+        )
+        
+        self.bot.send_message(
+            user_id,
+            f"📝 هل تريد المشاركة بالاسم التالي؟\n\n"
+            f"👤 {display_name}\n"
+            f"🆔 {user_id}",
+            reply_markup=confirm_kb
+        )
+        
+        self.user_temp_data[user_id] = {
+            'temp_contest_id': contest_id,
+            'temp_display_name': display_name
+        }
+
+    def handle_vote_start_link(self, message):
+        user_id = message.from_user.id
+        
+        if not self._check_bot_status(message):
+            return
+        if not self._check_global_forced_subscription_message(message):
+            return
+        
+        parts = message.text.replace('/start vote_', '').strip().split('_')
+        if len(parts) != 2:
+            self.bot.send_message(user_id, "❌ رابط غير صالح.")
+            return
+        
+        contest_id = parts[0]
+        participant_id = int(parts[1])
+        
+        contest = self.active_contests.get(contest_id)
+        if not contest:
+            self.bot.send_message(user_id, "❌ المسابقة غير موجودة.")
+            return
+        
+        if not contest['active']:
+            self.bot.send_message(user_id, "❌ المسابقة منتهية.")
+            return
+        
+        if user_id == participant_id:
+            self.bot.send_message(user_id, "❌ لا يمكنك التصويت لنفسك!")
+            return
+        
+        if participant_id not in contest['participants']:
+            self.bot.send_message(user_id, "❌ هذا المشارك غير موجود.")
+            return
+        
+        if contest_id in self.user_votes and self.user_votes[contest_id] == user_id:
+            self.bot.send_message(user_id, "⚠️ لقد صوت مسبقاً!")
+            return
+        
+        kb, correct_emoji = self.get_verification_markup(contest_id, participant_id)
+        
+        self.contest_verification[contest_id] = {
+            'voter_id': user_id,
+            'participant_id': participant_id,
+            'correct_emoji': correct_emoji
+        }
+        
+        self.bot.send_message(
+            user_id,
+            f"🔐 لتسجيل تصويتك يرجى التحقق من أنك لست روبوت\nيرجى اختيار الإيموجي التالي من الأزرار أدناه:\n\n{correct_emoji}",
+            reply_markup=kb
+        )
+
+    def handle_back_to_main_menu(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+
+        user_id = call.from_user.id
+        self.user_states.pop(user_id, None)
+        self.user_temp_data.pop(user_id, None)
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+
+        user_full_name_fallback = call.from_user.full_name or call.from_user.first_name or "صديقي"
+        user_username = call.from_user.username
+
+        welcome_message_parts = []
+        welcome_message_parts.append("اهلا بكم في روليت BEN\n\n")
+        welcome_part = f"أهلاً بك <a href='tg://user?id={user_id}'>{user_full_name_fallback}</a>"
+        if user_username:
+            welcome_part += f" (@{user_username})"
+        welcome_message_parts.append(welcome_part)
+        welcome_message_parts.append("، يسرني وجودك هنا! \n\n")
+        welcome_message_parts.append("هذا البوت يتيح لك تنظيم سحوبات وروليتات بسهولة وفعالية في قنواتك، مع خيارات متعددة لتلبية احتياجاتك. ")
+        welcome_message_parts.append("سواء كنت ترغب في سحب يدوي أو تلقائي، أو حتى سحب محمي، كل ذلك متاح لك.\n\n")
+        welcome_message_parts.append("ابدأ الآن بتحديد القناة التي تود إجراء السحب فيها، أو قم بإدارة قنواتك المضافة. ")
+        welcome_message_text = "".join(welcome_message_parts)
+
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=welcome_message_text,
+                reply_markup=self.main_menu_kb(user_id),
+                parse_mode="HTML"
+            )
+        except:
+            pass
+
+    def handle_my_channels_menu(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        self.user_states[user_id] = 'my_channels_menu'
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text="إدارة قنواتك:",
+                reply_markup=self.my_channels_kb()
+            )
+        except:
+            pass
+
+    def handle_add_channel_prompt(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        self.bot.send_message(call.message.chat.id, self.CHANNEL_BINDING_INSTRUCTIONS)
+        self.user_states[user_id] = 'awaiting_channel_to_add_forward'
+
+    def handle_view_my_channels(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        channels = self.user_bound_channels.get(user_id)
+        if not channels:
+            self.bot.send_message(call.message.chat.id, "لم تقم بإضافة أي قنوات بعد. ")
+            return
+
+        channel_list_text = "قنواتك المضافة:\n"
+        for cid, c_info in channels.items():
+            channel_list_text += f"- {c_info.get('title', 'غير معروف')} (@{c_info.get('username', 'لا يوجد')})\n"
+        self.bot.send_message(call.message.chat.id, channel_list_text)
+
+    def handle_delete_channel_prompt(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        channels = self.user_bound_channels.get(user_id)
+        if not channels:
+            self.bot.send_message(call.message.chat.id, "لم تقم بإضافة أي قنوات لحذفها. ")
+            return
+
+        delete_kb = InlineKeyboardMarkup(row_width=1)
+        for cid, c_info in channels.items():
+            delete_kb.add(InlineKeyboardButton(f"{c_info.get('title', 'غير معروف')} ", callback_data=f"delete_channel__{cid}", style="primary"))
+        delete_kb.add(InlineKeyboardButton("🔙 رجوع", callback_data="my_channels_menu"))
+
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text="اختر القناة لحذفها:",
+                reply_markup=delete_kb
+            )
+        except:
+            pass
+        self.user_states[user_id] = 'awaiting_channel_to_delete_selection'
+
+    def handle_delete_channel_selection(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        channel_id_str = call.data.split("__")[1]
+        channel_id = int(channel_id_str)
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+
+        if user_id in self.user_bound_channels and channel_id in self.user_bound_channels[user_id]:
+            channel_info = self.user_bound_channels[user_id].pop(channel_id)
+            if not self.user_bound_channels[user_id]:
+                self.user_bound_channels.pop(user_id)
+            self.bot.send_message(call.message.chat.id, f"تم حذف القناة: {channel_info.get('title', 'غير معروف')}. ")
+        else:
+            self.bot.send_message(call.message.chat.id, "هذه القناة غير موجودة في قائمة قنواتك. ")
+
+        self.handle_my_channels_menu(call)
+
+    def handle_start_roulette_select_channel_prompt(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        channels = self.user_bound_channels.get(user_id)
+        if not channels:
+            self.bot.send_message(call.message.chat.id, "عليك إضافة قناة أولاً في قسم 'قنواتي' قبل إنشاء روليت. ")
+            return
+
+        select_channel_kb = InlineKeyboardMarkup(row_width=1)
+        for cid, c_info in channels.items():
+            select_channel_kb.add(InlineKeyboardButton(f"{c_info.get('title', 'غير معروف')} (@{c_info.get('username', 'لا يوجد')})", callback_data=f"select_roulette_channel__{cid}", style="primary"))
+        select_channel_kb.add(InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main_menu"))
+
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text="اختر القناة التي تريد نشر الروليت فيها:",
+                reply_markup=select_channel_kb
+            )
+        except:
+            pass
+        self.user_states[user_id] = 'awaiting_roulette_channel_selection'
+
+    def handle_select_roulette_channel(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        channel_id_str = call.data.split("__")[1]
+        channel_id = int(channel_id_str)
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+
+        if user_id not in self.user_bound_channels or channel_id not in self.user_bound_channels[user_id]:
+            self.bot.send_message(call.message.chat.id, "القناة غير صالحة أو لم تعد مربوطة بحسابك. ")
+            self.handle_start_roulette_select_channel_prompt(call)
+            return
+
+        selected_channel_info = self.user_bound_channels[user_id][channel_id]
+        self.user_temp_data[user_id] = {
+            'main_channel_id': channel_id,
+            'main_channel_username': selected_channel_info['username'],
+            'main_channel_title': selected_channel_info['title']
+        }
+
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=f"تم اختيار قناة: {selected_channel_info['title']}\n\nاختر نوع الروليت:\n{self.ROULETTE_TYPE_TEXT_NORMAL}\n{self.ROULETTE_TYPE_TEXT_PROTECTED}",
+                reply_markup=self.roulette_type_selection_kb()
+            )
+        except:
+            pass
+        self.user_states[user_id] = 'awaiting_roulette_type_selection'
+
+    def handle_select_roulette_type_prompt_back(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        if 'main_channel_id' not in self.user_temp_data.get(user_id, {}):
+            self.handle_start_roulette_select_channel_prompt(call)
+            return
+
+        selected_channel_info = self.user_bound_channels[user_id][self.user_temp_data[user_id]['main_channel_id']]
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=f"تم اختيار قناة: {selected_channel_info['title']}\n\nاختر نوع الروليت:\n{self.ROULETTE_TYPE_TEXT_NORMAL}\n{self.ROULETTE_TYPE_TEXT_PROTECTED}",
+                reply_markup=self.roulette_type_selection_kb()
+            )
+        except:
+            pass
+        self.user_states[user_id] = 'awaiting_roulette_type_selection'
+
+    def handle_select_roulette_type(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        roulette_type = call.data.split("_")[3]
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+
+        if 'main_channel_id' not in self.user_temp_data.get(user_id, {}):
+            self.bot.send_message(call.message.chat.id, "حدث خطأ، يرجى البدء من جديد. ")
+            self.start_cmd(call.message)
+            return
+
+        self.user_temp_data[user_id]['roulette_type'] = roulette_type
+
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=f"الخطوة التالية: نوع السحب\n\nاختر طريقة عمل السحب:\n{self.DRAW_METHOD_TEXT_MANUAL}\n{self.DRAW_METHOD_TEXT_AUTOMATIC}\n\nاختر الطريقة المناسبة لك",
+                reply_markup=self.draw_method_selection_kb()
+            )
+        except:
+            pass
+        self.user_states[user_id] = 'awaiting_draw_method_selection'
+
+    def handle_select_draw_method_prompt_back(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        if 'main_channel_id' not in self.user_temp_data.get(user_id, {}):
+            self.handle_start_roulette_select_channel_prompt(call)
+            return
+
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=f"الخطوة التالية: نوع السحب\n\nاختر طريقة عمل السحب:\n{self.DRAW_METHOD_TEXT_MANUAL}\n{self.DRAW_METHOD_TEXT_AUTOMATIC}\n\nاختر الطريقة المناسبة لك",
+                reply_markup=self.draw_method_selection_kb()
+            )
+        except:
+            pass
+        self.user_states[user_id] = 'awaiting_draw_method_selection'
+
+    def handle_select_draw_method(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        draw_method = call.data.split("_")[3]
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+
+        if 'main_channel_id' not in self.user_temp_data.get(user_id, {}):
+            self.bot.send_message(call.message.chat.id, "حدث خطأ، يرجى البدء من جديد. ")
+            self.start_cmd(call.message)
+            return
+
+        self.user_temp_data[user_id]['draw_method'] = draw_method
+
+        if draw_method == 'manual':
+            try:
+                self.bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text=self.ROULETTE_TEXT_PROMPT,
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+            self.user_states[user_id] = 'awaiting_roulette_text'
         else:
             try:
-                target = int(text)
-            except ValueError:
-                await message.reply_text("أرسل @username أو معرّفاً رقمياً صالحاً.")
-                return
-        flow["target"] = target
-        flow["step"] = "confirm"
-        await message.reply_text(
-            "📋 <b>تأكيد السحب</b>\n\n"
-            f"🎁 {html.escape(flow['title'])}\n"
-            f"🏆 عدد الفائزين: {flow['winner_count']}\n"
-            f"⏳ المدة: {flow['duration'] // 60} دقيقة\n"
-            f"📍 الوجهة: <code>{html.escape(str(target))}</code>\n\n"
-            "أرسل نعم للنشر أو لا للإلغاء.",
-            parse_mode="HTML",
-        )
-        return
-    if step == "confirm":
-        if text.casefold() not in ("نعم", "yes"):
-            context.user_data.pop("flow", None)
-            await message.reply_text("تم إلغاء إنشاء السحب.", reply_markup=main_keyboard(uid))
+                self.bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text="اختر وحدة المدة الزمنية للسحب التلقائي:",
+                    reply_markup=self.auto_draw_duration_unit_kb()
+                )
+            except:
+                pass
+            self.user_states[user_id] = 'awaiting_auto_draw_unit_selection'
+
+    def handle_auto_draw_unit(self, call):
+        if not self._check_bot_status_callback(call):
             return
-        target = flow["target"]
-        duration = flow["duration"]
-        ends_at = now() + duration if duration else None
-        with database() as con:
-            cur = con.execute(
-                """INSERT INTO giveaways
-                   (creator_id,title,winner_count,duration_seconds,exclude_previous,status,created_at,ends_at)
-                   VALUES(?,?,?,?,?,'draft',?,?)""",
-                (uid, flow["title"], flow["winner_count"], duration, flow["exclude_previous"], now(), ends_at),
-            )
-            gid = cur.lastrowid
-            audit(con, uid, "create", gid, str(target))
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        unit = call.data.split("_")[3]
         try:
-            sent = await context.bot.send_message(
-                chat_id=target,
-                text=post_text(gid),
-                parse_mode="HTML",
-                reply_markup=post_keyboard(gid, "open", manager=True),
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+
+        self.user_temp_data[user_id]['auto_draw_unit'] = unit
+        self.bot.send_message(call.message.chat.id, f"أرسل المدة الزمنية بالعدد الذي اخترته ({unit}):")
+        self.user_states[user_id] = 'awaiting_auto_draw_value'
+
+    def handle_choose_style_instructions(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        if self.user_states.get(user_id) not in ['awaiting_roulette_options_choice', 'awaiting_roulette_text_edit_final']:
+            try:
+                self.bot.answer_callback_query(call.id, "لا يوجد كليشة سحب حالية لتعديلها. ", show_alert=True)
+            except:
+                pass
+            return
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        self.bot.send_message(call.message.chat.id, self.ROULETTE_TEXT_PROMPT, parse_mode="HTML")
+        self.user_states[user_id] = 'awaiting_roulette_text_edit'
+
+    def handle_prompt_conditional_channel(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        if 'roulette_text' not in self.user_temp_data.get(user_id, {}):
+            try:
+                self.bot.answer_callback_query(call.id, "الرجاء إدخال كليشة السحب أولاً. ", show_alert=True)
+            except:
+                pass
+            return
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        self.bot.send_message(call.message.chat.id, self.CONDITIONAL_CHANNEL_QUESTION, reply_markup=self.conditional_channel_choice_kb())
+        self.user_states[user_id] = 'awaiting_conditional_channel_choice'
+
+    def handle_back_to_roulette_creation_options(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        if 'roulette_text' not in self.user_temp_data.get(user_id, {}):
+            self.bot.send_message(call.message.chat.id, "حدث خطأ، يرجى البدء من جديد. ")
+            self.start_cmd(call.message)
+            return
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text="اختر أحد الخيارات:",
+                reply_markup=self.roulette_creation_options_kb()
             )
-            with database() as con:
-                con.execute(
-                    """UPDATE giveaways SET chat_id=?,chat_title=?,message_id=?,status='open'
-                       WHERE id=? AND status='draft'""",
-                    (
-                        sent.chat_id,
-                        sent.chat.title or sent.chat.username or str(sent.chat_id),
-                        sent.message_id,
-                        gid,
-                    ),
+        except:
+            pass
+        self.user_states[user_id] = 'awaiting_roulette_options_choice'
+
+    def handle_send_conditional_channel_link_prompt(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        self.bot.send_message(call.message.chat.id, self.SEND_CONDITIONAL_CHANNEL_LINK)
+        self.user_states[user_id] = 'awaiting_conditional_channel_link'
+
+    def handle_skip_conditional_channel(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        user_id = call.from_user.id
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        self.user_temp_data[user_id]['conditional_channel_id'] = None
+        self.user_temp_data[user_id]['conditional_channel_username'] = None
+        self.bot.send_message(call.message.chat.id, "كم عدد الفائزين الذين تريد اختيارهم؟ \n(سيتوقف السحب حين يصل عدد المشاركين المتبقين لهذا العدد).")
+        self.user_states[user_id] = 'awaiting_winner_count'
+
+    def handle_join_roulette(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        
+        roulette_id = call.data.split("_")[2]
+        user_id = call.from_user.id
+        username = call.from_user.username
+        first_name = call.from_user.first_name
+
+        r = self.active_roulettes.get(roulette_id)
+        if not r:
+            try:
+                self.bot.answer_callback_query(call.id, "السحب غير موجود. ❗❌", show_alert=True)
+            except:
+                pass
+            return
+
+        if user_id == r['creator_id']:
+            if r.get('draw_started_manually', False):
+                try:
+                    self.bot.answer_callback_query(call.id, "لا يمكنك المشاركة في سحبك الخاص بعد بدء السحب. ", show_alert=True)
+                except:
+                    pass
+                return
+            if r['draw_method'] == 'automatic' and r.get('draw_time_unix') and time.time() >= r['draw_time_unix']:
+                try:
+                    self.bot.answer_callback_query(call.id, "لا يمكنك المشاركة في سحبك الخاص بعد بدء السحب. ", show_alert=True)
+                except:
+                    pass
+                return
+
+        if r.get('final_winners_determined', False):
+            try:
+                self.bot.answer_callback_query(call.id, "هذا السحب قد انتهى بالفعل وتم تحديد الفائزين. ", show_alert=True)
+            except:
+                pass
+            return
+
+        if not r['active']:
+            try:
+                self.bot.answer_callback_query(call.id, "المشاركة في هذا السحب متوقفة حالياً. ", show_alert=True)
+            except:
+                pass
+            return
+
+        if user_id in r['participants']:
+            try:
+                self.bot.answer_callback_query(call.id, "أنت مشارك بالفعل. ✅✔️", show_alert=True)
+            except:
+                pass
+            return
+
+        if r['roulette_type'] == 'protected' and user_id in self.banned_from_creator_roulettes.get(r['creator_id'], set()):
+            try:
+                self.bot.answer_callback_query(call.id, "تم استبعادك من سحوبات هذا المنشئ. ", show_alert=True)
+            except:
+                pass
+            return
+
+        if r['conditional_channel_id']:
+            try:
+                if not self._is_channel_member(r['conditional_channel_id'], user_id):
+                    try:
+                        self.bot.answer_callback_query(call.id, "عليك الاشتراك بالقناة. ", show_alert=True)
+                    except:
+                        pass
+                    conditional_channel_username = r.get('conditional_channel_username')
+                    if conditional_channel_username:
+                        link_to_send = f"https://t.me/{conditional_channel_username}"
+                        self.bot.send_message(user_id, f"الرجاء الانضمام إلى القناة الشرطية للمشاركة في السحب:\n{link_to_send}")
+                    return
+            except Exception:
+                try:
+                    self.bot.answer_callback_query(call.id, "خطأ في التحقق من الاشتراك في القناة الشرطية. ", show_alert=True)
+                except:
+                    pass
+                return
+
+        r['participants'].add(user_id)
+        if not r.get('draw_started_manually', False) and r['draw_method'] == 'manual':
+            r['current_draw_pool'].add(user_id)
+
+        try:
+            self.bot.answer_callback_query(call.id, "تم تسجيل مشاركتك! ")
+        except:
+            pass
+        self._update_roulette_message(roulette_id)
+
+        if r['roulette_type'] == 'protected':
+            try:
+                participant_name = first_name if first_name else "مجهول"
+                participant_info_for_creator = f"👤 {participant_name}"
+                if username:
+                    participant_info_for_creator += f" (@{username})"
+                participant_info_for_creator += f"\n🆔 {user_id}"
+
+                self.bot.send_message(
+                    r['creator_id'],
+                    f"مشاركة جديدة في سحبك: \n\nلقد شارك {participant_info_for_creator}\nعدد المشاركين الكلي: {len(r['participants'])} ",
+                    reply_markup=self.creator_exclude_kb(roulette_id, user_id)
                 )
-                audit(con, uid, "publish", gid)
-            await refresh_post(context, gid)
-            if duration:
-                if context.job_queue is None:
-                    log.error("JobQueue غير متاحة؛ لم يتم جدولة إغلاق السحب.")
-                    await message.reply_text(
-                        "تم نشر السحب، لكن المؤقت غير متاح. ثبّت python-telegram-bot[job-queue].",
-                        reply_markup=main_keyboard(uid),
-                    )
-                else:
-                    context.job_queue.run_once(
-                        timer_close,
-                        when=duration,
-                        data={"gid": gid},
-                        name=f"giveaway-{gid}",
-                    )
-                    await message.reply_text(
-                        f"✅ تم نشر السحب #{gid} بنجاح.\nإغلاق التسجيل: /close {gid}\nسحب الفائزين: /draw {gid}",
-                        reply_markup=main_keyboard(uid),
-                    )
+            except Exception:
+                pass
+
+    def handle_toggle_participation(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        roulette_id = call.data.split("_")[2]
+        user_id = call.from_user.id
+        r = self.active_roulettes.get(roulette_id)
+
+        if not r or user_id != r['creator_id']:
+            try:
+                self.bot.answer_callback_query(call.id, self.NOT_YOUR_COMMAND_MSG, show_alert=True)
+            except:
+                pass
+            return
+
+        if r['draw_method'] == 'automatic':
+            try:
+                self.bot.answer_callback_query(call.id, "لا يمكن التحكم بالمشاركة في السحب التلقائي يدوياً. ", show_alert=True)
+            except:
+                pass
+            return
+
+        if r.get('final_winners_determined', False):
+            try:
+                self.bot.answer_callback_query(call.id, "السحب قد انتهى ولا يمكن تغيير حالة المشاركة. ", show_alert=True)
+            except:
+                pass
+            return
+
+        if r.get('draw_started_manually', False):
+            try:
+                self.bot.answer_callback_query(call.id, "لا يمكن إيقاف المشاركة بعد بدء السحب اليدوي. ❗🚫", show_alert=True)
+            except:
+                pass
+            return
+
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        r['active'] = not r['active']
+        status_text = "تم تشغيل المشاركة. " if r['active'] else "تم إيقاف المشاركة. "
+        self._update_roulette_message(roulette_id)
+        self.bot.send_message(user_id, status_text)
+
+    def handle_start_draw(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        roulette_id = call.data.split("_")[2]
+        user_id = call.from_user.id
+        r = self.active_roulettes.get(roulette_id)
+
+        if not r or user_id != r['creator_id']:
+            try:
+                self.bot.answer_callback_query(call.id, self.NOT_YOUR_COMMAND_MSG, show_alert=True)
+            except:
+                pass
+            return
+
+        if r['draw_method'] == 'automatic':
+            try:
+                self.bot.answer_callback_query(call.id, "هذا السحب تلقائي وسيتم سحبه في الوقت المحدد. ", show_alert=True)
+            except:
+                pass
+            return
+
+        if r.get('final_winners_determined', False):
+            try:
+                self.bot.answer_callback_query(call.id, "تم الانتهاء من هذا السحب مسبقاً. ", show_alert=True)
+            except:
+                pass
+            return
+
+        if not r['participants'] and not r.get('draw_started_manually', False):
+            try:
+                self.bot.answer_callback_query(call.id, "لا يوجد مشاركون في السحب لبدء الاستبعاد.", show_alert=True)
+            except:
+                pass
+            return
+        
+        if r.get('draw_started_manually', False) and len(r.get('current_draw_pool', [])) <= r['winners_count']:
+            try:
+                self.bot.answer_callback_query(call.id, "لقد وصلت إلى عدد الفائزين المطلوب بالفعل.", show_alert=True)
+            except:
+                pass
+            return
+
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+
+        if not r.get('draw_started_manually', False):
+            r['draw_started_manually'] = True
+            r['active'] = False
+            r['current_draw_pool'] = set(r['participants'])
+            self.bot.send_message(user_id, "بدأ السحب اليدوي!  اضغط 'استبعاد مشارك آخر' للمتابعة.")
+
+        self._perform_draw(roulette_id)
+
+    def handle_exclude_participant(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        parts = call.data.split("_")
+        roulette_id = parts[2]
+        participant_id = int(parts[3])
+        user_id = call.from_user.id
+        r = self.active_roulettes.get(roulette_id)
+
+        if not r or user_id != r['creator_id']:
+            try:
+                self.bot.answer_callback_query(call.id, self.NOT_YOUR_COMMAND_MSG, show_alert=True)
+            except:
+                pass
+            return
+
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        if participant_id in r['participants']:
+            r['participants'].discard(participant_id)
+            if r.get('draw_started_manually', False) or r['draw_method'] == 'automatic':
+                r['current_draw_pool'].discard(participant_id)
+            
+            self.banned_from_creator_roulettes.setdefault(r['creator_id'], set()).add(participant_id)
+            self._update_roulette_message(roulette_id)
+            try:
+                self.bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text=f"تم استبعاد المستخدم {participant_id} من هذا السحب وسحوباتك المستقبلية. "
+                )
+            except:
+                pass
+        else:
+            self.bot.send_message(user_id, "هذا المشارك ليس في السحب أو تم استبعاده مسبقاً. ")
+
+    def handle_remind_me_roulette(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        roulette_id = call.data.split("_")[3]
+        user_id = call.from_user.id
+        r = self.active_roulettes.get(roulette_id)
+
+        if not r:
+            try:
+                self.bot.answer_callback_query(call.id, "السحب غير موجود. ❗❌", show_alert=True)
+            except:
+                pass
+            return
+
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        r['reminders'].add(user_id)
+        self.bot.send_message(user_id, "سيتم إشعارك إذا فزت في هذا السحب! ")
+
+    def handle_remind_me_global_info(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        try:
+            self.bot.answer_callback_query(call.id, "للتذكير، يجب عليك تفعيل زر التذكير لكل سحب على حدة في رسالة السحب. هذا الزر يعرض معلومات فقط. ", show_alert=True)
+        except:
+            pass
+
+    def handle_view_participants(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        roulette_id = call.data.split("_")[2]
+        user_id = call.from_user.id
+        r = self.active_roulettes.get(roulette_id)
+
+        if not r or user_id != r['creator_id']:
+            try:
+                self.bot.answer_callback_query(call.id, self.NOT_YOUR_COMMAND_MSG, show_alert=True)
+            except:
+                pass
+            return
+
+        participants_to_show = r['current_draw_pool'] if r.get('draw_started_manually', False) or r['draw_method'] == 'automatic' else r['participants']
+        participants_count = len(participants_to_show)
+        try:
+            self.bot.answer_callback_query(call.id, f"عدد المشاركين الحاليين: {participants_count} ", show_alert=True)
+        except:
+            pass
+
+        if not participants_to_show:
+            self.bot.send_message(user_id, "لا يوجد مشاركون حالياً في هذا السحب.")
+            return
+
+        participants_list = []
+        for p_id in participants_to_show:
+            try:
+                p_info = self.bot.get_chat(p_id)
+                p_name = p_info.first_name if p_info.first_name else "مجهول"
+                p_username = f" (@{p_info.username})" if p_info.username else ""
+                participants_list.append(f" {p_name}{p_username} (ID: {p_id})")
+            except Exception:
+                participants_list.append(f"المستخدم (ID: {p_id})")
+
+        message_text = "قائمة المشاركين الحاليين:\n" + "\n".join(participants_list)
+        self.bot.send_message(user_id, message_text)
+
+    def handle_show_help_info(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        help_text = (
+            "دليل استخدام بوت الروليت:\n\n"
+            "1. **إضافة قناة (قنواتي):**\n"
+            "   - اضغط على 'إضافة قناة ➕'.\n"
+            "   - أضف البوت كمشرف في قناتك وأعطه الصلاحيات اللازمة (خاصة إرسال الرسائل).\n"
+            "   - قم بإعادة توجيه أي رسالة من قناتك إلى البوت.\n"
+            "   - سيتم ربط القناة بنجاح ويمكنك استخدامها لإنشاء السحوبات.  \n\n"
+            "2. **بدء روليت:**\n"
+            "   - اضغط على 'بدء روليت ' واختر القناة التي أضفتها مسبقاً.\n"
+            "   - **اختر نوع الروليت:**\n"
+            "     - **الروليت العادي:** سحب بسيط بدون شروط إضافية.\n"
+            "     - **الروليت المحمي:** يمنع المشاركين الذين قمت باستبعادهم مسبقاً من الانضمام مجدداً إلى سحوباتك.\n"
+            "   - **اختر طريقة السحب:**\n"
+            "     - **سحب يدوي:** أنت تتحكم بتوقيت كل استبعاد حتى الوصول لعدد الفائزين المطلوب.\n"
+            "     - **سحب تلقائي:** يتم تحديد موعد نهائي، وعندها سيبدأ البوت تلقائياً باستبعاد المشاركين بشكل متتابع حتى الوصول لعدد الفائزين.\n"
+            "   - **إرسال كليشة السحب :** هذه هي الرسالة التي ستظهر في القناة، يمكنك استخدام تنسيقات HTML (مثل التشويش `<code>&lt;tg-spoiler&gt;&lt;/tg-spoiler&gt;</code>`، التعريض `<code>&lt;b&gt;&lt;/b&gt;</code>`، أو المائل `<code>&lt;i&gt;&lt;/i&gt;</code>`).\n"
+            "   - **إضافة قناة شرط (اختياري) :** يمكنك إضافة قناة إجبارية للانضمام لكي يتمكن المستخدم من المشاركة في السحب.\n"
+            "   - **تحديد عدد الفائزين :** أدخل العدد النهائي للمشاركين الذين تريدهم أن يفوزوا. سيستمر السحب (يدوياً أو تلقائياً) باستبعاد المشاركين حتى يبقى هذا العدد.\n\n"
+            "3. **إدارة الروليت بعد النشر:**\n"
+            "   - ستظهر رسالة السحب في قناتك.\n"
+            "   - **المشاركة في السحب :** للمستخدمين للانضمام.\n"
+            "   - **ذكرني إذا فزت :** لتلقي إشعار خاص إذا فاز المستخدم.\n"
+            "   - **التحكم بالاستبعاد (للمنشئ):**\n"
+            "     - في السحب اليدوي، اضغط على 'ابدأ السحب ' لبدء عملية الاستبعاد، ثم 'استبعاد مشارك آخر' للمتابعة.\n"
+            "     - يمكنك تشغيل/إيقاف المشاركة قبل بدء السحب اليدوي.\n"
+            "   - **عرض المشاركين :** يعرض لك قائمة بالمشاركين الحاليين في السحب. \n\n"
+            "4. **استبعاد المشاركين (للمنشئ) :**\n"
+            "   - عندما يشارك أحدهم في سحبك، ستتلقى رسالة خاصة في الدردشة مع البوت تتضمن زر 'استبعاد هذا المشارك '. عند الضغط عليه، سيتم إزالة المستخدم من سحوباتك الحالية والمستقبلية إذا كان نوع الروليت 'محمي'."
+        )
+        self.bot.send_message(call.message.chat.id, help_text, parse_mode="HTML")
+
+    def handle_admin_panel(self, call):
+        user_id = call.from_user.id
+        if user_id != self.ADMIN_ID:
+            try:
+                self.bot.answer_callback_query(call.id, self.NOT_YOUR_COMMAND_MSG, show_alert=True)
+            except:
+                pass
+            return
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text="لوحة الأدمن :",
+                reply_markup=self.admin_panel_kb()
+            )
+        except:
+            pass
+
+    def handle_show_bot_stats(self, call):
+        user_id = call.from_user.id
+        if user_id != self.ADMIN_ID:
+            try:
+                self.bot.answer_callback_query(call.id, self.NOT_YOUR_COMMAND_MSG, show_alert=True)
+            except:
+                pass
+            return
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+
+        total_bound_channels = sum(len(channels) for channels in self.user_bound_channels.values())
+        total_active_roulettes = len(self.active_roulettes)
+        total_global_forced_channels = len(self.global_forced_channels)
+
+        stats_text = (
+            f"إحصائيات البوت: \n"
+            f"عدد المستخدمين الكلي: {self.total_users_count}\n"
+            f"عدد القنوات المربوطة من المستخدمين: {total_bound_channels}\n"
+            f"عدد الروليتات النشطة حالياً: {total_active_roulettes}\n"
+            f"عدد قنوات الاشتراك الإجباري العالمية: {total_global_forced_channels}\n"
+            f"حالة البوت: {'نشط' if self.bot_active else 'متوقف للصيانة'}"
+        )
+        self.bot.send_message(call.message.chat.id, stats_text)
+
+    def handle_add_global_forced_channel_prompt(self, call):
+        user_id = call.from_user.id
+        if user_id != self.ADMIN_ID:
+            try:
+                self.bot.answer_callback_query(call.id, self.NOT_YOUR_COMMAND_MSG, show_alert=True)
+            except:
+                pass
+            return
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        self.bot.send_message(call.message.chat.id, "أضف البوت كمشرف في القناة الإجبارية ثم أعد توجيه أي رسالة من القناة إلى هنا لإضافتها.")
+        self.user_states[user_id] = 'awaiting_global_forced_channel_forward'
+
+    def handle_remove_global_forced_channel_prompt(self, call):
+        user_id = call.from_user.id
+        if user_id != self.ADMIN_ID:
+            try:
+                self.bot.answer_callback_query(call.id, self.NOT_YOUR_COMMAND_MSG, show_alert=True)
+            except:
+                pass
+            return
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+
+        if not self.global_forced_channels:
+            self.bot.send_message(call.message.chat.id, "لا توجد قنوات اشتراك إجباري لإزالتها. ")
+            return
+
+        remove_kb = InlineKeyboardMarkup(row_width=1)
+        for cid, c_info in self.global_forced_channels.items():
+            remove_kb.add(InlineKeyboardButton(f"{c_info.get('title', 'غير معروف')} ", callback_data=f"remove_global_channel__{cid}", style="primary"))
+        remove_kb.add(InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
+        
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text="اختر قناة الاشتراك الإجباري لإزالتها:",
+                reply_markup=remove_kb
+            )
+        except:
+            pass
+        self.user_states[user_id] = 'awaiting_global_forced_channel_removal_selection'
+
+    def handle_remove_global_channel_selection(self, call):
+        user_id = call.from_user.id
+        if user_id != self.ADMIN_ID:
+            try:
+                self.bot.answer_callback_query(call.id, self.NOT_YOUR_COMMAND_MSG, show_alert=True)
+            except:
+                pass
+            return
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        channel_id_str = call.data.split("__")[1]
+        channel_id = int(channel_id_str)
+
+        if channel_id in self.global_forced_channels:
+            channel_info = self.global_forced_channels.pop(channel_id)
+            self.bot.send_message(call.message.chat.id, f"تم إزالة قناة الاشتراك الإجباري: {channel_info.get('title', 'غير معروف')}. ")
+        else:
+            self.bot.send_message(call.message.chat.id, "هذه القناة ليست من قنوات الاشتراك الإجباري. ")
+        self.handle_admin_panel(call)
+
+    def handle_stop_bot_for_maintenance(self, call):
+        user_id = call.from_user.id
+        if user_id != self.ADMIN_ID:
+            try:
+                self.bot.answer_callback_query(call.id, self.NOT_YOUR_COMMAND_MSG, show_alert=True)
+            except:
+                pass
+            return
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        self.bot_active = False
+        self.bot.send_message(call.message.chat.id, "تم إيقاف البوت للصيانة. لن يتمكن المستخدمون العاديون من التفاعل معه الآن. ")
+        self.handle_admin_panel(call)
+
+    def handle_start_bot_from_maintenance(self, call):
+        user_id = call.from_user.id
+        if user_id != self.ADMIN_ID:
+            try:
+                self.bot.answer_callback_query(call.id, self.NOT_YOUR_COMMAND_MSG, show_alert=True)
+            except:
+                pass
+            return
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        self.bot_active = True
+        self.bot.send_message(call.message.chat.id, "تم تشغيل البوت. يمكن للمستخدمين التفاعل معه الآن. ")
+        self.handle_admin_panel(call)
+
+    def handle_start_contest_select_channel(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        
+        user_id = call.from_user.id
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+        
+        channels = self.user_bound_channels.get(user_id)
+        if not channels:
+            self.bot.send_message(call.message.chat.id, "⚠️ عليك إضافة قناة أولاً في قسم 'قنواتي' قبل إنشاء مسابقة.")
+            return
+
+        select_channel_kb = InlineKeyboardMarkup(row_width=1)
+        for cid, c_info in channels.items():
+            select_channel_kb.add(InlineKeyboardButton(
+                f"{c_info.get('title', 'غير معروف')} (@{c_info.get('username', 'لا يوجد')})", 
+                callback_data=f"select_contest_channel__{cid}", style="primary"))
+        select_channel_kb.add(InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main_menu"))
+
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text="📢 اختر القناة التي تريد نشر المسابقة فيها:",
+                reply_markup=select_channel_kb
+            )
+        except:
+            pass
+        self.user_states[user_id] = 'awaiting_contest_channel_selection'
+
+    def handle_select_contest_channel(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        if not self._check_global_forced_subscription_callback(call):
+            return
+        
+        user_id = call.from_user.id
+        channel_id_str = call.data.split("__")[1]
+        channel_id = int(channel_id_str)
+        try:
+            self.bot.answer_callback_query(call.id)
+        except:
+            pass
+
+        if user_id not in self.user_bound_channels or channel_id not in self.user_bound_channels[user_id]:
+            self.bot.send_message(call.message.chat.id, "❌ القناة غير صالحة.")
+            return
+
+        selected_channel_info = self.user_bound_channels[user_id][channel_id]
+        self.user_temp_data[user_id] = {
+            'contest_main_channel_id': channel_id,
+            'contest_main_channel_username': selected_channel_info['username'],
+            'contest_main_channel_title': selected_channel_info['title']
+        }
+
+        try:
+            self.bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=f"✅ تم اختيار قناة: {selected_channel_info['title']}\n\n📝 الآن أرسل كليشة المسابقة (النص الذي سيظهر في القناة):",
+            )
+        except:
+            pass
+        self.user_states[user_id] = 'awaiting_contest_text'
+
+    def handle_contest_text(self, message):
+        user_id = message.from_user.id
+        if self.user_states.get(user_id) != 'awaiting_contest_text':
+            return
+        
+        self.user_temp_data[user_id]['contest_text'] = message.text
+        self.user_states.pop(user_id, None)
+        self._publish_contest(user_id)
+        self.bot.send_message(message.chat.id, "✅ تم نشر المسابقة بنجاح في القناة!")
+
+    def handle_confirm_contest(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        
+        user_id = call.from_user.id
+        temp = self.user_temp_data.get(user_id)
+        if not temp:
+            try:
+                self.bot.answer_callback_query(call.id, "❌ حدث خطأ.", show_alert=True)
+            except:
+                pass
+            return
+        
+        contest_id = temp['temp_contest_id']
+        display_name = temp['temp_display_name']
+        
+        contest = self.active_contests.get(contest_id)
+        if not contest:
+            try:
+                self.bot.answer_callback_query(call.id, "❌ المسابقة غير موجودة.", show_alert=True)
+            except:
+                pass
+            return
+        
+        contest['participants'][user_id] = display_name
+        self.contest_votes[contest_id][user_id] = set()
+        
+        try:
+            self.bot.answer_callback_query(call.id, "✅ تم تسجيل مشاركتك!")
+        except:
+            pass
+        try:
+            self.bot.delete_message(call.message.chat.id, call.message.message_id)
+        except:
+            pass
+        
+        self._publish_participant_message(contest_id, user_id, display_name)
+        self._update_contest_message(contest_id)
+        
+        self.user_temp_data.pop(user_id, None)
+
+    def handle_cancel_contest(self, call):
+        user_id = call.from_user.id
+        try:
+            self.bot.answer_callback_query(call.id, "❌ تم الإلغاء.")
+        except:
+            pass
+        try:
+            self.bot.delete_message(call.message.chat.id, call.message.message_id)
+        except:
+            pass
+        self.user_temp_data.pop(user_id, None)
+
+    def handle_verification(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        
+        parts = call.data.split("_")
+        contest_id = parts[1]
+        participant_id = int(parts[2])
+        selected_emoji = parts[3]
+        voter_id = call.from_user.id
+        
+        verification = self.contest_verification.get(contest_id)
+        if not verification:
+            try:
+                self.bot.answer_callback_query(call.id, "❌ انتهت صلاحية التحقق.", show_alert=True)
+            except:
+                pass
+            return
+        
+        if verification['voter_id'] != voter_id:
+            try:
+                self.bot.answer_callback_query(call.id, "❌ هذا ليس حسابك.", show_alert=True)
+            except:
+                pass
+            return
+        
+        if verification['participant_id'] != participant_id:
+            try:
+                self.bot.answer_callback_query(call.id, "❌ خطأ في التحقق.", show_alert=True)
+            except:
+                pass
+            return
+        
+        if selected_emoji == verification['correct_emoji']:
+            self.contest_votes[contest_id][participant_id].add(voter_id)
+            self.user_votes[contest_id] = voter_id
+            
+            try:
+                self.bot.answer_callback_query(call.id, "✅ تم تسجيل تصويتك بنجاح!")
+            except:
+                pass
+            try:
+                self.bot.delete_message(call.message.chat.id, call.message.message_id)
+            except:
+                pass
+            self.bot.send_message(voter_id, "🎉 شكراً لك! تم تسجيل تصويتك بنجاح.")
+            
+            self._update_participant_message(contest_id, participant_id)
+            
+            self.contest_verification.pop(contest_id, None)
+        else:
+            try:
+                self.bot.answer_callback_query(call.id, "❌ إيموجي خاطئ! حاول مرة أخرى.", show_alert=True)
+            except:
+                pass
+
+    def handle_contest_votes(self, call):
+        if not self._check_bot_status_callback(call):
+            return
+        
+        parts = call.data.split("_")
+        contest_id = parts[2]
+        participant_id = int(parts[3])
+        user_id = call.from_user.id
+        
+        contest = self.active_contests.get(contest_id)
+        if not contest:
+            try:
+                self.bot.answer_callback_query(call.id, "❌ المسابقة غير موجودة.", show_alert=True)
+            except:
+                pass
+            return
+        
+        votes_count = len(self.contest_votes.get(contest_id, {}).get(participant_id, set()))
+        participant_name = contest['participants'].get(participant_id, "مشارك")
+        
+        try:
+            self.bot.answer_callback_query(
+                call.id, 
+                f"👤 {participant_name}\n🎯 عدد الأصوات: {votes_count}", 
+                show_alert=True
+            )
+        except:
+            pass
+
+    def handle_messages_by_state(self, message):
+        user_id = message.from_user.id
+        if not self._check_bot_status(message):
+            return
+        if not self._check_global_forced_subscription_message(message):
+            return
+
+        current_state = self.user_states.get(user_id)
+
+        if current_state == 'awaiting_channel_to_add_forward':
+            if message.forward_from_chat and message.forward_from_chat.type == "channel":
+                channel = message.forward_from_chat
+                try:
+                    bot_member = self.bot.get_chat_member(channel.id, self.bot.get_me().id)
+                    if bot_member.status not in ['administrator', 'creator']:
+                        self.bot.send_message(message.chat.id, "البوت ليس مشرفاً في هذه القناة. الرجاء إضافة البوت كمشرف وإعادة التوجيه. ❗❌")
+                        return
+                except Exception:
+                    self.bot.send_message(message.chat.id, "حدث خطأ أثناء التحقق من صلاحيات البوت في القناة. تأكد من أن القناة عامة وأن البوت مشرف. ")
+                    return
+
+                self.user_bound_channels.setdefault(user_id, {})[channel.id] = {
+                    'title': channel.title,
+                    'username': channel.username
+                }
+                self.bot.send_message(message.chat.id, f"تم ربط القناة: {channel.title} (@{channel.username if channel.username else 'غير متوفر'}) ")
+                self.user_states.pop(user_id, None)
+                self.handle_my_channels_menu(message)
             else:
-                await message.reply_text(
-                    f"✅ تم نشر السحب #{gid} بنجاح.\nإغلاق التسجيل: /close {gid}\nسحب الفائزين: /draw {gid}",
-                    reply_markup=main_keyboard(uid),
-                )
-        except TelegramError as exc:
-            log.exception("فشل نشر السحب")
-            with database() as con:
-                con.execute(
-                    "UPDATE giveaways SET status='draft',chat_id=NULL,message_id=NULL WHERE id=?",
-                    (gid,),
-                )
-                audit(con, uid, "publish_failed", gid, str(exc)[:250])
-            await message.reply_text(
-                "تعذر النشر. تحقق من الوجهة وصلاحيات البوت والاتصال بتيليجرام.",
-                reply_markup=main_keyboard(uid),
-            )
-        finally:
-            context.user_data.pop("flow", None)
+                self.bot.send_message(message.chat.id, "يرجى إعادة توجيه رسالة من قناة عامة أضفت فيها البوت كمشرف. ")
 
+        elif current_state == 'awaiting_global_forced_channel_forward':
+            if user_id != self.ADMIN_ID:
+                self.bot.send_message(message.chat.id, self.NOT_YOUR_COMMAND_MSG)
+                return
 
-# -------------------- DIAGNOSTICS / STARTUP --------------------
-async def debug_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if msg and msg.text:
-        log.info(
-            "وصل تحديث نصي: user_id=%s chat_id=%s text=%r",
-            update.effective_user.id if update.effective_user else None,
-            update.effective_chat.id if update.effective_chat else None,
-            msg.text[:100],
-        )
+            if message.forward_from_chat and message.forward_from_chat.type == "channel":
+                channel = message.forward_from_chat
+                try:
+                    bot_member = self.bot.get_chat_member(channel.id, self.bot.get_me().id)
+                    if bot_member.status not in ['administrator', 'creator']:
+                        self.bot.send_message(message.chat.id, "البوت ليس مشرفاً في هذه القناة. الرجاء إضافة البوت كمشرف وإعادة التوجيه. ")
+                        return
+                except Exception:
+                    self.bot.send_message(message.chat.id, "حدث خطأ أثناء التحقق من صلاحيات البوت في القناة. تأكد من أن القناة عامة وأن البوت مشرف. ")
+                    return
+                
+                if channel.id in self.global_forced_channels:
+                    self.bot.send_message(message.chat.id, "هذه القناة مضافة بالفعل كقناة اشتراك إجباري. ")
+                else:
+                    self.global_forced_channels[channel.id] = {
+                        'title': channel.title,
+                        'username': channel.username
+                    }
+                    self.bot.send_message(message.chat.id, f"تم إضافة القناة {channel.title} (@{channel.username if channel.username else 'غير متوفر'}) كقناة اشتراك إجباري عالمي. ")
+                self.user_states.pop(user_id, None)
+                self.handle_admin_panel(message)
+            else:
+                self.bot.send_message(message.chat.id, "يرجى إعادة توجيه رسالة من قناة عامة أضفت فيها البوت كمشرف. ")
 
+        elif current_state == 'awaiting_roulette_text' or current_state == 'awaiting_roulette_text_edit':
+            self.user_temp_data[user_id]['roulette_text'] = message.text
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    error = context.error
-    if isinstance(error, Conflict):
-        log.error("Conflict: توجد نسخة أخرى من البوت تستخدم getUpdates. أوقف النسخ الأخرى.")
-    elif isinstance(error, InvalidToken):
-        log.error("رمز BOT_TOKEN غير صحيح. لا ترسل الرمز في المحادثة.")
-    else:
-        log.error("خطأ غير معالج أثناء استقبال تحديث: %r", error, exc_info=error)
+            if current_state == 'awaiting_roulette_text':
+                self.bot.send_message(message.chat.id, "تم حفظ الكليشة، اختر أحد الخيارات: ", reply_markup=self.roulette_creation_options_kb())
+            else:
+                self.bot.send_message(message.chat.id, "تم تحديث الكليشة، اختر أحد الخيارات: ✅🔄", reply_markup=self.roulette_creation_options_kb())
 
+            self.user_states[user_id] = 'awaiting_roulette_options_choice'
 
-async def post_init(app: Application):
+        elif current_state == 'awaiting_conditional_channel_link':
+            channel_link = message.text.strip()
+            channel_identifier = self._get_channel_info_from_link(channel_link)
+
+            if not channel_identifier:
+                self.bot.send_message(message.chat.id, "الرابط غير صالح. الرجاء إرسال رابط قناة صحيح (مثال: @VIP_C20 أو https://t.me/VIP_C20). ")
+                return
+
+            try:
+                chat = self.bot.get_chat(channel_identifier)
+                if chat.type != 'channel':
+                    self.bot.send_message(message.chat.id, "هذا ليس رابط قناة. الرجاء إرسال رابط قناة. ")
+                    return
+
+                self.user_temp_data[user_id]['conditional_channel_id'] = chat.id
+                self.user_temp_data[user_id]['conditional_channel_username'] = chat.username
+                self.bot.send_message(message.chat.id, f"تم حفظ القناة الشرطية: {chat.title} (@{chat.username or 'غير متوفر'}) ")
+                self.bot.send_message(message.chat.id, "كم عدد الفائزين الذين تريد اختيارهم؟ \n(سيتوقف السحب حين يصل عدد المشاركين المتبقين لهذا العدد).")
+                self.user_states[user_id] = 'awaiting_winner_count'
+
+            except Exception as e:
+                self.bot.send_message(message.chat.id, f"حدث خطأ: {e} ")
+
+        elif current_state == 'awaiting_winner_count':
+            try:
+                count = int(message.text)
+                if count < 0:
+                    raise ValueError("Non-negative number required")
+                self.user_temp_data[user_id]['winners_count'] = count
+                self._publish_roulette(user_id)
+                self.user_states.pop(user_id, None)
+                self.user_temp_data.pop(user_id, None)
+            except ValueError:
+                self.bot.send_message(message.chat.id, "الرجاء إرسال عدد صحيح موجب أو صفر (في حال أردت استبعاد الجميع عدا واحد فقط مثلاً). ")
+            except Exception as e:
+                self.bot.send_message(message.chat.id, f"حدث خطأ أثناء نشر الروليت: {e} ")
+                self.user_states.pop(user_id, None)
+                self.user_temp_data.pop(user_id, None)
+
+        elif current_state == 'awaiting_auto_draw_value':
+            try:
+                value = int(message.text)
+                if value <= 0:
+                    raise ValueError("Positive number required")
+
+                unit = self.user_temp_data[user_id].get('auto_draw_unit')
+                delay_seconds = 0
+
+                if unit == 'minutes':
+                    delay_seconds = value * 60
+                elif unit == 'hours':
+                    delay_seconds = value * 3600
+                elif unit == 'days':
+                    delay_seconds = value * 86400
+                else:
+                    raise ValueError("Invalid unit")
+
+                self.user_temp_data[user_id]['draw_time_unix'] = int(time.time() + delay_seconds)
+
+                self.bot.send_message(message.chat.id, self.ROULETTE_TEXT_PROMPT, parse_mode="HTML")
+                self.user_states[user_id] = 'awaiting_roulette_text'
+
+            except ValueError:
+                self.bot.send_message(message.chat.id, "الرجاء إرسال عدد صحيح موجب للمدة الزمنية. ❗❌")
+            except Exception as e:
+                self.bot.send_message(message.chat.id, f"حدث خطأ: {e} ")
+                self.user_states.pop(user_id, None)
+                self.user_temp_data.pop(user_id, None)
+
+        elif not message.text.startswith('/'):
+            self.bot.send_message(message.chat.id, "أمر غير مفهوم. الرجاء استخدام الأزرار أو /start للبدء. ❗❓", reply_markup=self.main_menu_kb(user_id))
+
+    def run(self):
+        logger.info("جاري تشغيل البوت...")
+        while True:
+            try:
+                self.bot.infinity_polling(timeout=30, long_polling_timeout=30)
+            except Exception as e:
+                logger.error(f"توقف البوت بسبب خطأ: {e}", exc_info=True)
+                logger.info("إعادة المحاولة خلال 5 ثوانٍ...")
+                time.sleep(5)
+
+if __name__ == '__main__':
     try:
-        me = await app.bot.get_me()
-        log.info("تم الاتصال بتيليجرام: @%s (id=%s)", me.username, me.id)
-    except TelegramError:
-        log.exception("فشل الاتصال بواجهة Telegram API")
+        bot_instance = RouletteBot()
+        bot_instance.run()
+    except Exception as e:
+        logger.error(f"فشل تشغيل البوت نهائياً: {e}", exc_info=True)
         raise
-    await restore_timers(app)
-    log.info("تم تهيئة البوت بنجاح.")
-
-
-def main():
-    if not TOKEN:
-        raise SystemExit(
-            "لم يتم العثور على BOT_TOKEN.\n"
-            "في Termux نفّذ: export BOT_TOKEN='توكن_البوت' ثم أعد التشغيل."
-        )
-    init_db()
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start), group=0)
-    app.add_handler(CommandHandler("cancel", cancel), group=0)
-    app.add_handler(CommandHandler("close", close_command), group=0)
-    app.add_handler(CommandHandler("draw", draw_command), group=0)
-    app.add_handler(CommandHandler("exclude", exclude_command), group=0)
-    app.add_handler(CommandHandler("addadmin", addadmin_command), group=0)
-    app.add_handler(CommandHandler("deladmin", deladmin_command), group=0)
-    app.add_handler(CallbackQueryHandler(callback), group=0)
-    # Generic text logger is in a later group, so it logs messages not consumed by commands.
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, flow_message), group=0)
-    app.add_handler(MessageHandler(filters.ALL, debug_updates), group=1)
-    app.add_error_handler(error_handler)
-    log.info("بدء تشغيل بوت الروليت. Owner ID: %s", OWNER_ID)
-    # Poll only message/callback updates; do not discard queued updates.
-    app.run_polling(drop_pending_updates=False)
-
-
-if __name__ == "__main__":
-    main()
-'''
-path = "/mnt/data/Rolet.py"
-with open(path, "w", encoding="utf-8") as f:
-    f.write(code)
-import py_compile
-py_compile.compile(path, doraise=True)
-print(f"تم إنشاء الملف وفحص صياغته بنجاح: {path}\nعدد الأسطر: {len(code.splitlines())}")
