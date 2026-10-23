@@ -31,8 +31,8 @@ logging.basicConfig(
 logger = logging.getLogger("RouletteBot")
 
 class RouletteBot:
-    API_TOKEN = '8906278700:AAGf5AZs6tKkPtROSxYjJPjLS4cuHX8tW5E'
-    ADMIN_ID = 1537665613
+    API_TOKEN = '8808678304:AAEMfuncdFnBakFGZQRXa3Ko4XH7snOw64Q'
+    ADMIN_ID = 1537665613, 2087179061
 
     def __init__(self):
         self.bot = telebot.TeleBot(self.API_TOKEN)
