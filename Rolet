@@ -1,4 +1,3 @@
-
 import telebot
 from telebot import types
 import sqlite3
@@ -7,10 +6,8 @@ import random
 from datetime import datetime, timedelta
 import threading
 import time
-from typing import Optional, List, Dict
-import logging
 import uuid
-import signal
+import logging
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,14 +16,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TOKEN = "8906278700:AAGf5AZs6tKkPtROSxYjJPjLS4cuHX8tW5E"
-ADMIN_ID = 1537665613
-SUPPORT_ID = 687865476  # dev5z
-BOT_USERNAME = "RedFFFoxRRouletteBot"
+ADMIN_ID = 1537665613 # ايديك يغالي
+SUPPORT_ID = 1537665613 # ايديك مره ثانية يغالي
+BOT_USERNAME = "تجربة" #حط اسم بوتك
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML", skip_pending=True)
 db_lock = threading.Lock()
 
-# Reset webhook to clear any previous connections
 try:
     bot.delete_webhook()
     print("[INFO] Webhook cleared")
@@ -34,6 +30,7 @@ try:
 except:
     pass
 
+#صنع من قبل RedFox يمنع تغيير الحقوق.
 class Database:
     def __init__(self, db_name="rroulette_bot.db"):
         self.db_name = db_name
@@ -85,7 +82,23 @@ class Database:
                 (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, message TEXT,
                  created_date TEXT, is_read INTEGER DEFAULT 0)''')
             
-            # Add missing columns if they don't exist
+            cursor.execute('''CREATE TABLE IF NOT EXISTS roulette_condition_channels
+                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 roulette_id INTEGER,
+                 channel_id TEXT,
+                 channel_name TEXT,
+                 FOREIGN KEY (roulette_id) REFERENCES roulettes(id))''')
+            
+            cursor.execute('''CREATE TABLE IF NOT EXISTS participant_channels_status
+                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 participant_id INTEGER,
+                 roulette_id INTEGER,
+                 channel_id TEXT,
+                 is_subscribed INTEGER DEFAULT 0,
+                 checked_at TEXT,
+                 FOREIGN KEY (participant_id) REFERENCES participants(id),
+                 FOREIGN KEY (roulette_id) REFERENCES roulettes(id))''')
+            
             try:
                 cursor.execute("ALTER TABLE users ADD COLUMN blocked INTEGER DEFAULT 0")
             except:
@@ -155,7 +168,6 @@ def generate_roulette_key():
     return f"roulette_{uuid.uuid4().hex[:12]}"
 
 def get_html_text(message):
-    """تحويل نص الرسالة مع التنسيقات إلى HTML"""
     if not message.text:
         return ""
     
@@ -165,16 +177,10 @@ def get_html_text(message):
     text = message.text
     entities = sorted(message.entities, key=lambda e: e.offset, reverse=True)
     
-    # نستخدم قائمة الأحرف لسهولة التعديل
-    # ملاحظة: Telegram counts offset by UTF-16 code units.
-    # Python strings (unicode) matches this mostly for BMP, but emojis can be tricky.
-    # For simplicity/safety with mixed content, we try the standard approach.
-    
     for entity in entities:
         offset = entity.offset
         length = entity.length
         
-        # تحويل نوع الكيان إلى HTML tags
         start_tag = ""
         end_tag = ""
         
@@ -204,17 +210,6 @@ def get_html_text(message):
              end_tag = '</span>'
         
         if start_tag:
-            # نقوم بالاستبدال من النهاية للبداية حتى لا نغير الـ offsets القادمة
-            # لكن مهلاً، في Python، الاستبدال اسهل بتقسيم النص
-            
-            # UTF-16 encoding correction for emojis handles
-            # لكن بما أننا لا نملك مكتبة مساعدة، سنستخدم النص مباشرة ونأمل خيرًا
-            # أو نستخدم طريقة bytearray with utf-16
-            
-            # Safe basic approach (works for non-surrogate pairs logic mostly)
-            # If complex emojis are used, offsets might misalignment in pure python string indexing vs telegram's utf16 count.
-            # But mostly fine.
-            
             before = text[:offset]
             content = text[offset:offset+length]
             after = text[offset+length:]
@@ -302,13 +297,11 @@ def create_subscription_keyboard(user_id):
         is_subscribed = is_user_subscribed_to_channel(user_id, channel_id)
         status_emoji = "✅" if is_subscribed else "❌"
         
-        # Create a channel link - try to get URL
         try:
             channel_link = f"https://t.me/{channel_id[1:]}" if channel_id.startswith("@") else channel_id
         except:
             channel_link = channel_id
         
-        # Two buttons: left for status, right for channel name/link
         keyboard.row(
             types.InlineKeyboardButton(f"{status_emoji} {'مشترك' if is_subscribed else 'غير مشترك'}", callback_data="dummy"),
             types.InlineKeyboardButton(f"📢 {channel_name}", url=channel_link)
@@ -327,7 +320,6 @@ def create_main_menu_keyboard(user_id=None):
                  types.InlineKeyboardButton("ℹ️ معلومات", callback_data="bot_info"))
     keyboard.add(types.InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings_menu"))
     
-    # إضافة زر لوحة التحكم فقط للأدمن
     if user_id == ADMIN_ID:
         keyboard.add(types.InlineKeyboardButton("🔐 لوحة التحكم", callback_data="admin_panel_btn"))
         keyboard.add(types.InlineKeyboardButton("👑 زر المالك", callback_data="owner_button"))
@@ -336,34 +328,24 @@ def create_main_menu_keyboard(user_id=None):
 
 def create_admin_keyboard():
     keyboard = types.InlineKeyboardMarkup()
-    # Row 1: إدارة الروليتات والقنوات
     keyboard.row(types.InlineKeyboardButton("🎰 الروليتات النشطة", callback_data="active_roulettes"),
                  types.InlineKeyboardButton("📋 إدارة القنوات", callback_data="manage_channels"))
-    # Row 2: الإذاعة والرسائل
     keyboard.row(types.InlineKeyboardButton("📢 بث رسالة", callback_data="broadcast"),
                  types.InlineKeyboardButton("💬 رسالة لمستخدم", callback_data="send_to_user"))
-    # Row 3: إدارة المستخدمين
     keyboard.row(types.InlineKeyboardButton("🚫 حظر مستخدم", callback_data="block_user_admin"),
                  types.InlineKeyboardButton("✅ فك الحظر", callback_data="unblock_user_admin"))
-    # Row 4: الإحصائيات والتقارير
     keyboard.row(types.InlineKeyboardButton("📊 إحصائيات", callback_data="bot_stats"),
                  types.InlineKeyboardButton("👥 المستخدمين", callback_data="user_count"))
-    # Row 5: القنوات المطلوبة والاشتراك الإجباري
     keyboard.row(types.InlineKeyboardButton("🔗 القنوات المطلوبة", callback_data="required_channels_manage"),
                  types.InlineKeyboardButton("✅ الاشتراك الإجباري", callback_data="toggle_mandatory_sub"))
-    # Row 6: المتابعة والتحقق
     keyboard.row(types.InlineKeyboardButton("🏆 أفضل الرابحين", callback_data="top_winners_admin"),
                  types.InlineKeyboardButton("🔍 البحث عن مستخدم", callback_data="search_user"))
-    # Row 7: إدارة النظام
     keyboard.row(types.InlineKeyboardButton("ℹ️ معلومات البوت", callback_data="bot_info"),
                  types.InlineKeyboardButton("📈 إحصائيات متقدمة", callback_data="advanced_stats"))
-    # Row 8: الإعدادات والصيانة
     keyboard.row(types.InlineKeyboardButton("⚙️ الإعدادات", callback_data="admin_settings"),
                  types.InlineKeyboardButton("🔧 الصيانة", callback_data="maintenance"))
-    # Row 9: أدوات إضافية
     keyboard.row(types.InlineKeyboardButton("🗑️ مسح الروليتات المنتهية", callback_data="cleanup_roulettes"),
                  types.InlineKeyboardButton("🔄 تحديث الإحصائيات", callback_data="refresh_stats"))
-    # Row 10: العودة
     keyboard.row(types.InlineKeyboardButton("🔙 العودة", callback_data="back_to_main"))
     return keyboard
 
@@ -421,6 +403,48 @@ def send_notification(user_id, message):
     except:
         pass
 
+#صنع من قبل RedFox يمنع تغيير الحقوق.
+def add_condition_channel_to_roulette(roulette_id, channel_id, channel_name):
+    return db.execute(
+        "INSERT INTO roulette_condition_channels (roulette_id, channel_id, channel_name) VALUES (?, ?, ?)",
+        (roulette_id, channel_id, channel_name)
+    )
+
+def get_roulette_condition_channels(roulette_id):
+    return db.fetch_all(
+        "SELECT channel_id, channel_name FROM roulette_condition_channels WHERE roulette_id = ?",
+        (roulette_id,)
+    )
+
+def remove_condition_channel_from_roulette(roulette_id, channel_id):
+    return db.execute(
+        "DELETE FROM roulette_condition_channels WHERE roulette_id = ? AND channel_id = ?",
+        (roulette_id, channel_id)
+    )
+
+def check_user_subscription_all_channels(user_id, roulette_id):
+    channels = get_roulette_condition_channels(roulette_id)
+    
+    if not channels:
+        return True, []
+    
+    missing_channels = []
+    
+    for channel_id, channel_name in channels:
+        if not is_user_subscribed_to_channel(user_id, channel_id):
+            missing_channels.append((channel_id, channel_name))
+    
+    if missing_channels:
+        return False, missing_channels
+    else:
+        return True, []
+
+def update_participant_channel_status(participant_id, roulette_id, channel_id, is_subscribed):
+    return db.execute(
+        "INSERT OR REPLACE INTO participant_channels_status (participant_id, roulette_id, channel_id, is_subscribed, checked_at) VALUES (?, ?, ?, ?, ?)",
+        (participant_id, roulette_id, channel_id, is_subscribed, datetime.now().isoformat())
+    )
+
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_id = message.from_user.id
@@ -433,17 +457,16 @@ def send_welcome(message):
     
     add_user(user_id, username, first_name)
     
-    # Check for start parameter (deeplink verification)
     args = message.text.split()
     if len(args) > 1 and args[1].startswith("verify_"):
-        roulette_key = args[1][7:] if len(args[1]) > 7 else ""  # Remove "verify_" prefix
+        roulette_key = args[1][7:] if len(args[1]) > 7 else ""
         
         if not roulette_key:
             bot.send_message(user_id, "<b>❌ الروليت غير متوفرة</b>")
             return
         
         roulette = db.fetch_one(
-            "SELECT id, condition_channel, status, creator_id FROM roulettes WHERE roulette_key = ?",
+            "SELECT id, status FROM roulettes WHERE roulette_key = ?",
             (roulette_key,)
         )
         
@@ -451,51 +474,60 @@ def send_welcome(message):
             bot.send_message(user_id, "<b>❌ الروليت غير متوفرة</b>")
             return
         
-        roulette_id, condition_channel, status, creator_id = roulette
+        roulette_id, status = roulette
         
         if status != "active":
             bot.send_message(user_id, "<b>❌ انتهت الروليت بالفعل</b>")
             return
         
-        if not is_user_subscribed_to_channel(user_id, condition_channel):
-            bot.send_message(user_id, "<b>❌ يجب الاشتراك في القناة أولًا</b>")
+        is_subscribed, missing_channels = check_user_subscription_all_channels(user_id, roulette_id)
+        
+        if not is_subscribed:
+            missing_message = (
+                "<b>❌ يجب الاشتراك في جميع القنوات أولاً</b>\n\n"
+                "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                "<b>القنوات المطلوبة:</b>\n"
+            )
+            
+            for i, (ch_id, ch_name) in enumerate(missing_channels, 1):
+                channel_link = f"https://t.me/{ch_id[1:]}" if ch_id.startswith("@") else ch_id
+                missing_message += f"{i}. <a href=\"{channel_link}\">{ch_name}</a>\n"
+            
+            missing_message += (
+                f"\n<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                f"<i>بعد الاشتراك، استخدم نفس الرابط للمشاركة</i>"
+            )
+            
+            bot.send_message(user_id, missing_message)
             return
         
-        existing = db.fetch_one(
-            "SELECT id FROM participants WHERE user_id = ? AND roulette_id = ?",
-            (user_id, roulette_id)
-        )
-        
-        if existing:
-            bot.send_message(user_id, "<b>⚠️ أنت مشترك بالفعل في هذه الروليت</b>")
-            return
-        
-        # Show verification
-        emojis = ["🎯", "⚽", "🎮"]
+        emojis = ["🎯", "⚽", "🎮", "🏀", "🎾", "⚾", "🏈", "🎳", "🏓", "🎲"]
         correct_emoji = random.choice(emojis)
         other_emojis = [e for e in emojis if e != correct_emoji]
         random.shuffle(other_emojis)
         
         keyboard = types.InlineKeyboardMarkup()
-        buttons = [types.InlineKeyboardButton(emoji, 
-                                             callback_data=f"verify:{roulette_key}:{emoji}:{correct_emoji}")
+        buttons = [types.InlineKeyboardButton(emoji,
+                     callback_data=f"verify:{roulette_key}:{emoji}:{correct_emoji}")
                    for emoji in [correct_emoji] + other_emojis]
-        keyboard.row(*buttons)
+        keyboard.row(*buttons[:3])
+        keyboard.row(*buttons[3:6])
         
-        bot.send_message(user_id,
-                       "<b>🔐 تحقق من الهوية</b>\n\n"
-                       "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                       "<b>⚠️ اختر الرمز الصحيح أدناه:</b>\n\n"
-                       f"<b>🎯 الرمز المطلوب: {correct_emoji}</b>\n\n"
-                       "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                       "💡 <i>لديك محاولات غير محدودة</i>\n"
-                       "✅ <i>اختر الرمز الصحيح للمشاركة</i>",
-                       reply_markup=keyboard)
+        bot.send_message(
+            user_id,
+            "<b>🔐 تحقق من الهوية</b>\n\n"
+            "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            "<b>⚠️ اختر الرمز الصحيح أدناه:</b>\n\n"
+            f"<b>🎯 الرمز المطلوب: {correct_emoji}</b>\n\n"
+            "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            "💡 <i>لديك محاولات غير محدودة</i>\n"
+            "✅ <i>اختر الرمز الصحيح للمشاركة</i>",
+            reply_markup=keyboard
+        )
         return
     
-    # Check for reminder confirmation parameter
     if len(args) > 1 and args[1].startswith("remind_"):
-        roulette_key = args[1][7:] if len(args[1]) > 7 else ""  # Remove "remind_" prefix
+        roulette_key = args[1][7:] if len(args[1]) > 7 else ""
         
         if not roulette_key:
             bot.send_message(user_id, "<b>❌ الروليت غير متوفرة</b>")
@@ -513,30 +545,6 @@ def send_welcome(message):
                        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>",
                        reply_markup=keyboard)
         return
-    
-    # Check if user has pending join verification
-    if user_id in user_states and user_states[user_id].get("state") == "verify_emoji":
-        roulette_key = user_states[user_id].get("roulette_key")
-        correct_emoji = user_states[user_id].get("correct_emoji")
-        
-        if roulette_key and correct_emoji:
-            # Show pending verification
-            emojis = ["🎯", "⚽", "🎮"]
-            other_emojis = [e for e in emojis if e != correct_emoji]
-            random.shuffle(other_emojis)
-            
-            keyboard = types.InlineKeyboardMarkup()
-            buttons = [types.InlineKeyboardButton(emoji, 
-                                                 callback_data=f"verify:{roulette_key}:{emoji}:{correct_emoji}")
-                       for emoji in [correct_emoji] + other_emojis]
-            keyboard.row(*buttons)
-            
-            bot.send_message(user_id,
-                           f"<b>🔐 تحقق من الهوية</b>\n\n"
-                           f"<b>اختر الرمز التالي:</b> <code>{correct_emoji}</code>\n\n"
-                           f"<b>لديك محاولات غير محدودة</b>",
-                           reply_markup=keyboard)
-            return
     
     user_states[user_id] = {}
     
@@ -566,6 +574,830 @@ def send_welcome(message):
                    "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
                    "<b>⬇️ اختر من الخيارات أدناه:</b>",
                    reply_markup=keyboard)
+
+@bot.message_handler(content_types=['text'])
+def handle_text_message(message):
+    user_id = message.from_user.id
+    
+    if user_id not in user_states:
+        return
+    
+    state = user_states.get(user_id, {}).get("state")
+    
+    if state == "create_roulette_condition_channels":
+        handle_condition_channels(message)
+    elif state == "link_channel":
+        handle_link_channel(message)
+    elif state == "create_roulette_winners":
+        handle_winners_count(message)
+    elif state == "create_roulette_text":
+        handle_roulette_text(message)
+    elif state == "create_roulette_countdown":
+        handle_roulette_countdown(message)
+    elif state == "broadcast":
+        handle_broadcast(message)
+    elif state == "send_to_user_id":
+        handle_send_to_user_id(message)
+    elif state == "send_to_user_message":
+        handle_send_to_user_message(message)
+    elif state == "add_channel":
+        handle_add_channel(message)
+    elif state == "delete_channel":
+        handle_delete_channel(message)
+    elif state == "block_user":
+        handle_block_user(message)
+    elif state == "unblock_user":
+        handle_unblock_user(message)
+    elif state == "search_user":
+        handle_search_user(message)
+    elif state == "add_required_channel":
+        handle_add_required_channel(message)
+    elif state == "view_roulette_channels":
+        handle_view_roulette_channels(message)
+
+def handle_condition_channels(message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    message_id = user_states.get(user_id, {}).get("message_id")
+    
+    if text.lower() == "/done":
+        condition_channels = user_states[user_id].get("condition_channels", [])
+        
+        if not condition_channels:
+            error_msg = (
+                "<b>❌ يجب إضافة قناة شرط واحدة على الأقل</b>\n\n"
+                "الرجاء إرسال معرف قناة واحدة على الأقل"
+            )
+            if message_id:
+                try:
+                    bot.edit_message_text(error_msg, user_id, message_id)
+                except:
+                    bot.send_message(user_id, error_msg)
+            else:
+                bot.send_message(user_id, error_msg)
+            return
+        
+        user_states[user_id]["state"] = "create_roulette_text"
+        user_states[user_id]["condition_channel"] = condition_channels[0][0]
+        
+        success_message = (
+            f"<b>✅ تم إضافة {len(condition_channels)} قناة كشروط اشتراك</b>\n\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            f"<b>📋 القنوات المضافة:</b>\n"
+        )
+        
+        for i, (ch_id, ch_name) in enumerate(condition_channels, 1):
+            success_message += f"{i}. {ch_name} ({ch_id})\n"
+        
+        success_message += (
+            f"\n<b>⚠️ ملاحظة:</b>\n"
+            f"يجب على المشاركين الاشتراك في <b>جميع</b> هذه القنوات\n\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            f"<b>📝 الخطوة التالية: إرسال نص الروليت</b>\n"
+            f"اكتب النص الذي سيظهر مع الروليت\n\n"
+            f"💡 <b>تلميح:</b> يمكنك استخدام التنسيق والتعبيرات 😊"
+        )
+        
+        if message_id:
+            try:
+                bot.edit_message_text(success_message, user_id, message_id)
+            except:
+                sent = bot.send_message(user_id, success_message)
+                user_states[user_id]["message_id"] = sent.message_id
+        else:
+            sent = bot.send_message(user_id, success_message)
+            user_states[user_id]["message_id"] = sent.message_id
+        
+        return
+    
+    channel_id = None
+    channel_name = None
+    
+    if message.forward_from_chat:
+        channel_id = str(message.forward_from_chat.id)
+        channel_name = message.forward_from_chat.title
+    elif text.startswith("@"):
+        channel_id = text
+        channel_name = text[1:]
+    elif "t.me" in text:
+        parts = text.replace("https://", "").replace("http://", "").split("/")
+        channel_id = "@" + parts[-1]
+        channel_name = parts[-1]
+    
+    if channel_id:
+        try:
+            bot_member = bot.get_chat_member(channel_id, bot.get_me().id)
+            bot_is_admin = bot_member.status in ['administrator', 'creator']
+            
+            if not bot_is_admin:
+                error_message = (
+                    f"<b>❌ البوت ليس ادمن في هذه القناة!</b>\n\n"
+                    f"القناة: {channel_name}\n\n"
+                    f"<b>الحل:</b>\n"
+                    f"1️⃣ أضفني كمشرف في القناة\n"
+                    f"2️⃣ أعطني صلاحية \"حذف الرسائل\"\n\n"
+                    f"أو أرسل معرف قناة أخرى\n"
+                    f"أو أرسل /done للانتهاء"
+                )
+                bot.send_message(user_id, error_message)
+                return
+            
+            condition_channels = user_states[user_id].get("condition_channels", [])
+            existing_channels = [ch[0] for ch in condition_channels]
+            
+            if channel_id in existing_channels:
+                bot.send_message(user_id, 
+                               f"<b>⚠️ القناة مضافة بالفعل</b>\n\n"
+                               f"القناة: {channel_name}\n\n"
+                               f"أرسل قناة أخرى أو /done للانتهاء")
+                return
+            
+            if len(condition_channels) >= 10:
+                bot.send_message(user_id,
+                               "<b>❌ وصلت للحد الأقصى</b>\n\n"
+                               "يمكنك إضافة 10 قنوات كحد أقصى\n"
+                               "أرسل /done للانتهاء")
+                return
+            
+            condition_channels.append((channel_id, channel_name))
+            user_states[user_id]["condition_channels"] = condition_channels
+            
+            confirm_message = (
+                f"<b>✅ تم إضافة القناة #{len(condition_channels)}</b>\n\n"
+                f"<b>📢 القناة:</b> {channel_name}\n"
+                f"<b>🔗 المعرف:</b> {channel_id}\n\n"
+                f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                f"<b>📊 الإجمالي:</b> {len(condition_channels)} قناة\n\n"
+            )
+            
+            if len(condition_channels) < 10:
+                confirm_message += (
+                    "<b>📝 الخطوة التالية:</b>\n"
+                    "أرسل معرف القناة التالية\n"
+                    "أو أرسل /done للانتهاء من إضافة القنوات\n\n"
+                    "<i>يمكنك إضافة حتى 10 قنوات</i>"
+                )
+            else:
+                confirm_message += (
+                    "<b>🎉 وصلت للحد الأقصى!</b>\n\n"
+                    "أرسل /done للانتهاء من إضافة القنوات"
+                )
+            
+            bot.send_message(user_id, confirm_message)
+            
+        except Exception as e:
+            logger.error(f"Error checking channel: {e}")
+            bot.send_message(user_id,
+                           f"<b>❌ خطأ في التحقق من القناة</b>\n\n"
+                           f"تأكد من:\n"
+                           f"• معرف القناة صحيح\n"
+                           f"• البوت مشرف في القناة\n"
+                           f"• القناة عامة أو البوت عضو فيها\n\n"
+                           f"حاول مرة أخرى أو أرسل /done")
+    else:
+        bot.send_message(user_id,
+                       "<b>❌ لم أستطع قراءة معرف القناة</b>\n\n"
+                       "<b>طرق إرسال القناة:</b>\n"
+                       "1️⃣ @channel_name\n"
+                       "2️⃣ https://t.me/channel_name\n"
+                       "3️⃣ أعيد توجيه رسالة من القناة\n\n"
+                       "أو أرسل /done للانتهاء")
+
+def handle_link_channel(message):
+    user_id = message.from_user.id
+    channel_id = None
+    channel_name = None
+    
+    if message.forward_from_chat:
+        channel_id = str(message.forward_from_chat.id)
+        channel_name = message.forward_from_chat.title
+    elif message.text and message.text.startswith("@"):
+        channel_id = message.text
+        channel_name = message.text[1:]
+    elif message.text and "t.me" in message.text:
+        parts = message.text.replace("https://", "").replace("http://", "").split("/")
+        channel_id = "@" + parts[-1]
+        channel_name = parts[-1]
+    
+    if channel_id:
+        try:
+            member = bot.get_chat_member(channel_id, bot.get_me().id)
+            if member.status in ['administrator', 'creator']:
+                existing = db.fetch_one("SELECT channel_id FROM channels WHERE channel_id = ? AND owner_id = ?",
+                                      (channel_id, user_id))
+                
+                if existing:
+                    bot.send_message(user_id, "<b>❌ القناة مرتبطة بحسابك بالفعل</b>")
+                else:
+                    db.execute("INSERT INTO channels VALUES (?, ?, ?, ?)",
+                             (channel_id, channel_name, user_id, datetime.now().isoformat()))
+                    bot.send_message(user_id,
+                                   f"<b>✅ تم!</b>\n"
+                                   f"<b>📢</b> {channel_name}")
+                    
+                    keyboard = create_user_channels_keyboard(user_id)
+                    bot.send_message(user_id, "<b>📢 قنواتك:</b>",
+                                   reply_markup=keyboard)
+            else:
+                bot.send_message(user_id, "<b>❌ يجب أن تكون مشرفاً في القناة لربطها</b>")
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            bot.send_message(user_id, "<b>❌ خطأ</b>")
+    else:
+        bot.send_message(user_id, "<b>❌ فشل التعرف</b>")
+    
+    user_states[user_id] = {}
+
+def handle_winners_count(message):
+    user_id = message.from_user.id
+    message_id = user_states.get(user_id, {}).get("message_id")
+    
+    try:
+        winners_count = int(message.text)
+        if winners_count < 1:
+            error_msg = ("<b>❌ الرقم غير صحيح!</b>\n\n"
+                        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                        "<b>يجب إدخال رقم صحيح:</b>\n"
+                        "✅ الحد الأدنى: 1 فائز\n"
+                        "✅ يمكنك إدخال أي رقم تريده\n\n"
+                        "<b>مثال:</b>\n"
+                        "أرسل: 1 أو 2 أو 5 أو أكثر\n\n"
+                        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                        "<i>الرجاء إرسال الرقم مجدداً</i>")
+            if message_id:
+                try:
+                    bot.edit_message_text(error_msg, user_id, message_id)
+                except:
+                    bot.send_message(user_id, error_msg)
+            else:
+                bot.send_message(user_id, error_msg)
+        else:
+            user_states[user_id]["winners_count"] = winners_count
+            user_states[user_id]["state"] = "create_roulette_condition_channels"
+            user_states[user_id]["condition_channels"] = []
+            
+            channels = db.fetch_all("SELECT channel_id, channel_name FROM channels WHERE owner_id = ?",
+                                  (user_id,))
+            if not channels:
+                error_msg = "<b>❌ لا توجد قنوات</b>"
+                if message_id:
+                    try:
+                        bot.edit_message_text(error_msg, user_id, message_id)
+                    except:
+                        bot.send_message(user_id, error_msg)
+                else:
+                    bot.send_message(user_id, error_msg)
+                user_states[user_id] = {}
+            else:
+                keyboard = types.InlineKeyboardMarkup()
+                for ch_id, ch_name in channels:
+                    keyboard.add(types.InlineKeyboardButton(f"📢 {ch_name}",
+                                                           callback_data=f"roulette_channel:{ch_id}"))
+                
+                choice_message = (f"<b>✅ عدد الفائزين: {winners_count}</b>\n\n"
+                                "<b>📢 اختر القناة:</b>\n\n"
+                                "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                                "<b>القنوات المرتبطة بحسابك:</b>\n"
+                                "اضغط على القناة التي تريد استخدامها للروليت\n\n"
+                                "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                                "💡 <i>اختر قناة واحدة فقط من القائمة</i>")
+                
+                if message_id:
+                    try:
+                        bot.edit_message_text(choice_message, user_id, message_id, reply_markup=keyboard)
+                    except:
+                        sent = bot.send_message(user_id, choice_message, reply_markup=keyboard)
+                        user_states[user_id]["message_id"] = sent.message_id
+                else:
+                    sent = bot.send_message(user_id, choice_message, reply_markup=keyboard)
+                    user_states[user_id]["message_id"] = sent.message_id
+    except ValueError:
+        bot.send_message(user_id, "<b>❌ الرقم غير صحيح!</b>\n\n"
+                       "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                       "<b>المطلوب:</b>\n"
+                       "أرسل رقماً صحيحاً يمثل عدد الفائزين\n\n"
+                       "<b>أمثلة صحيحة:</b>\n"
+                       "• 1 (لاختيار فائز واحد)\n"
+                       "• 2 (لاختيار فائزين اثنين)\n"
+                       "• 5 (لاختيار 5 فائزين)\n\n"
+                       "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                       "<i>الرجاء إرسال رقماً صحيحاً فقط</i>")
+
+def handle_roulette_text(message):
+    user_id = message.from_user.id
+    message_id = user_states.get(user_id, {}).get("message_id")
+    
+    if message.text and ("t.me" in message.text or "http" in message.text):
+        error_message = ("<b>❌ روابط ممنوعة!</b>\n\n"
+                       "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                       "<b>لماذا؟</b>\n"
+                       "النصوص التي تحتوي على روابط غير مسموحة في الروليت\n\n"
+                       "<b>المسموح به:</b>\n"
+                       "✅ النصوص العادية\n"
+                       "✅ النص السميك والمائل\n"
+                       "✅ الرموز التعبيرية\n\n"
+                       "<b>الممنوع:</b>\n"
+                       "❌ روابط Telegram (t.me)\n"
+                       "❌ روابط الويب (http://, https://)\n\n"
+                       "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                       "<i>أرسل نصاً بدون روابط</i>")
+        
+        if message_id:
+            try:
+                bot.edit_message_text(error_message, user_id, message_id)
+            except:
+                bot.send_message(user_id, error_message)
+        else:
+            bot.send_message(user_id, error_message)
+        return
+    
+    message_text = get_html_text(message) or f"محتوى {message.content_type}"
+    
+    user_states[user_id]["message_text"] = message_text
+    user_states[user_id]["state"] = "create_roulette_countdown"
+    
+    countdown_message = ("<b>⏱️ كم ثانية للعداد التنازلي؟</b>\n\n"
+                        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                        "<b>📝 اختر مدة العداد:</b>\n"
+                        "أرسل رقم يمثل عدد الثواني\n\n"
+                        "<b>✅ أمثلة:</b>\n"
+                        "• 10 ثواني (سريع)\n"
+                        "• 30 ثانية (متوسط)\n"
+                        "• 60 ثانية (بطيء)\n\n"
+                        "<b>💡 ملاحظة:</b>\n"
+                        "إذا أرسلت 10، سيكون العداد 10 ثواني\n"
+                        "إذا أرسلت 0 أو تركت فارغ، سيكون 10 ثواني افتراضي\n\n"
+                        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>")
+    
+    if message_id:
+        try:
+            bot.edit_message_text(countdown_message, user_id, message_id)
+        except:
+            sent = bot.send_message(user_id, countdown_message)
+            user_states[user_id]["message_id"] = sent.message_id
+    else:
+        sent = bot.send_message(user_id, countdown_message)
+        user_states[user_id]["message_id"] = sent.message_id
+
+def handle_roulette_countdown(message):
+    user_id = message.from_user.id
+    message_id = user_states.get(user_id, {}).get("message_id")
+    
+    try:
+        countdown = int(message.text) if message.text.isdigit() else 30
+        if countdown < 10:
+            countdown = 10
+        elif countdown > 300:
+            countdown = 300
+    except:
+        countdown = 30
+    
+    winners_count = user_states[user_id].get("winners_count")
+    channel_id = user_states[user_id].get("channel_id")
+    condition_channels = user_states[user_id].get("condition_channels", [])
+    message_text = user_states[user_id].get("message_text")
+    
+    if not all([winners_count, channel_id, condition_channels, message_text]):
+        error_message = "<b>❌ خطأ في البيانات</b>"
+        if message_id:
+            try:
+                bot.edit_message_text(error_message, user_id, message_id)
+            except:
+                bot.send_message(user_id, error_message)
+        else:
+            bot.send_message(user_id, error_message)
+        user_states[user_id] = {}
+        return
+    
+    roulette_key = generate_roulette_key()
+    bot_link = get_bot_link()
+    
+    roulette_text = f"🎰 {message_text}\n\n"
+    roulette_text += f"<b>📋 شروط الاشتراك:</b>\n"
+    
+    for i, (ch_id, ch_name) in enumerate(condition_channels, 1):
+        channel_mention = f"@{ch_id[1:]}" if ch_id.startswith("@") else ch_id
+        roulette_text += f"{i}. 🔗 {channel_mention}\n"
+    
+    roulette_text += f"\n<b>🏆 عدد الفائزين:</b> {winners_count}\n"
+    roulette_text += f"<b>📊 المشاركون: 0</b>\n"
+    roulette_text += f"<b>⏱️ وقت العد:</b> {countdown} ثانية\n\n"
+    roulette_text += f'<a href="{bot_link}">🎰 Roulette RedFox</a>'
+    
+    keyboard = types.InlineKeyboardMarkup()
+    deeplink = f"https://t.me/{BOT_USERNAME}?start=verify_{roulette_key}"
+    reminder_deeplink = f"https://t.me/{BOT_USERNAME}?start=remind_{roulette_key}"
+    
+    keyboard.row(
+        types.InlineKeyboardButton("🎲 المشاركة", url=deeplink),
+        types.InlineKeyboardButton("🔔 التذكير", url=reminder_deeplink)
+    )
+    keyboard.row(
+        types.InlineKeyboardButton("⏸️ إيقاف", callback_data=f"pause:{roulette_key}"),
+        types.InlineKeyboardButton("▶️ بدء", callback_data=f"start:{roulette_key}")
+    )
+    
+    try:
+        sent_message = bot.send_message(channel_id, roulette_text, reply_markup=keyboard)
+        message_id_roulette = sent_message.message_id
+        
+        db.execute(
+            "INSERT INTO roulettes (roulette_key, creator_id, channel_id, condition_channel, winners_count, message_text, message_id, participants_count, status, created_date, winners, prize_text, end_date, channel_name, countdown_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (roulette_key, user_id, channel_id, condition_channels[0][0], winners_count, 
+             message_text, message_id_roulette, 0, "active", datetime.now().isoformat(), "", "", None, "", countdown)
+        )
+        
+        roulette_id = db.fetch_one("SELECT last_insert_rowid()")[0]
+        
+        for ch_id, ch_name in condition_channels:
+            add_condition_channel_to_roulette(roulette_id, ch_id, ch_name)
+        
+        try:
+            channel_info = db.fetch_one("SELECT channel_name FROM channels WHERE channel_id = ?", (channel_id,))
+            channel_name = channel_info[0] if channel_info else channel_id
+            
+            admin_msg = (f"<b>🎰 روليت جديدة مع {len(condition_channels)} قنوات شرط!</b>\n\n"
+                       f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                       f"<b>👤 المنشئ:</b> @{message.from_user.username or 'Unknown'}\n"
+                       f"<b>📢 القناة:</b> {channel_name}\n"
+                       f"<b>📝 النص:</b> {message_text[:50]}...\n"
+                       f"<b>🏆 عدد الفائزين:</b> {winners_count}\n"
+                       f"<b>⏱️ مدة العداد:</b> {countdown} ثانية\n"
+                       f"<b>📊 القنوات:</b> {len(condition_channels)}\n"
+                       f"<b>🕐 الوقت:</b> {datetime.now().strftime('%H:%M:%S')}\n\n"
+                       f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>")
+            bot.send_message(ADMIN_ID, admin_msg)
+        except:
+            pass
+        
+        success_message = (f"<b>✅ تم إنشاء الروليت بنجاح!</b>\n\n"
+                          f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                          f"<b>🎯 التفاصيل:</b>\n"
+                          f"📝 النص: {message_text[:50]}...\n"
+                          f"🏆 الفائزين: {winners_count}\n"
+                          f"📊 القنوات: {len(condition_channels)}\n"
+                          f"⏱️ العد: {countdown} ثانية\n\n"
+                          f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                          f"<i>سيتم إخطارك عند انضمام مشاركين جدد</i>")
+        
+        main_keyboard = create_main_menu_keyboard(user_id)
+        bot.send_message(user_id, success_message, reply_markup=main_keyboard)
+        
+        confirmation_message = (f"<b>📢 تم نشر روليتك!</b>\n\n"
+                               f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                               f"<b>🎰 عنوان الروليت:</b>\n{message_text}\n\n"
+                               f"<b>👥 المشاركون الجدد سيصل لك إشعار</b>\n"
+                               f"<b>🚫 يمكنك طرد أي مشارك من الروليت</b>\n\n"
+                               f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                               f"<i>اضغط على الإشعارات لإدارة المشاركين</i>")
+        bot.send_message(user_id, confirmation_message)
+    
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        error_message = f"<b>❌ حدث خطأ في إنشاء الروليت: {str(e)[:50]}</b>"
+        if message_id:
+            try:
+                bot.edit_message_text(error_message, user_id, message_id)
+            except:
+                bot.send_message(user_id, error_message)
+        else:
+            bot.send_message(user_id, error_message)
+    
+    user_states[user_id] = {}
+
+def handle_broadcast(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    
+    users = db.fetch_all("SELECT user_id FROM users WHERE blocked = 0")
+    
+    sent = 0
+    failed = 0
+    
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
+    
+    message_id = message.message_id
+    from_chat_id = message.chat.id
+    reply_markup = message.reply_markup
+    
+    for user in users:
+        try:
+            bot.copy_message(user[0], from_chat_id, message_id, reply_markup=reply_markup)
+            sent += 1
+            time.sleep(0.01)
+        except Exception as e:
+            failed += 1
+    
+    result_msg = (f"<b>✅ تم البث بنجاح!</b>\n\n"
+                 f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                 f"<b>📤 تم الإرسال لـ:</b> {sent} مستخدم\n"
+                 f"<b>❌ فشل:</b> {failed}\n"
+                 f"<b>📊 الإجمالي:</b> {sent + failed}\n\n"
+                 f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>")
+    
+    bot.send_message(ADMIN_ID, result_msg, reply_markup=keyboard)
+    user_states[user_id] = {}
+
+def handle_send_to_user_id(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    
+    try:
+        target_user_id = int(message.text)
+        
+        user = db.fetch_one("SELECT user_id, username, first_name FROM users WHERE user_id = ?", (target_user_id,))
+        
+        if not user:
+            keyboard = types.InlineKeyboardMarkup()
+            keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
+            bot.send_message(user_id, 
+                           "<b>❌ المستخدم غير موجود</b>\n\n"
+                           "<b>تأكد من المعرف الصحيح وحاول مرة أخرى</b>",
+                           reply_markup=keyboard)
+            user_states[user_id] = {}
+            return
+        
+        user_states[user_id]["target_user_id"] = target_user_id
+        user_states[user_id]["target_username"] = user[1]
+        user_states[user_id]["state"] = "send_to_user_message"
+        
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("🔙 إلغاء", callback_data="back_to_admin"))
+        
+        bot.send_message(user_id,
+                       f"<b>💬 إرسال رسالة</b>\n\n"
+                       f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                       f"<b>المستخدم:</b> {user[2]} (@{user[1]})\n\n"
+                       f"<b>اكتب الرسالة التي تريد إرسالها:</b>",
+                       reply_markup=keyboard)
+    except ValueError:
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
+        bot.send_message(user_id,
+                       "<b>❌ معرف غير صحيح</b>\n\n"
+                       "<b>يجب أن يكون رقماً صحيحاً</b>",
+                       reply_markup=keyboard)
+
+def handle_send_to_user_message(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    
+    target_user_id = user_states[user_id].get("target_user_id")
+    target_username = user_states[user_id].get("target_username")
+    
+    try:
+        signed_message = (f"{message.text}\n\n"
+                         f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+                         f"<i>رسالة من الإدارة 📢</i>")
+        
+        bot.send_message(target_user_id, signed_message)
+        
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("📢 بث جديد", callback_data="broadcast"),
+                     types.InlineKeyboardButton("💬 رسالة جديدة", callback_data="send_to_user"))
+        keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
+        
+        result_msg = (f"<b>✅ تم الإرسال بنجاح!</b>\n\n"
+                     f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                     f"<b>المستخدم:</b> @{target_username}\n"
+                     f"<b>المعرف:</b> <code>{target_user_id}</code>\n"
+                     f"<b>الحالة:</b> ✅ تم الإرسال\n\n"
+                     f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>")
+        
+        bot.send_message(user_id, result_msg, reply_markup=keyboard)
+    except Exception as e:
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
+        bot.send_message(user_id,
+                       f"<b>❌ فشل الإرسال</b>\n\n"
+                       f"<b>الخطأ:</b> {str(e)[:50]}",
+                       reply_markup=keyboard)
+    
+    user_states[user_id] = {}
+
+def handle_add_channel(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    
+    channel_id = message.text.strip()
+    channel_name = message.text.strip()
+    
+    db.execute("INSERT OR REPLACE INTO required_channels VALUES (?, ?, ?)",
+             (channel_id, channel_name, datetime.now().isoformat()))
+    bot.send_message(ADMIN_ID, f"<b>✅</b> {channel_id}")
+    user_states[user_id] = {}
+
+def handle_delete_channel(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    
+    channel_id = message.text.strip()
+    db.execute("DELETE FROM required_channels WHERE channel_id = ?", (channel_id,))
+    bot.send_message(ADMIN_ID, f"<b>✅</b> {channel_id}")
+    user_states[user_id] = {}
+
+def handle_block_user(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    
+    try:
+        target_user_id = int(message.text)
+        block_user(target_user_id)
+        bot.send_message(ADMIN_ID, f"<b>✅ حظر: {target_user_id}</b>")
+    except:
+        bot.send_message(ADMIN_ID, "<b>❌ معرف</b>")
+    user_states[user_id] = {}
+
+def handle_unblock_user(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    
+    try:
+        target_user_id = int(message.text)
+        unblock_user(target_user_id)
+        bot.send_message(ADMIN_ID, f"<b>✅ تم فك الحظر: {target_user_id}</b>")
+    except:
+        bot.send_message(ADMIN_ID, "<b>❌ معرف غير صحيح</b>")
+    user_states[user_id] = {}
+
+def handle_add_required_channel(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    
+    channel_id = None
+    channel_name = None
+    
+    if message.forward_from_chat:
+        channel_id = str(message.forward_from_chat.id)
+        channel_name = message.forward_from_chat.title
+    elif message.text and message.text.startswith("@"):
+        channel_id = message.text
+        channel_name = message.text[1:]
+    elif message.text and "t.me" in message.text:
+        parts = message.text.replace("https://", "").replace("http://", "").split("/")
+        channel_id = "@" + parts[-1]
+        channel_name = parts[-1]
+    
+    if channel_id:
+        try:
+            member = bot.get_chat_member(channel_id, bot.get_me().id)
+            if member.status in ['administrator', 'creator']:
+                existing = db.fetch_one(
+                    "SELECT channel_id FROM required_channels WHERE channel_id = ?",
+                    (channel_id,)
+                )
+                
+                if existing:
+                    keyboard = types.InlineKeyboardMarkup()
+                    keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
+                    bot.send_message(ADMIN_ID,
+                                   "<b>⚠️ القناة موجودة بالفعل في القنوات المطلوبة</b>",
+                                   reply_markup=keyboard)
+                else:
+                    db.execute(
+                        "INSERT INTO required_channels (channel_id, channel_name) VALUES (?, ?)",
+                        (channel_id, channel_name)
+                    )
+                    keyboard = types.InlineKeyboardMarkup()
+                    keyboard.add(types.InlineKeyboardButton("➕ إضافة أخرى", callback_data="add_required_channel"))
+                    keyboard.add(types.InlineKeyboardButton("📋 القنوات المطلوبة", callback_data="required_channels_manage"))
+                    keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
+                    
+                    bot.send_message(ADMIN_ID,
+                                   f"<b>✅ تمت إضافة القناة بنجاح!</b>\n\n"
+                                   f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                                   f"<b>📢 اسم القناة:</b> {channel_name}\n"
+                                   f"<b>🔗 المعرف:</b> {channel_id}\n\n"
+                                   f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                                   f"<i>ستكون الآن قناة مطلوبة للمستخدمين الجدد</i>",
+                                   reply_markup=keyboard)
+            else:
+                keyboard = types.InlineKeyboardMarkup()
+                keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
+                bot.send_message(ADMIN_ID,
+                               "<b>❌ البوت ليس مشرفاً في هذه القناة</b>\n\n"
+                               "<b>تأكد من:</b>\n"
+                               "• إضافة البوت كمشرف في القناة\n"
+                               "• إعطاء صلاحيات كافية للبوت",
+                               reply_markup=keyboard)
+        except Exception as e:
+            keyboard = types.InlineKeyboardMarkup()
+            keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
+            bot.send_message(ADMIN_ID,
+                           f"<b>❌ حدث خطأ في التحقق من القناة</b>\n\n"
+                           f"<b>الخطأ:</b> {str(e)[:50]}",
+                           reply_markup=keyboard)
+    else:
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
+        bot.send_message(ADMIN_ID,
+                       "<b>❌ لم أستطع قراءة معرف القناة</b>\n\n"
+                       "<b>تأكد من صيغة المعرف:</b>\n"
+                       "• @channel_name\n"
+                       "• t.me/channel_name\n"
+                       "• رابط كامل للقناة",
+                       reply_markup=keyboard)
+    
+    user_states[user_id] = {}
+
+def handle_search_user(message):
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    
+    search_query = message.text.strip()
+    
+    user = None
+    if search_query.isdigit():
+        user = db.fetch_one("SELECT user_id, username, first_name, joined_date, blocked FROM users WHERE user_id = ?", 
+                           (int(search_query),))
+    else:
+        user = db.fetch_one("SELECT user_id, username, first_name, joined_date, blocked FROM users WHERE username = ? OR first_name = ?",
+                           (search_query.replace("@", ""), search_query))
+    
+    keyboard = types.InlineKeyboardMarkup()
+    
+    if not user:
+        keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
+        bot.send_message(ADMIN_ID,
+                       f"<b>❌ لم يتم العثور على المستخدم</b>\n\n"
+                       f"<b>البحث عن:</b> {search_query}",
+                       reply_markup=keyboard)
+    else:
+        user_id_found, username, first_name, joined_date, blocked = user
+        
+        stats = get_user_stats(user_id_found)
+        
+        status_icon = "🚫" if blocked else "✅"
+        status_text = "محظور" if blocked else "نشط"
+        
+        info_text = (f"<b>👤 معلومات المستخدم</b>\n\n"
+                    f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                    f"<b>الاسم:</b> {first_name}\n"
+                    f"<b>اليوزر:</b> @{username}\n"
+                    f"<b>المعرف:</b> <code>{user_id_found}</code>\n"
+                    f"<b>تاريخ الانضمام:</b> {joined_date}\n"
+                    f"<b>الحالة:</b> {status_icon} {status_text}\n\n"
+                    f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                    f"<b>📊 الإحصائيات:</b>\n"
+                    f"🎰 المشاركات: {stats['participations']}\n"
+                    f"🏆 الفوز: {stats['wins']}\n"
+                    f"💰 الجائزة: {stats['prize_value']}")
+        
+        if blocked:
+            keyboard.add(types.InlineKeyboardButton("✅ فك الحظر", callback_data=f"quick_unblock:{user_id_found}"))
+        else:
+            keyboard.add(types.InlineKeyboardButton("🚫 حظر", callback_data=f"quick_block:{user_id_found}"))
+        
+        keyboard.add(types.InlineKeyboardButton("💬 إرسال رسالة", callback_data=f"quick_msg:{user_id_found}"))
+        keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
+        
+        bot.send_message(ADMIN_ID, info_text, reply_markup=keyboard)
+    
+    user_states[user_id] = {}
+
+def handle_view_roulette_channels(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    roulette_key = message.text.strip()
+    
+    roulette = db.fetch_one(
+        "SELECT id FROM roulettes WHERE roulette_key = ?",
+        (roulette_key,)
+    )
+    
+    if not roulette:
+        bot.send_message(ADMIN_ID, "<b>❌ لم يتم العثور على الروليت</b>")
+        user_states[ADMIN_ID] = {}
+        return
+    
+    roulette_id = roulette[0]
+    
+    channels = get_roulette_condition_channels(roulette_id)
+    
+    if not channels:
+        bot.send_message(ADMIN_ID, f"<b>📋 الروليت: {roulette_key}</b>\n\nلا توجد قنوات شرط")
+    else:
+        message_text = f"<b>📋 قنوات شرط الروليت: {roulette_key}</b>\n\n"
+        
+        for i, (ch_id, ch_name) in enumerate(channels, 1):
+            message_text += f"{i}. {ch_name}\n   <code>{ch_id}</code>\n\n"
+        
+        message_text += f"<b>الإجمالي:</b> {len(channels)} قناة"
+        
+        bot.send_message(ADMIN_ID, message_text)
+    
+    user_states[ADMIN_ID] = {}
 
 @bot.callback_query_handler(func=lambda call: call.data == "verify_subscription")
 def verify_subscription(call):
@@ -821,7 +1653,6 @@ def show_support(call):
             f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
             f"💡 <i>للمزيد من المساعدة، تواصل مع فريق الدعم</i>")
     
-    
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(types.InlineKeyboardButton("🔙 العودة", callback_data="back_to_main"))
     
@@ -843,795 +1674,6 @@ def link_channel(call):
                    "• رسالة من القناة",
                    reply_markup=keyboard)
 
-@bot.message_handler(content_types=['text'])
-def handle_text_message(message):
-    user_id = message.from_user.id
-    
-    if user_id not in user_states:
-        return
-    
-    state = user_states.get(user_id, {}).get("state")
-    
-    if state == "link_channel":
-        handle_link_channel(message)
-    elif state == "create_roulette_winners":
-        handle_winners_count(message)
-    elif state == "create_roulette_condition_channel":
-        handle_condition_channel(message)
-    elif state == "create_roulette_text":
-        handle_roulette_text(message)
-    elif state == "create_roulette_countdown":
-        handle_roulette_countdown(message)
-    elif state == "broadcast":
-        handle_broadcast(message)
-    elif state == "send_to_user_id":
-        handle_send_to_user_id(message)
-    elif state == "send_to_user_message":
-        handle_send_to_user_message(message)
-    elif state == "add_channel":
-        handle_add_channel(message)
-    elif state == "delete_channel":
-        handle_delete_channel(message)
-    elif state == "block_user":
-        handle_block_user(message)
-    elif state == "unblock_user":
-        handle_unblock_user(message)
-    elif state == "search_user":
-        handle_search_user(message)
-    elif state == "add_required_channel":
-        handle_add_required_channel(message)
-
-def handle_link_channel(message):
-    user_id = message.from_user.id
-    channel_id = None
-    channel_name = None
-    
-    if message.forward_from_chat:
-        channel_id = str(message.forward_from_chat.id)
-        channel_name = message.forward_from_chat.title
-    elif message.text and message.text.startswith("@"):
-        channel_id = message.text
-        channel_name = message.text[1:]
-    elif message.text and "t.me" in message.text:
-        parts = message.text.replace("https://", "").replace("http://", "").split("/")
-        channel_id = "@" + parts[-1]
-        channel_name = parts[-1]
-    
-    if channel_id:
-        try:
-            member = bot.get_chat_member(channel_id, bot.get_me().id)
-            if member.status in ['administrator', 'creator']:
-                # التحقق إذا كان المستخدم قد ربط القناة بالفعل
-                existing = db.fetch_one("SELECT channel_id FROM channels WHERE channel_id = ? AND owner_id = ?",
-                                      (channel_id, user_id))
-                
-                if existing:
-                    bot.send_message(user_id, "<b>❌ القناة مرتبطة بحسابك بالفعل</b>")
-                else:
-                    # إضافة القناة (مسموح بتكرار القناة لمستخدمين مختلفين بسبب المفتاح المركب)
-                    db.execute("INSERT INTO channels VALUES (?, ?, ?, ?)",
-                             (channel_id, channel_name, user_id, datetime.now().isoformat()))
-                    bot.send_message(user_id,
-                                   f"<b>✅ تم!</b>\n"
-                                   f"<b>📢</b> {channel_name}")
-                    
-                    keyboard = create_user_channels_keyboard(user_id)
-                    bot.send_message(user_id, "<b>📢 قنواتك:</b>",
-                                   reply_markup=keyboard)
-            else:
-                bot.send_message(user_id, "<b>❌ يجب أن تكون مشرفاً في القناة لربطها</b>")
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            bot.send_message(user_id, "<b>❌ خطأ</b>")
-    else:
-        bot.send_message(user_id, "<b>❌ فشل التعرف</b>")
-    
-    user_states[user_id] = {}
-
-def handle_winners_count(message):
-    user_id = message.from_user.id
-    message_id = user_states.get(user_id, {}).get("message_id")
-    
-    try:
-        winners_count = int(message.text)
-        if winners_count < 1:
-            error_msg = ("<b>❌ الرقم غير صحيح!</b>\n\n"
-                        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                        "<b>يجب إدخال رقم صحيح:</b>\n"
-                        "✅ الحد الأدنى: 1 فائز\n"
-                        "✅ يمكنك إدخال أي رقم تريده\n\n"
-                        "<b>مثال:</b>\n"
-                        "أرسل: 1 أو 2 أو 5 أو أكثر\n\n"
-                        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                        "<i>الرجاء إرسال الرقم مجدداً</i>")
-            if message_id:
-                try:
-                    bot.edit_message_text(error_msg, user_id, message_id)
-                except:
-                    bot.send_message(user_id, error_msg)
-            else:
-                bot.send_message(user_id, error_msg)
-        else:
-            user_states[user_id]["winners_count"] = winners_count
-            user_states[user_id]["state"] = "create_roulette_channel"
-            
-            channels = db.fetch_all("SELECT channel_id, channel_name FROM channels WHERE owner_id = ?",
-                                  (user_id,))
-            if not channels:
-                error_msg = "<b>❌ لا توجد قنوات</b>"
-                if message_id:
-                    try:
-                        bot.edit_message_text(error_msg, user_id, message_id)
-                    except:
-                        bot.send_message(user_id, error_msg)
-                else:
-                    bot.send_message(user_id, error_msg)
-                user_states[user_id] = {}
-            else:
-                keyboard = types.InlineKeyboardMarkup()
-                for ch_id, ch_name in channels:
-                    keyboard.add(types.InlineKeyboardButton(f"📢 {ch_name}",
-                                                           callback_data=f"roulette_channel:{ch_id}"))
-                
-                choice_message = (f"<b>✅ عدد الفائزين: {winners_count}</b>\n\n"
-                                "<b>📢 اختر القناة:</b>\n\n"
-                                "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                                "<b>القنوات المرتبطة بحسابك:</b>\n"
-                                "اضغط على القناة التي تريد استخدامها للروليت\n\n"
-                                "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                                "💡 <i>اختر قناة واحدة فقط من القائمة</i>")
-                
-                if message_id:
-                    try:
-                        bot.edit_message_text(choice_message, user_id, message_id, reply_markup=keyboard)
-                    except:
-                        sent = bot.send_message(user_id, choice_message, reply_markup=keyboard)
-                        user_states[user_id]["message_id"] = sent.message_id
-                else:
-                    sent = bot.send_message(user_id, choice_message, reply_markup=keyboard)
-                    user_states[user_id]["message_id"] = sent.message_id
-    except ValueError:
-        bot.send_message(user_id, "<b>❌ الرقم غير صحيح!</b>\n\n"
-                       "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                       "<b>المطلوب:</b>\n"
-                       "أرسل رقماً صحيحاً يمثل عدد الفائزين\n\n"
-                       "<b>أمثلة صحيحة:</b>\n"
-                       "• 1 (لاختيار فائز واحد)\n"
-                       "• 2 (لاختيار فائزين اثنين)\n"
-                       "• 5 (لاختيار 5 فائزين)\n\n"
-                       "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                       "<i>الرجاء إرسال رقماً صحيحاً فقط</i>")
-
-def handle_condition_channel(message):
-    user_id = message.from_user.id
-    channel_id = None
-    message_id = user_states.get(user_id, {}).get("message_id")
-    
-    if message.forward_from_chat:
-        channel_id = str(message.forward_from_chat.id)
-    elif message.text and message.text.startswith("@"):
-        channel_id = message.text
-    elif message.text and "t.me" in message.text:
-        parts = message.text.replace("https://", "").replace("http://", "").split("/")
-        channel_id = "@" + parts[-1]
-    
-    if channel_id:
-        try:
-            # Check if bot is admin in the channel
-            bot_member = bot.get_chat_member(channel_id, bot.get_me().id)
-            bot_is_admin = bot_member.status in ['administrator', 'creator']
-            
-            # Check if user is admin or owner in the channel
-            user_member = bot.get_chat_member(channel_id, user_id)
-            user_is_admin_or_owner = user_member.status in ['administrator', 'creator']
-            
-            if not bot_is_admin:
-                # Bot is not admin
-                error_message = ("<b>❌ البوت ليس ادمن في هذه القناة!</b>\n\n"
-                                "<b>الحل:</b>\n"
-                                "1️⃣ اذهب إلى القناة\n"
-                                "2️⃣ أضفني كمشرف (@RedFoxRouletteBot)\n"
-                                "3️⃣ أعطني صلاحية \"حذف الرسائل\"\n\n"
-                                "ثم أرسل لي معرف القناة مرة أخرى 🔄\n\n"
-                                "أو اختر قناة أخرى تكون ادمن فيها بالفعل")
-                if message_id:
-                    try:
-                        bot.edit_message_text(error_message, user_id, message_id)
-                    except:
-                        bot.send_message(user_id, error_message)
-                else:
-                    bot.send_message(user_id, error_message)
-            elif not user_is_admin_or_owner:
-                # User is not admin or owner
-                error_message = ("<b>❌ أنت لست ادمن أو مالك في هذه القناة!</b>\n\n"
-                                "<b>لا يمكنك إنشاء روليت لقناة لست مسؤول عنها</b>\n\n"
-                                "<b>الحل:</b>\n"
-                                "1️⃣ اختر قناة تكون ادمن أو مالك فيها\n"
-                                "2️⃣ أو اطلب من مالك القناة أن يضيفك كمشرف\n\n"
-                                "حاول مرة أخرى 🔄")
-                if message_id:
-                    try:
-                        bot.edit_message_text(error_message, user_id, message_id)
-                    except:
-                        bot.send_message(user_id, error_message)
-                else:
-                    bot.send_message(user_id, error_message)
-            else:
-                # Both bot and user are admin/owner
-                user_states[user_id]["condition_channel"] = channel_id
-                user_states[user_id]["state"] = "create_roulette_text"
-                
-                success_message = ("<b>✅ تم اختيار القناة بنجاح!</b>\n\n"
-                                  "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                                  "<b>📝 الخطوة التالية: إرسال نص الروليت</b>\n"
-                                  "اكتب النص الذي سيظهر مع الروليت\n\n"
-                                  "<b>💡 النقاط المهمة:</b>\n"
-                                  "✅ يمكنك استخدام:\n"
-                                  "   • <b>نص سميك</b>\n"
-                                  "   • <i>نص مائل</i>\n"
-                                  "   • <u>نص تحته خط</u>\n"
-                                  "   • <s>نص مشطوب</s>\n"
-                                  "   • <code>نص برمجي</code>\n"
-                                  "   • الرموز التعبيرية 😊\n\n"
-                                  "<b>❌ ممنوع:</b>\n"
-                                  "   • أي نوع من الروابط\n"
-                                  "   • روابط Telegram\n"
-                                  "   • روابط الويب\n\n"
-                                  "<b>📌 مثال نص جيد:</b>\n"
-                                  "<i>الفائز سيحصل على جائزة مميزة! 🎁</i>\n\n"
-                                  "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                                  "أرسل نص الروليت الآن:")
-                
-                if message_id:
-                    try:
-                        bot.edit_message_text(success_message, user_id, message_id)
-                    except:
-                        sent = bot.send_message(user_id, success_message)
-                        user_states[user_id]["message_id"] = sent.message_id
-                else:
-                    sent = bot.send_message(user_id, success_message)
-                    user_states[user_id]["message_id"] = sent.message_id
-        except Exception as e:
-            error_message = ("<b>❌ خطأ في التحقق من القناة</b>\n\n"
-                            "<b>تأكد من:</b>\n"
-                            "✅ أن معرف القناة صحيح\n"
-                            "✅ أنني ادمن في القناة\n"
-                            "✅ أنك منضم للقناة\n\n"
-                            "حاول مرة أخرى 🔄")
-            if message_id:
-                try:
-                    bot.edit_message_text(error_message, user_id, message_id)
-                except:
-                    bot.send_message(user_id, error_message)
-            else:
-                bot.send_message(user_id, error_message)
-    else:
-        error_message = ("<b>❌ لم أستطع قراءة معرف القناة</b>\n\n"
-                        "<b>طرق إرسال القناة:</b>\n"
-                        "1️⃣ أرسل اسم القناة: @channel_name\n"
-                        "2️⃣ أرسل رابط القناة: https://t.me/channel_name\n"
-                        "3️⃣ أعيد توجيه رسالة من القناة\n\n"
-                        "حاول مرة أخرى 🔄")
-        if message_id:
-            try:
-                bot.edit_message_text(error_message, user_id, message_id)
-            except:
-                bot.send_message(user_id, error_message)
-        else:
-            bot.send_message(user_id, error_message)
-
-def handle_roulette_text(message):
-    user_id = message.from_user.id
-    message_id = user_states.get(user_id, {}).get("message_id")
-    
-    if message.text and ("t.me" in message.text or "http" in message.text):
-        error_message = ("<b>❌ روابط ممنوعة!</b>\n\n"
-                       "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                       "<b>لماذا؟</b>\n"
-                       "النصوص التي تحتوي على روابط غير مسموحة في الروليت\n\n"
-                       "<b>المسموح به:</b>\n"
-                       "✅ النصوص العادية\n"
-                       "✅ النص السميك والمائل\n"
-                       "✅ الرموز التعبيرية\n\n"
-                       "<b>الممنوع:</b>\n"
-                       "❌ روابط Telegram (t.me)\n"
-                       "❌ روابط الويب (http://, https://)\n\n"
-                       "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                       "<i>أرسل نصاً بدون روابط</i>")
-        
-        if message_id:
-            try:
-                bot.edit_message_text(error_message, user_id, message_id)
-            except:
-                bot.send_message(user_id, error_message)
-        else:
-            bot.send_message(user_id, error_message)
-        return
-    
-    message_text = get_html_text(message) or f"محتوى {message.content_type}"
-    
-    # Save message text and move to countdown selection
-    user_states[user_id]["message_text"] = message_text
-    user_states[user_id]["state"] = "create_roulette_countdown"
-    
-    countdown_message = ("<b>⏱️ كم ثانية للعداد التنازلي؟</b>\n\n"
-                        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                        "<b>📝 اختر مدة العداد:</b>\n"
-                        "أرسل رقم يمثل عدد الثواني\n\n"
-                        "<b>✅ أمثلة:</b>\n"
-                        "• 10 ثواني (سريع)\n"
-                        "• 30 ثانية (متوسط)\n"
-                        "• 60 ثانية (بطيء)\n\n"
-                        "<b>💡 ملاحظة:</b>\n"
-                        "إذا أرسلت 10، سيكون العداد 10 ثواني\n"
-                        "إذا أرسلت 0 أو تركت فارغ، سيكون 10 ثواني افتراضي\n\n"
-                        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>")
-    
-    if message_id:
-        try:
-            bot.edit_message_text(countdown_message, user_id, message_id)
-        except:
-            sent = bot.send_message(user_id, countdown_message)
-            user_states[user_id]["message_id"] = sent.message_id
-    else:
-        sent = bot.send_message(user_id, countdown_message)
-        user_states[user_id]["message_id"] = sent.message_id
-
-def handle_roulette_countdown(message):
-    user_id = message.from_user.id
-    message_id = user_states.get(user_id, {}).get("message_id")
-    
-    try:
-        countdown = int(message.text) if message.text.isdigit() else 10
-        if countdown <= 0:
-            countdown = 10
-    except:
-        countdown = 10
-    
-    # Get all previous data
-    winners_count = user_states[user_id].get("winners_count")
-    channel_id = user_states[user_id].get("channel_id")
-    condition_channel = user_states[user_id].get("condition_channel")
-    message_text = user_states[user_id].get("message_text")
-    
-    if not all([winners_count, channel_id, condition_channel, message_text]):
-        error_message = "<b>❌ خطأ في البيانات</b>"
-        if message_id:
-            try:
-                bot.edit_message_text(error_message, user_id, message_id)
-            except:
-                bot.send_message(user_id, error_message)
-        else:
-            bot.send_message(user_id, error_message)
-        user_states[user_id] = {}
-        return
-    
-    # Create roulette with countdown
-    condition_channel_mention = f"@{condition_channel[1:]}" if condition_channel.startswith("@") else condition_channel
-    bot_link = get_bot_link()
-    roulette_key = generate_roulette_key()
-    
-    # استخدام النص كما هو بدون تغليف إضافي بـ bold
-    roulette_text = f"🎰 {message_text}\n\n"
-    roulette_text += f"<b>📋 الشروط:</b>\n"
-    roulette_text += f"🔗 يجب الاشتراك في: {condition_channel_mention}\n"
-    roulette_text += f"<b>🏆 عدد الفائزين:</b> {winners_count}\n"
-    roulette_text += f"<b>📊 المشاركون: 0</b>\n\n"
-    roulette_text += f'<a href="{bot_link}">🎰 Roulette RedFox</a>'
-    
-    keyboard = types.InlineKeyboardMarkup()
-    deeplink = f"https://t.me/{BOT_USERNAME}?start=verify_{roulette_key}"
-    reminder_deeplink = f"https://t.me/{BOT_USERNAME}?start=remind_{roulette_key}"
-    keyboard.row(types.InlineKeyboardButton("🎲 مشاركة بالروليت", url=deeplink),
-                 types.InlineKeyboardButton("🔔 ذكرني اذا فزت", url=reminder_deeplink))
-    keyboard.row(types.InlineKeyboardButton("⏸️ إيقاف الروليت", callback_data=f"pause:{roulette_key}"))
-    keyboard.add(types.InlineKeyboardButton("▶️ بدء الروليت", callback_data=f"start:{roulette_key}"))
-    
-    try:
-        sent_message = bot.send_message(channel_id, roulette_text, reply_markup=keyboard)
-        message_id_roulette = sent_message.message_id
-        
-        db.execute(
-            "INSERT INTO roulettes (roulette_key, creator_id, channel_id, condition_channel, winners_count, message_text, message_id, participants_count, status, created_date, winners, prize_text, end_date, channel_name, countdown_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (roulette_key, user_id, channel_id, condition_channel, winners_count, 
-             message_text, message_id_roulette, 0, "active", datetime.now().isoformat(), "", "", None, "", countdown)
-        )
-        
-        try:
-            # Get channel info
-            channel_info = db.fetch_one("SELECT channel_name FROM channels WHERE channel_id = ?", (channel_id,))
-            channel_name = channel_info[0] if channel_info else channel_id
-            
-            admin_msg = (f"<b>🎰 روليت جديدة!</b>\n\n"
-                       f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                       f"<b>👤 المنشئ:</b> @{message.from_user.username or 'Unknown'}\n"
-                       f"<b>📢 القناة:</b> {channel_name}\n"
-                       f"<b>📝 النص:</b> {message_text[:50]}...\n"
-                       f"<b>🏆 عدد الفائزين:</b> {winners_count}\n"
-                       f"<b>⏱️ مدة العداد:</b> {countdown} ثانية\n"
-                       f"<b>🕐 الوقت:</b> {datetime.now().strftime('%H:%M:%S')}\n\n"
-                       f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>")
-            bot.send_message(ADMIN_ID, admin_msg)
-        except:
-            pass
-        
-        # Edit the message with success confirmation and main menu
-        success_message = ("<b>✅ تم إنشاء الروليت بنجاح!</b>\n\n"
-                          "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-                          f"<b>🏆 عدد الفائزين:</b> {winners_count}\n"
-                          f"<b>⏱️ مدة العداد:</b> {countdown} ثانية\n"
-                          "<b>🟢 الحالة:</b> نشطة\n"
-                          "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                          "<b>🔗 تم نشر الروليت في القناة بنجاح!</b>\n\n"
-                          "<i>اختر ما الذي تريد أن تفعله بعد ذلك:</i>")
-        
-        main_keyboard = create_main_menu_keyboard(user_id)
-        
-        if message_id:
-            try:
-                bot.edit_message_text(success_message, user_id, message_id, reply_markup=main_keyboard)
-            except:
-                bot.send_message(user_id, success_message, reply_markup=main_keyboard)
-        else:
-            bot.send_message(user_id, success_message, reply_markup=main_keyboard)
-        
-        # Send confirmation message with roulette details
-        confirmation_message = (f"<b>📢 تم نشر روليتك!</b>\n\n"
-                               f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                               f"<b>🎰 عنوان الروليت:</b>\n{message_text}\n\n"
-                               f"<b>👥 المشاركون الجدد سيصل لك إشعار</b>\n"
-                               f"<b>🚫 يمكنك طرد أي مشارك من الروليت</b>\n\n"
-                               f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                               f"<i>اضغط على الإشعارات لإدارة المشاركين</i>")
-        bot.send_message(user_id, confirmation_message)
-    
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        error_message = "<b>❌ حدث خطأ في إنشاء الروليت</b>"
-        if message_id:
-            try:
-                bot.edit_message_text(error_message, user_id, message_id)
-            except:
-                bot.send_message(user_id, error_message)
-        else:
-            bot.send_message(user_id, error_message)
-    
-    user_states[user_id] = {}
-
-def handle_broadcast(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    
-    users = db.fetch_all("SELECT user_id FROM users WHERE blocked = 0")
-    
-    sent = 0
-    failed = 0
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
-    
-    message_id = message.message_id
-    from_chat_id = message.chat.id
-    reply_markup = message.reply_markup
-    
-    for user in users:
-        try:
-            # استخدام copy_message لنسخ الرسالة كما هي (نص، صورة، فيديو، ملف، ملصق..)
-            # مع الحفاظ على التنسيق والأزرار إذا وجدت
-            bot.copy_message(user[0], from_chat_id, message_id, reply_markup=reply_markup)
-            sent += 1
-            time.sleep(0.01)  # تأخير صغير لتجنب حد التقييد
-        except Exception as e:
-            failed += 1
-    
-    result_msg = (f"<b>✅ تم البث بنجاح!</b>\n\n"
-                 f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                 f"<b>📤 تم الإرسال لـ:</b> {sent} مستخدم\n"
-                 f"<b>❌ فشل:</b> {failed}\n"
-                 f"<b>📊 الإجمالي:</b> {sent + failed}\n\n"
-                 f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>")
-    
-    bot.send_message(ADMIN_ID, result_msg, reply_markup=keyboard)
-    user_states[user_id] = {}
-
-def handle_send_to_user_id(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    
-    try:
-        target_user_id = int(message.text)
-        
-        # التحقق من وجود المستخدم
-        user = db.fetch_one("SELECT user_id, username, first_name FROM users WHERE user_id = ?", (target_user_id,))
-        
-        if not user:
-            keyboard = types.InlineKeyboardMarkup()
-            keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
-            bot.send_message(user_id, 
-                           "<b>❌ المستخدم غير موجود</b>\n\n"
-                           "<b>تأكد من المعرف الصحيح وحاول مرة أخرى</b>",
-                           reply_markup=keyboard)
-            user_states[user_id] = {}
-            return
-        
-        user_states[user_id]["target_user_id"] = target_user_id
-        user_states[user_id]["target_username"] = user[1]
-        user_states[user_id]["state"] = "send_to_user_message"
-        
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("🔙 إلغاء", callback_data="back_to_admin"))
-        
-        bot.send_message(user_id,
-                       f"<b>💬 إرسال رسالة</b>\n\n"
-                       f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                       f"<b>المستخدم:</b> {user[2]} (@{user[1]})\n\n"
-                       f"<b>اكتب الرسالة التي تريد إرسالها:</b>",
-                       reply_markup=keyboard)
-    except ValueError:
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
-        bot.send_message(user_id,
-                       "<b>❌ معرف غير صحيح</b>\n\n"
-                       "<b>يجب أن يكون رقماً صحيحاً</b>",
-                       reply_markup=keyboard)
-
-def handle_send_to_user_message(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    
-    target_user_id = user_states[user_id].get("target_user_id")
-    target_username = user_states[user_id].get("target_username")
-    
-    try:
-        # إضافة توقيع الرسالة
-        signed_message = (f"{message.text}\n\n"
-                         f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-                         f"<i>رسالة من الإدارة 📢</i>")
-        
-        bot.send_message(target_user_id, signed_message)
-        
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("📢 بث جديد", callback_data="broadcast"),
-                     types.InlineKeyboardButton("💬 رسالة جديدة", callback_data="send_to_user"))
-        keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
-        
-        result_msg = (f"<b>✅ تم الإرسال بنجاح!</b>\n\n"
-                     f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                     f"<b>المستخدم:</b> @{target_username}\n"
-                     f"<b>المعرف:</b> <code>{target_user_id}</code>\n"
-                     f"<b>الحالة:</b> ✅ تم الإرسال\n\n"
-                     f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>")
-        
-        bot.send_message(user_id, result_msg, reply_markup=keyboard)
-    except Exception as e:
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
-        bot.send_message(user_id,
-                       f"<b>❌ فشل الإرسال</b>\n\n"
-                       f"<b>الخطأ:</b> {str(e)[:50]}",
-                       reply_markup=keyboard)
-    
-    user_states[user_id] = {}
-
-def handle_add_channel(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    
-    channel_id = message.text.strip()
-    channel_name = message.text.strip()
-    
-    db.execute("INSERT OR REPLACE INTO required_channels VALUES (?, ?, ?)",
-             (channel_id, channel_name, datetime.now().isoformat()))
-    bot.send_message(ADMIN_ID, f"<b>✅</b> {channel_id}")
-    user_states[user_id] = {}
-
-def handle_delete_channel(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    
-    channel_id = message.text.strip()
-    db.execute("DELETE FROM required_channels WHERE channel_id = ?", (channel_id,))
-    bot.send_message(ADMIN_ID, f"<b>✅</b> {channel_id}")
-    user_states[user_id] = {}
-
-def handle_block_user(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    
-    try:
-        target_user_id = int(message.text)
-        block_user(target_user_id)
-        bot.send_message(ADMIN_ID, f"<b>✅ حظر: {target_user_id}</b>")
-    except:
-        bot.send_message(ADMIN_ID, "<b>❌ معرف</b>")
-    user_states[user_id] = {}
-
-def handle_unblock_user(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    
-    try:
-        target_user_id = int(message.text)
-        unblock_user(target_user_id)
-        bot.send_message(ADMIN_ID, f"<b>✅ تم فك الحظر: {target_user_id}</b>")
-    except:
-        bot.send_message(ADMIN_ID, "<b>❌ معرف غير صحيح</b>")
-    user_states[user_id] = {}
-
-def handle_add_required_channel(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    
-    channel_id = None
-    channel_name = None
-    
-    if message.forward_from_chat:
-        channel_id = str(message.forward_from_chat.id)
-        channel_name = message.forward_from_chat.title
-    elif message.text and message.text.startswith("@"):
-        channel_id = message.text
-        channel_name = message.text[1:]
-    elif message.text and "t.me" in message.text:
-        parts = message.text.replace("https://", "").replace("http://", "").split("/")
-        channel_id = "@" + parts[-1]
-        channel_name = parts[-1]
-    
-    if channel_id:
-        try:
-            member = bot.get_chat_member(channel_id, bot.get_me().id)
-            if member.status in ['administrator', 'creator']:
-                # التحقق من عدم وجودها مسبقاً
-                existing = db.fetch_one(
-                    "SELECT channel_id FROM required_channels WHERE channel_id = ?",
-                    (channel_id,)
-                )
-                
-                if existing:
-                    keyboard = types.InlineKeyboardMarkup()
-                    keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
-                    bot.send_message(ADMIN_ID,
-                                   "<b>⚠️ القناة موجودة بالفعل في القنوات المطلوبة</b>",
-                                   reply_markup=keyboard)
-                else:
-                    db.execute(
-                        "INSERT INTO required_channels (channel_id, channel_name) VALUES (?, ?)",
-                        (channel_id, channel_name)
-                    )
-                    keyboard = types.InlineKeyboardMarkup()
-                    keyboard.add(types.InlineKeyboardButton("➕ إضافة أخرى", callback_data="add_required_channel"))
-                    keyboard.add(types.InlineKeyboardButton("📋 القنوات المطلوبة", callback_data="required_channels_manage"))
-                    keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
-                    
-                    bot.send_message(ADMIN_ID,
-                                   f"<b>✅ تمت إضافة القناة بنجاح!</b>\n\n"
-                                   f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                                   f"<b>📢 اسم القناة:</b> {channel_name}\n"
-                                   f"<b>🔗 المعرف:</b> {channel_id}\n\n"
-                                   f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                                   f"<i>ستكون الآن قناة مطلوبة للمستخدمين الجدد</i>",
-                                   reply_markup=keyboard)
-            else:
-                keyboard = types.InlineKeyboardMarkup()
-                keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
-                bot.send_message(ADMIN_ID,
-                               "<b>❌ البوت ليس مشرفاً في هذه القناة</b>\n\n"
-                               "<b>تأكد من:</b>\n"
-                               "• إضافة البوت كمشرف في القناة\n"
-                               "• إعطاء صلاحيات كافية للبوت",
-                               reply_markup=keyboard)
-        except Exception as e:
-            keyboard = types.InlineKeyboardMarkup()
-            keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
-            bot.send_message(ADMIN_ID,
-                           f"<b>❌ حدث خطأ في التحقق من القناة</b>\n\n"
-                           f"<b>الخطأ:</b> {str(e)[:50]}",
-                           reply_markup=keyboard)
-    else:
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
-        bot.send_message(ADMIN_ID,
-                       "<b>❌ لم أستطع قراءة معرف القناة</b>\n\n"
-                       "<b>تأكد من صيغة المعرف:</b>\n"
-                       "• @channel_name\n"
-                       "• t.me/channel_name\n"
-                       "• رابط كامل للقناة",
-                       reply_markup=keyboard)
-    
-    user_states[user_id] = {}
-
-def handle_search_user(message):
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    
-    search_query = message.text.strip()
-    
-    # البحث بالمعرف أو اليوزر
-    user = None
-    if search_query.isdigit():
-        user = db.fetch_one("SELECT user_id, username, first_name, joined_date, blocked FROM users WHERE user_id = ?", 
-                           (int(search_query),))
-    else:
-        user = db.fetch_one("SELECT user_id, username, first_name, joined_date, blocked FROM users WHERE username = ? OR first_name = ?",
-                           (search_query.replace("@", ""), search_query))
-    
-    keyboard = types.InlineKeyboardMarkup()
-    
-    if not user:
-        keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
-        bot.send_message(ADMIN_ID,
-                       f"<b>❌ لم يتم العثور على المستخدم</b>\n\n"
-                       f"<b>البحث عن:</b> {search_query}",
-                       reply_markup=keyboard)
-    else:
-        user_id_found, username, first_name, joined_date, blocked = user
-        
-        # الحصول على إحصائيات المستخدم
-        stats = get_user_stats(user_id_found)
-        
-        status_icon = "🚫" if blocked else "✅"
-        status_text = "محظور" if blocked else "نشط"
-        
-        info_text = (f"<b>👤 معلومات المستخدم</b>\n\n"
-                    f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                    f"<b>الاسم:</b> {first_name}\n"
-                    f"<b>اليوزر:</b> @{username}\n"
-                    f"<b>المعرف:</b> <code>{user_id_found}</code>\n"
-                    f"<b>تاريخ الانضمام:</b> {joined_date}\n"
-                    f"<b>الحالة:</b> {status_icon} {status_text}\n\n"
-                    f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                    f"<b>📊 الإحصائيات:</b>\n"
-                    f"🎰 المشاركات: {stats['participations']}\n"
-                    f"🏆 الفوز: {stats['wins']}\n"
-                    f"💰 الجائزة: {stats['prize_value']}")
-        
-        if blocked:
-            keyboard.add(types.InlineKeyboardButton("✅ فك الحظر", callback_data=f"quick_unblock:{user_id_found}"))
-        else:
-            keyboard.add(types.InlineKeyboardButton("🚫 حظر", callback_data=f"quick_block:{user_id_found}"))
-        
-        keyboard.add(types.InlineKeyboardButton("💬 إرسال رسالة", callback_data=f"quick_msg:{user_id_found}"))
-        keyboard.add(types.InlineKeyboardButton("🔙 عودة", callback_data="back_to_admin"))
-        
-        bot.send_message(ADMIN_ID, info_text, reply_markup=keyboard)
-    
-    user_states[user_id] = {}
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("quick_block:"))
-def quick_block_user(call):
-    if call.from_user.id != ADMIN_ID:
-        return
-    
-    target_user_id = int(call.data.split(":")[1])
-    block_user(target_user_id)
-    bot.answer_callback_query(call.id, "✅ تم الحظر", show_alert=True)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("quick_unblock:"))
-def quick_unblock_user(call):
-    if call.from_user.id != ADMIN_ID:
-        return
-    
-    target_user_id = int(call.data.split(":")[1])
-    unblock_user(target_user_id)
-    bot.answer_callback_query(call.id, "✅ تم فك الحظر", show_alert=True)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("quick_msg:"))
-def quick_send_message(call):
-    if call.from_user.id != ADMIN_ID:
-        return
-    
-    target_user_id = int(call.data.split(":")[1])
-    user_states[ADMIN_ID] = {"state": "send_to_user_message", "target_user_id": target_user_id}
-    bot.send_message(ADMIN_ID, "<b>اكتب الرسالة:</b>")
-
 @bot.callback_query_handler(func=lambda call: call.data.startswith("roulette_channel:"))
 def select_roulette_channel(call):
     user_id = call.from_user.id
@@ -1640,15 +1682,22 @@ def select_roulette_channel(call):
     
     user_states[user_id]["channel_id"] = channel_id
     user_states[user_id]["message_id"] = message_id
-    user_states[user_id]["state"] = "create_roulette_condition_channel"
+    user_states[user_id]["state"] = "create_roulette_condition_channels"
+    user_states[user_id]["condition_channels"] = []
     
-    condition_message = ("<b>🔗 قناة الشرط</b>\n\n"
-                        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                        "<b>✅ تم اختيار القناة</b>\n\n"
-                        "<b>الآن اختر قناة الشرط:</b>\n"
-                        "يجب أن يكون اشتراك المستخدم فيها\n\n"
-                        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                        "<i>أرسل معرف أو رابط القناة</i>")
+    condition_message = (
+        "<b>🔗 قنوات الشرط المتعددة</b>\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "<b>✅ تم اختيار قناة الروليت الرئيسية</b>\n\n"
+        "<b>📋 نظام القنوات المتعددة:</b>\n"
+        "• يمكنك إضافة حتى 10 قنوات كشروط اشتراك\n"
+        "• يجب على المشاركين الاشتراك في <b>جميع</b> القنوات\n"
+        "• يمكنك التوقف في أي وقت بإرسال /done\n\n"
+        "<b>🎯 القناة الأولى:</b>\n"
+        "أرسل معرف أو رابط القناة الأولى كشرط للاشتراك\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "<i>أرسل معرف القناة أو /done للانتهاء</i>"
+    )
     
     try:
         bot.edit_message_text(condition_message, user_id, message_id)
@@ -1724,7 +1773,6 @@ def back_to_main(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_panel_btn")
 def admin_panel_callback(call):
-    """فتح لوحة التحكم من زر القائمة الرئيسية"""
     user_id = call.from_user.id
     
     if user_id != ADMIN_ID:
@@ -1975,7 +2023,6 @@ def toggle_mandatory_subscription(call):
         reply_markup=keyboard
     )
     
-    # إضافة قائمة القنوات المطلوبة
     required = get_required_channels()
     if required:
         msg_text = (f"<b>✅ الاشتراك الإجباري</b>\n\n"
@@ -2046,7 +2093,6 @@ def cleanup_roulettes(call):
     if call.from_user.id != ADMIN_ID:
         return
     
-    # حذف الروليتات المنتهية من أكثر من يوم
     deleted = db.execute(
         "DELETE FROM roulettes WHERE status = 'finished' AND DATE(end_date) < DATE('now')"
     )
@@ -2066,7 +2112,6 @@ def refresh_statistics(call):
     if call.from_user.id != ADMIN_ID:
         return
     
-    # إعادة حساب الإحصائيات
     total_users = db.fetch_one("SELECT COUNT(*) FROM users")[0]
     total_roulettes = db.fetch_one("SELECT COUNT(*) FROM roulettes")[0]
     active_roulettes = db.fetch_one("SELECT COUNT(*) FROM roulettes WHERE status = 'active'")[0]
@@ -2088,28 +2133,6 @@ def refresh_statistics(call):
            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>")
     
     bot.send_message(ADMIN_ID, text, reply_markup=keyboard)
-
-@bot.callback_query_handler(func=lambda call: call.data == "bot_info")
-def show_bot_info(call):
-    if call.from_user.id != ADMIN_ID:
-        return
-    
-    stats = get_bot_statistics()
-    
-    text = (f"<b>ℹ️ معلومات البوت</b>\n\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"<b>🤖 اسم البوت:</b> @{BOT_USERNAME}\n"
-            f"<b>👨‍💻 المطور:</b> @RedFoxDev\n"
-            f"<b>🌐 البلد:</b> السعودية\n"
-            f"<b>📱 نسخة:</b> 1.0\n\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"<b>📊 الإحصائيات الحالية:</b>\n"
-            f"👥 المستخدمون: {stats['total_users']}\n"
-            f"🎰 الروليتات: {stats['total_roulettes']}\n"
-            f"🟢 النشطة: {stats['active_roulettes']}\n"
-            f"👨 المشاركون: {stats['total_participants']}")
-    
-    bot.send_message(ADMIN_ID, text)
 
 @bot.callback_query_handler(func=lambda call: call.data == "advanced_stats")
 def show_advanced_stats(call):
@@ -2165,14 +2188,17 @@ def start_search_user(call):
                    reply_markup=keyboard)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("verify:"))
-def verify_participant(call):
+def verify_participant_multi_channel(call):
     user_id = call.from_user.id
     parts = call.data.split(":")
     roulette_key = parts[1]
     selected_emoji = parts[2]
     correct_emoji = parts[3]
     
-    roulette = db.fetch_one("SELECT id, status FROM roulettes WHERE roulette_key = ?", (roulette_key,))
+    roulette = db.fetch_one(
+        "SELECT id, status FROM roulettes WHERE roulette_key = ?",
+        (roulette_key,)
+    )
     
     if not roulette:
         bot.answer_callback_query(call.id, "❌ حدث خطأ", show_alert=True)
@@ -2181,50 +2207,59 @@ def verify_participant(call):
     roulette_id, status = roulette
     
     if status != "active":
-        bot.answer_callback_query(call.id, "❌ انتهت الروليت أو بدأت بالفعل", show_alert=True)
+        bot.answer_callback_query(call.id, "❌ انتهت الروليت", show_alert=True)
         return
     
-    # Check if user is subscribed to the condition channel
-    roulette_data = db.fetch_one("SELECT condition_channel FROM roulettes WHERE id = ?", (roulette_id,))
-    if roulette_data:
-        condition_channel = roulette_data[0]
-        if not is_user_subscribed_to_channel(user_id, condition_channel):
-            channel_obj = None
-            try:
-                channel_obj = bot.get_chat(condition_channel)
-                link = f"https://t.me/{channel_obj.username}" if channel_obj.username else condition_channel
-            except:
-                link = condition_channel
-                
-            bot.answer_callback_query(call.id, "❌ يجب الاشتراك في قناة الشرط أولاً!", show_alert=True)
-            bot.send_message(user_id, 
-                           f"<b>⚠️ عذراً، يجب عليك الاشتراك في القناة التالية للمشاركة:</b>\n"
-                           f"📢 {link}\n\n"
-                           f"<i>بعد الاشتراك، حاول الضغط على زر المشاركة مرة أخرى</i>")
-            return
-
     if selected_emoji != correct_emoji:
         bot.answer_callback_query(call.id, "❌ إجابة خاطئة، حاول مرة أخرى", show_alert=True)
         
-        emojis = ["🎯", "⚽", "🎮"]
+        emojis = ["🎯", "⚽", "🎮", "🏀", "🎾", "⚾", "🏈", "🎳", "🏓", "🎲"]
         correct_emoji_new = random.choice(emojis)
         other_emojis = [e for e in emojis if e != correct_emoji_new]
         random.shuffle(other_emojis)
         
         keyboard = types.InlineKeyboardMarkup()
         buttons = [types.InlineKeyboardButton(emoji,
-                                             callback_data=f"verify:{roulette_key}:{emoji}:{correct_emoji_new}")
+                     callback_data=f"verify:{roulette_key}:{emoji}:{correct_emoji_new}")
                    for emoji in [correct_emoji_new] + other_emojis]
-        keyboard.row(*buttons)
+        keyboard.row(*buttons[:3])
+        keyboard.row(*buttons[3:6])
         
-        bot.edit_message_text(f"<b>🔐 تحقق من الهوية</b>\n\n"
-                            f"<b>اختر الرمز التالي:</b> <code>{correct_emoji_new}</code>\n\n"
-                            f"<b>حاول مرة أخرى</b>",
-                            user_id, call.message.message_id,
-                            reply_markup=keyboard)
+        bot.edit_message_text(
+            f"<b>🔐 تحقق من الهوية</b>\n\n"
+            f"<b>اختر الرمز التالي:</b> <code>{correct_emoji_new}</code>\n\n"
+            f"<b>حاول مرة أخرى</b>",
+            user_id, call.message.message_id,
+            reply_markup=keyboard
+        )
         return
     
     bot.answer_callback_query(call.id, "✅ إجابة صحيحة!")
+    
+    is_subscribed, missing_channels = check_user_subscription_all_channels(user_id, roulette_id)
+    
+    if not is_subscribed:
+        missing_message = (
+            "<b>❌ يجب الاشتراك في جميع القنوات أولاً</b>\n\n"
+            "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            "<b>القنوات المطلوبة:</b>\n"
+        )
+        
+        for i, (ch_id, ch_name) in enumerate(missing_channels, 1):
+            channel_link = f"https://t.me/{ch_id[1:]}" if ch_id.startswith("@") else ch_id
+            missing_message += f"{i}. <a href=\"{channel_link}\">{ch_name}</a>\n"
+        
+        missing_message += (
+            f"\n<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            f"<i>بعد الاشتراك في جميع القنوات، حاول مرة أخرى</i>"
+        )
+        
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("🔄 تحقق من الاشتراكات", 
+                     callback_data=f"check_subscription:{roulette_key}"))
+        
+        bot.edit_message_text(missing_message, user_id, call.message.message_id, reply_markup=keyboard)
+        return
     
     existing = db.fetch_one(
         "SELECT id FROM participants WHERE user_id = ? AND roulette_id = ?",
@@ -2238,11 +2273,12 @@ def verify_participant(call):
     username = call.from_user.username or "NoUsername"
     first_name = call.from_user.first_name or "User"
     
-    # Register participant automatically
     db.execute(
         "INSERT INTO participants VALUES (NULL, ?, ?, ?, ?, ?)",
         (user_id, roulette_id, username, first_name, datetime.now().isoformat())
     )
+    
+    participant_id = db.fetch_one("SELECT last_insert_rowid()")[0]
     
     update_user_stats(user_id, participations=1)
     
@@ -2251,108 +2287,143 @@ def verify_participant(call):
     db.execute("UPDATE roulettes SET participants_count = ? WHERE id = ?",
              (new_count, roulette_id))
     
-    roulette_info = db.fetch_one(
-        "SELECT creator_id, channel_id, message_id FROM roulettes WHERE id = ?",
-        (roulette_id,)
-    )
-    creator_id = roulette_info[0]
-    channel_id = roulette_info[1]
-    message_id = roulette_info[2]
+    channels = get_roulette_condition_channels(roulette_id)
+    for ch_id, ch_name in channels:
+        update_participant_channel_status(participant_id, roulette_id, ch_id, 1)
     
     try:
-        # Update message in channel with new participant count in real-time
-        roulette_data = db.fetch_one(
-            "SELECT message_text, condition_channel, winners_count FROM roulettes WHERE id = ?",
-            (roulette_id,)
+        creator_id = db.fetch_one("SELECT creator_id FROM roulettes WHERE id = ?", (roulette_id,))[0]
+        channel_info = db.fetch_one("SELECT channel_id FROM roulettes WHERE id = ?", (roulette_id,))[0]
+        
+        participant_message = (
+            f"<b>✅ مشارك جديد!</b>\n\n"
+            f"👤 <b>الاسم:</b> {first_name}\n"
+            f"🔗 <b>اليوزر:</b> @{username}\n"
+            f"🆔 <b>المعرف:</b> <code>{user_id}</code>\n"
+            f"📊 <b>إجمالي المشاركين:</b> {new_count}\n"
+            f"✅ <b>الحالة:</b> مشترك في جميع القنوات"
         )
-        message_text, condition_channel, winners_count = roulette_data
-        condition_channel_mention = f"@{condition_channel[1:]}" if condition_channel.startswith("@") else condition_channel
-        bot_link = get_bot_link()
-        
-        # استخدام النص كما هو للحفاظ على التنسيق
-        updated_text = f"🎰 {message_text}\n\n"
-        updated_text += f"<b>📋 الشروط:</b>\n"
-        updated_text += f"🔗 يجب الاشتراك في: {condition_channel_mention}\n"
-        updated_text += f"<b>🏆 عدد الفائزين:</b> {winners_count}\n"
-        updated_text += f"<b>📊 المشاركون: {new_count}</b>\n\n"
-        updated_text += f'<a href="{bot_link}">🎰 Roulette RedFox</a>'
         
         keyboard = types.InlineKeyboardMarkup()
-        deeplink = f"https://t.me/{BOT_USERNAME}?start=verify_{roulette_key}"
-        reminder_deeplink = f"https://t.me/{BOT_USERNAME}?start=remind_{roulette_key}"
-        keyboard.add(types.InlineKeyboardButton("🎲 مشاركة بالروليت", url=deeplink))
-        keyboard.add(types.InlineKeyboardButton("🔔 ذكرني اذا فزت", url=reminder_deeplink))
-        keyboard.add(types.InlineKeyboardButton("▶️ بدء الروليت", callback_data=f"start:{roulette_key}"))
-        
-        bot.edit_message_text(updated_text, channel_id, message_id, reply_markup=keyboard)
-    except:
-        pass
-    
-    try:
-        participant_message = (f"<b>✅ مشارك جديد!</b>\n\n"
-                             f"👤 <b>الاسم:</b> {first_name}\n"
-                             f"🔗 <b>اليوزر:</b> @{username}\n"
-                             f"🆔 <b>المعرف:</b> <code>{user_id}</code>\n"
-                             f"📊 <b>إجمالي المشاركين:</b> {new_count}")
-        
-        # Add buttons to view and remove participant
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("👁️ عرض المعلومات", callback_data=f"view_participant:{roulette_key}:{user_id}"),
-                     types.InlineKeyboardButton("🚫 طرد المشارك", callback_data=f"remove_participant:{roulette_key}:{user_id}"))
+        keyboard.add(
+            types.InlineKeyboardButton("👁️ عرض المعلومات", 
+                 callback_data=f"view_participant:{roulette_key}:{user_id}"),
+            types.InlineKeyboardButton("🚫 طرد المشارك", 
+                 callback_data=f"remove_participant:{roulette_key}:{user_id}")
+        )
         
         bot.send_message(creator_id, participant_message, reply_markup=keyboard)
-    except:
-        pass
+        
+        update_roulette_message(roulette_id, channel_info, new_count)
+        
+    except Exception as e:
+        logger.error(f"Error notifying creator: {e}")
     
-    # Send confirmation to user
-    bot.edit_message_text("<b>✅ تم التسجيل بنجاح!</b>\n\n"
-                         "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                         "🎉 <b>تهانينا على المشاركة!</b>\n\n"
-                         "✅ <b>تمت إضافتك</b> إلى قائمة المشاركين\n"
-                         "🔔 <b>سيتم إخطارك</b> عند إعلان الفائزين\n\n"
-                         "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                         "💡 <i>اترك البوت مفتوحاً لتلقي النتيجة</i>",
-                         user_id, call.message.message_id)
+    confirmation_message = (
+        "<b>✅ تم التسجيل بنجاح!</b>\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "🎉 <b>تمت إضافتك إلى الروليت</b>\n\n"
+        "✅ <b>أنت مشترك في جميع القنوات المطلوبة</b>\n"
+        "🔔 <b>سيتم إخطارك عند إعلان الفائزين</b>\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "💡 <i>حظاً موفقاً في الروليت!</i>"
+    )
+    
+    bot.edit_message_text(confirmation_message, user_id, call.message.message_id)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("remind:"))
-def set_reminder(call):
+def update_roulette_message(roulette_id, channel_id, participants_count):
+    try:
+        roulette = db.fetch_one(
+            "SELECT message_id, message_text, winners_count, countdown_seconds FROM roulettes WHERE id = ?",
+            (roulette_id,)
+        )
+        
+        if not roulette:
+            return
+        
+        message_id, message_text, winners_count, countdown = roulette
+        
+        channels = get_roulette_condition_channels(roulette_id)
+        
+        updated_text = f"🎰 {message_text}\n\n"
+        updated_text += f"<b>📋 شروط الاشتراك:</b>\n"
+        
+        for i, (ch_id, ch_name) in enumerate(channels, 1):
+            channel_mention = f"@{ch_id[1:]}" if ch_id.startswith("@") else ch_id
+            updated_text += f"{i}. 🔗 {channel_mention}\n"
+        
+        updated_text += f"\n<b>🏆 عدد الفائزين:</b> {winners_count}\n"
+        updated_text += f"<b>📊 المشاركون: {participants_count}</b>\n"
+        updated_text += f"<b>⏱️ وقت العد:</b> {countdown} ثانية\n\n"
+        updated_text += f'<a href="{get_bot_link()}">🎰 Roulette RedFox</a>'
+        
+        bot.edit_message_text(updated_text, channel_id, message_id)
+        
+    except Exception as e:
+        logger.error(f"Error updating roulette message: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("check_subscription:"))
+def check_subscription_callback(call):
     user_id = call.from_user.id
     roulette_key = call.data.split(":")[1]
     
-    roulette = db.fetch_one("SELECT id FROM roulettes WHERE roulette_key = ?", (roulette_key,))
+    roulette = db.fetch_one(
+        "SELECT id FROM roulettes WHERE roulette_key = ?",
+        (roulette_key,)
+    )
     
     if not roulette:
-        try:
-            bot.answer_callback_query(call.id, "❌ حدث خطأ", show_alert=True)
-        except:
-            pass
+        bot.answer_callback_query(call.id, "❌ الروليت غير موجودة", show_alert=True)
         return
     
-    existing = db.fetch_one("SELECT user_id FROM reminders WHERE user_id = ?", (user_id,))
+    roulette_id = roulette[0]
     
-    if existing:
-        db.execute("UPDATE reminders SET enabled = 1 WHERE user_id = ?", (user_id,))
+    is_subscribed, missing_channels = check_user_subscription_all_channels(user_id, roulette_id)
+    
+    if is_subscribed:
+        bot.answer_callback_query(call.id, "✅ أنت مشترك في جميع القنوات!", show_alert=True)
+        
+        emojis = ["🎯", "⚽", "🎮", "🏀", "🎾", "⚾", "🏈", "🎳", "🏓", "🎲"]
+        correct_emoji = random.choice(emojis)
+        other_emojis = [e for e in emojis if e != correct_emoji]
+        random.shuffle(other_emojis)
+        
+        keyboard = types.InlineKeyboardMarkup()
+        buttons = [types.InlineKeyboardButton(emoji,
+                     callback_data=f"verify:{roulette_key}:{emoji}:{correct_emoji}")
+                   for emoji in [correct_emoji] + other_emojis]
+        keyboard.row(*buttons[:3])
+        keyboard.row(*buttons[3:6])
+        
+        bot.edit_message_text(
+            f"<b>🔐 تحقق من الهوية</b>\n\n"
+            f"<b>اختر الرمز التالي:</b> <code>{correct_emoji}</code>\n\n"
+            f"<b>لديك محاولات غير محدودة</b>",
+            user_id, call.message.message_id,
+            reply_markup=keyboard
+        )
     else:
-        db.execute("INSERT INTO reminders VALUES (?, 1, ?)", (user_id, datetime.now().isoformat()))
-    
-    try:
-        bot.answer_callback_query(call.id)
-    except:
-        pass
-    
-    # Create deeplink to open bot with reminder confirmation
-    deeplink = f"https://t.me/{BOT_USERNAME}?start=reminder_{roulette_key}"
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🔔 تأكيد", url=deeplink))
-    
-    try:
-        bot.send_message(user_id,
-                       f"<b>🔔 تفعيل الإشعارات</b>\n\n"
-                       f"<b>اضغط على الزر لتأكيد تفعيل الإشعارات:</b>",
-                       reply_markup=keyboard)
-    except Exception as e:
-        logger.warning(f"Could not send reminder confirmation to user {user_id}: {e}")
+        missing_message = (
+            "<b>❌ ما زلت غير مشترك في بعض القنوات</b>\n\n"
+            "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            "<b>القنوات المطلوبة:</b>\n"
+        )
+        
+        for i, (ch_id, ch_name) in enumerate(missing_channels, 1):
+            channel_link = f"https://t.me/{ch_id[1:]}" if ch_id.startswith("@") else ch_id
+            missing_message += f"{i}. <a href=\"{channel_link}\">{ch_name}</a>\n"
+        
+        missing_message += (
+            f"\n<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            f"<i>بعد الاشتراك في جميع القنوات، اضغط على الزر أدناه</i>"
+        )
+        
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("🔄 تحقق مرة أخرى", 
+                     callback_data=f"check_subscription:{roulette_key}"))
+        
+        bot.edit_message_text(missing_message, user_id, call.message.message_id, reply_markup=keyboard)
+        bot.answer_callback_query(call.id, "❌ ما زالت هناك قنوات مفقودة", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("remove_participant:"))
 def remove_participant(call):
@@ -2361,7 +2432,6 @@ def remove_participant(call):
     roulette_key = parts[1]
     participant_id = int(parts[2])
     
-    # Verify that the user is the creator
     roulette = db.fetch_one(
         "SELECT id, creator_id, participants_count FROM roulettes WHERE roulette_key = ?",
         (roulette_key,)
@@ -2377,13 +2447,11 @@ def remove_participant(call):
         bot.answer_callback_query(call.id, "❌ أنت لست منشئ الروليت", show_alert=True)
         return
     
-    # Remove participant
     db.execute(
         "DELETE FROM participants WHERE user_id = ? AND roulette_id = ?",
         (participant_id, roulette_id)
     )
     
-    # Update participants count
     new_count = max(0, participants_count - 1)
     db.execute(
         "UPDATE roulettes SET participants_count = ? WHERE id = ?",
@@ -2392,7 +2460,6 @@ def remove_participant(call):
     
     bot.answer_callback_query(call.id, "✅ تم طرد المشارك", show_alert=True)
     
-    # Notify the removed participant
     try:
         bot.send_message(
             participant_id,
@@ -2404,7 +2471,6 @@ def remove_participant(call):
     except:
         pass
     
-    # Update the notification message
     try:
         bot.edit_message_reply_markup(
             user_id,
@@ -2421,7 +2487,6 @@ def view_participant_info(call):
     roulette_key = parts[1]
     participant_id = int(parts[2])
     
-    # Verify that the user is the creator
     roulette = db.fetch_one(
         "SELECT id, creator_id FROM roulettes WHERE roulette_key = ?",
         (roulette_key,)
@@ -2437,7 +2502,6 @@ def view_participant_info(call):
         bot.answer_callback_query(call.id, "❌ أنت لست منشئ الروليت", show_alert=True)
         return
     
-    # Get participant info
     participant = db.fetch_one(
         "SELECT username, first_name, joined_date FROM participants WHERE user_id = ? AND roulette_id = ?",
         (participant_id, roulette_id)
@@ -2473,7 +2537,6 @@ def pause_roulette(call):
     chat_id = message.chat.id
     message_id = message.message_id
     
-    # Get roulette info
     roulette = db.fetch_one(
         "SELECT id, creator_id, status FROM roulettes WHERE roulette_key = ?",
         (roulette_key,)
@@ -2493,29 +2556,22 @@ def pause_roulette(call):
         bot.answer_callback_query(call.id, "⚠️ الروليت موقوفة بالفعل", show_alert=True)
         return
     
-    # Update status to paused
     db.execute("UPDATE roulettes SET status = ? WHERE id = ?", ("paused", roulette_id))
     
     bot.answer_callback_query(call.id, "⏸️ تم إيقاف الروليت", show_alert=True)
     
-    # Update message to reflect paused status
     try:
-        # Get current message text
         roulette_data = db.fetch_one(
-            "SELECT message_text, condition_channel, winners_count, participants_count FROM roulettes WHERE id = ?",
+            "SELECT message_text, participants_count, winners_count FROM roulettes WHERE id = ?",
             (roulette_id,)
         )
-        message_text, condition_channel, winners_count, participants_count = roulette_data
-        condition_channel_mention = f"@{condition_channel[1:]}" if condition_channel.startswith("@") else condition_channel
-        bot_link = get_bot_link()
+        message_text, participants_count, winners_count = roulette_data
         
         updated_text = f"<b>🎰 {message_text}</b>\n\n"
-        updated_text += f"<b>📋 الشروط:</b>\n"
-        updated_text += f"🔗 يجب الاشتراك في: {condition_channel_mention}\n"
-        updated_text += f"<b>🏆 عدد الفائزين:</b> {winners_count}\n"
         updated_text += f"<b>📊 المشاركون: {participants_count}</b>\n"
+        updated_text += f"<b>🏆 عدد الفائزين:</b> {winners_count}\n"
         updated_text += f"<b>🟡 الحالة: موقوفة</b>\n\n"
-        updated_text += f'<a href="{bot_link}">🎰 Roulette RedFox</a>'
+        updated_text += f'<a href="{get_bot_link()}">🎰 Roulette RedFox</a>'
         
         keyboard = types.InlineKeyboardMarkup()
         deeplink = f"https://t.me/{BOT_USERNAME}?start=verify_{roulette_key}"
@@ -2537,7 +2593,6 @@ def resume_roulette(call):
     chat_id = message.chat.id
     message_id = message.message_id
     
-    # Get roulette info
     roulette = db.fetch_one(
         "SELECT id, creator_id, status FROM roulettes WHERE roulette_key = ?",
         (roulette_key,)
@@ -2557,28 +2612,21 @@ def resume_roulette(call):
         bot.answer_callback_query(call.id, "⚠️ الروليت ليست موقوفة", show_alert=True)
         return
     
-    # Update status back to active
     db.execute("UPDATE roulettes SET status = ? WHERE id = ?", ("active", roulette_id))
     
     bot.answer_callback_query(call.id, "▶️ تم استئناف الروليت", show_alert=True)
     
-    # Update message to reflect resumed status
     try:
-        # Get current message text
         roulette_data = db.fetch_one(
-            "SELECT message_text, condition_channel, winners_count, participants_count FROM roulettes WHERE id = ?",
+            "SELECT message_text, participants_count, winners_count FROM roulettes WHERE id = ?",
             (roulette_id,)
         )
-        message_text, condition_channel, winners_count, participants_count = roulette_data
-        condition_channel_mention = f"@{condition_channel[1:]}" if condition_channel.startswith("@") else condition_channel
-        bot_link = get_bot_link()
+        message_text, participants_count, winners_count = roulette_data
         
         updated_text = f"<b>🎰 {message_text}</b>\n\n"
-        updated_text += f"<b>📋 الشروط:</b>\n"
-        updated_text += f"🔗 يجب الاشتراك في: {condition_channel_mention}\n"
-        updated_text += f"<b>🏆 عدد الفائزين:</b> {winners_count}\n"
-        updated_text += f"<b>📊 المشاركون: {participants_count}</b>\n\n"
-        updated_text += f'<a href="{bot_link}">🎰 Roulette RedFox</a>'
+        updated_text += f"<b>📊 المشاركون: {participants_count}</b>\n"
+        updated_text += f"<b>🏆 عدد الفائزين:</b> {winners_count}\n\n"
+        updated_text += f'<a href="{get_bot_link()}">🎰 Roulette RedFox</a>'
         
         keyboard = types.InlineKeyboardMarkup()
         deeplink = f"https://t.me/{BOT_USERNAME}?start=verify_{roulette_key}"
@@ -2591,7 +2639,6 @@ def resume_roulette(call):
         bot.edit_message_text(updated_text, chat_id, message_id, reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Error updating resumed roulette: {e}")
-
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("start:"))
 def start_roulette(call):
@@ -2618,13 +2665,11 @@ def start_roulette(call):
         bot.answer_callback_query(call.id, "❌ الروليت ليست نشطة", show_alert=True)
         return
     
-    # التحقق من الصلاحيات: المالك أو أي أدمن في القناة
     is_allowed = False
     if user_id == creator_id:
         is_allowed = True
     else:
         try:
-            # التحقق مما إذا كان المستخدم أدمن في القناة
             chat_member = bot.get_chat_member(channel_id, user_id)
             if chat_member.status in ['administrator', 'creator']:
                 is_allowed = True
@@ -2673,12 +2718,10 @@ def start_roulette(call):
     winners_text = ""
     winners_list = []
     
-    # Get channel info for winners notification
     channel_info = db.fetch_one("SELECT channel_id, channel_name FROM roulettes WHERE id = ?", (roulette_id,))
     channel_id_from_db = channel_info[0]
     channel_name = channel_info[1] or "القناة"
     
-    # Try to get channel link
     try:
         channel_obj = bot.get_chat(channel_id_from_db)
         channel_link = f"https://t.me/{channel_obj.username}" if channel_obj.username else None
@@ -2739,7 +2782,6 @@ def start_roulette(call):
     except Exception as e:
         logger.error(f"Error sending winners list: {e}")
 
-    # حذف رسالة الروليت الأصلية (التي تحتوي على زر الانضمام)
     try:
         bot.delete_message(chat_id, message.message_id)
     except Exception as e:
@@ -2751,495 +2793,53 @@ def owner_button_callback(call):
         return
     bot.answer_callback_query(call.id, "👑 مرحبًا أيها المالك! هذا الزر خاص بك فقط", show_alert=True)
 
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# 📊 STATISTICS & ANALYTICS SECTION
-# ═════════════════════════════════════════════════════════════════════════════════
-
-def get_bot_statistics():
-    """جلب إحصائيات البوت الشاملة"""
-    total_users = len(db.fetch_all("SELECT user_id FROM users") or [])
-    total_roulettes = len(db.fetch_all("SELECT id FROM roulettes") or [])
-    active_roulettes = len(db.fetch_all("SELECT id FROM roulettes WHERE status = 'active'") or [])
-    finished_roulettes = len(db.fetch_all("SELECT id FROM roulettes WHERE status = 'finished'") or [])
-    total_participants = len(db.fetch_all("SELECT id FROM participants") or [])
+@bot.callback_query_handler(func=lambda call: call.data.startswith("quick_block:"))
+def quick_block_user(call):
+    if call.from_user.id != ADMIN_ID:
+        return
     
-    return {
-        "total_users": total_users,
-        "total_roulettes": total_roulettes,
-        "active_roulettes": active_roulettes,
-        "finished_roulettes": finished_roulettes,
-        "total_participants": total_participants
-    }
+    target_user_id = int(call.data.split(":")[1])
+    block_user(target_user_id)
+    bot.answer_callback_query(call.id, "✅ تم الحظر", show_alert=True)
 
-def get_top_users(limit=10):
-    """الحصول على أفضل المستخدمين"""
-    return db.fetch_all(
-        "SELECT u.user_id, u.first_name, s.wins, s.participations FROM users u "
-        "JOIN user_stats s ON u.user_id = s.user_id "
-        "ORDER BY s.wins DESC LIMIT ?",
-        (limit,)
-    )
-
-def get_user_ranking(user_id):
-    """الحصول على ترتيب المستخدم"""
-    result = db.fetch_one(
-        "SELECT COUNT(*) + 1 FROM user_stats WHERE wins > "
-        "(SELECT wins FROM user_stats WHERE user_id = ?)",
-        (user_id,)
-    )
-    return result[0] if result else None
-
-def get_recent_roulettes(limit=5):
-    """الحصول على آخر الروليتات"""
-    return db.fetch_all(
-        "SELECT id, roulette_key, message_text, created_date, status FROM roulettes "
-        "ORDER BY created_date DESC LIMIT ?",
-        (limit,)
-    )
-
-def format_statistics_message(user_id):
-    """تنسيق رسالة الإحصائيات"""
-    stats = get_user_stats(user_id)
-    ranking = get_user_ranking(user_id)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("quick_unblock:"))
+def quick_unblock_user(call):
+    if call.from_user.id != ADMIN_ID:
+        return
     
-    message = (
-        "<b>📊 إحصائياتي</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        f"🎰 <b>المشاركات:</b> {stats['participations']}\n"
-        f"🏆 <b>الفوز:</b> {stats['wins']}\n"
-        f"📈 <b>معدل الفوز:</b> {(stats['wins']/max(stats['participations'],1)*100):.1f}%\n"
-        f"🥇 <b>الترتيب:</b> #{ranking or 'غير مصنف'}\n"
-        f"💰 <b>قيمة الجوائز:</b> {stats['prize_value']}\n\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-    )
+    target_user_id = int(call.data.split(":")[1])
+    unblock_user(target_user_id)
+    bot.answer_callback_query(call.id, "✅ تم فك الحظر", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("quick_msg:"))
+def quick_send_message(call):
+    if call.from_user.id != ADMIN_ID:
+        return
     
-    if stats['last_participation']:
-        last_date = datetime.fromisoformat(stats['last_participation'])
-        message += f"⏰ <b>آخر مشاركة:</b> {last_date.strftime('%d/%m/%Y %H:%M')}\n"
-    
-    return message
+    target_user_id = int(call.data.split(":")[1])
+    user_states[ADMIN_ID] = {"state": "send_to_user_message", "target_user_id": target_user_id}
+    bot.send_message(ADMIN_ID, "<b>اكتب الرسالة:</b>")
 
-# ═════════════════════════════════════════════════════════════════════════════════
-# 🎮 ADVANCED ROULETTE FEATURES
-# ═════════════════════════════════════════════════════════════════════════════════
-
-def create_roulette_description(winners_count, condition_channel, countdown_seconds):
-    """إنشاء وصف مفصل للروليت"""
-    description = (
-        "<b>📋 تفاصيل الروليت</b>\n\n"
-        f"🏆 <b>عدد الفائزين:</b> {winners_count}\n"
-        f"📢 <b>الشرط:</b> الاشتراك في {condition_channel}\n"
-        f"⏱️ <b>وقت العد:</b> {countdown_seconds} ثواني\n"
-    )
-    return description
-
-def validate_roulette_input(winners_count, message_text):
-    """التحقق من صحة بيانات الروليت"""
-    if not isinstance(winners_count, int) or winners_count < 1:
-        return False, "عدد الفائزين يجب أن يكون رقم موجب"
-    
-    if not message_text or len(message_text) < 3:
-        return False, "النص يجب أن يكون على الأقل 3 أحرف"
-    
-    if len(message_text) > 500:
-        return False, "النص طويل جداً (الحد الأقصى 500 حرف)"
-    
-    return True, "صحيح"
-
-def create_roulette_animation(countdown_seconds):
-    """إنشاء رسالة الاستعداد"""
-    message = (
-        f"<b>⏱️ جاري التحضير...</b>\n\n"
-        f"<b>العد التنازلي:</b> {countdown_seconds} ثانية\n\n"
-        f"🎲 جاري اختيار الفائزين..."
-    )
-    return message
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# 🔐 SECURITY & VALIDATION SECTION
-# ═════════════════════════════════════════════════════════════════════════════════
-
-def is_valid_channel_id(channel_id):
-    """التحقق من صحة معرف القناة"""
-    try:
-        if channel_id.startswith("@"):
-            return len(channel_id) > 1
-        return channel_id.lstrip("-").isdigit()
-    except:
-        return False
-
-def sanitize_text(text):
-    """تنظيف النص من الأحرف الخطرة"""
-    dangerous_chars = ["<script>", "</script>", "javascript:"]
-    for char in dangerous_chars:
-        text = text.replace(char, "")
-    return text
-
-def rate_limit_check(user_id, action, limit=5, timeframe=60):
-    """التحقق من تجاوز الحد الأقصى للطلبات"""
-    key = f"rate_{user_id}_{action}"
-    count = 0  # يمكن تحسينها باستخدام cache
-    return count < limit
-
-def validate_user_permissions(user_id, action):
-    """التحقق من صلاحيات المستخدم"""
-    if user_id == ADMIN_ID:
-        return True
-    
-    if action == "create_roulette":
-        return not is_user_blocked(user_id)
-    
-    if action == "participate":
-        return not is_user_blocked(user_id)
-    
-    return False
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# 📧 NOTIFICATION & MESSAGING SYSTEM
-# ═════════════════════════════════════════════════════════════════════════════════
-
-def create_notification(user_id, message):
-    """إنشاء إشعار للمستخدم"""
-    db.execute(
-        "INSERT INTO notifications (user_id, message, created_date) VALUES (?, ?, ?)",
-        (user_id, message, datetime.now().isoformat())
-    )
-
-def send_notification(user_id, title, message, include_button=False):
-    """إرسال إشعار للمستخدم"""
-    notification = (
-        f"<b>{title}</b>\n\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        f"{message}\n\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-    )
-    
-    keyboard = None
-    if include_button:
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("✅ تم الفهم", callback_data="dismiss_notification"))
-    
-    try:
-        bot.send_message(user_id, notification, reply_markup=keyboard)
-    except Exception as e:
-        logger.error(f"Error sending notification: {e}")
-
-def send_bulk_notification(user_ids, title, message):
-    """إرسال إشعار جماعي"""
-    sent = 0
-    failed = 0
-    
-    for user_id in user_ids:
-        try:
-            send_notification(user_id, title, message)
-            sent += 1
-            time.sleep(0.02)  # تجنب التقييد
-        except Exception as e:
-            logger.error(f"Failed to notify {user_id}: {e}")
-            failed += 1
-    
-    return sent, failed
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# 📱 USER ENGAGEMENT & EXPERIENCE
-# ═════════════════════════════════════════════════════════════════════════════════
-
-def get_welcome_message():
-    """رسالة الترحيب المخصصة"""
-    message = (
-        "<b>🎰 أهلاً وسهلاً في Roulette RedFox!</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "🎯 <b>أهدافنا:</b>\n"
-        "✅ توفير تجربة روليت آمنة وموثوقة\n"
-        "✅ اختيار فائزين عشوائي 100%\n"
-        "✅ إدارة احترافية للجوائز\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "💡 <b>كيف تبدأ؟</b>\n"
-        "1️⃣ انقر على 'روليت جديد'\n"
-        "2️⃣ حدد عدد الفائزين\n"
-        "3️⃣ اختر القناة المشروطة\n"
-        "4️⃣ أضف نص الروليت\n"
-        "5️⃣ حدد مدة العد التنازلي\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "🔒 <b>السلامة:</b>\n"
-        "• بيانات آمنة محمية\n"
-        "• اختيار عشوائي تام\n"
-        "• تحقق من الاشتراكات تلقائياً\n\n"
-        "❓ <b>تحتاج مساعدة؟</b>\n"
-        "اتصل بفريق الدعم: @" + BOT_USERNAME
-    )
-    return message
-
-def get_help_message():
-    """رسالة المساعدة الشاملة"""
-    message = (
-        "<b>❓ مركز المساعدة</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "<b>🎰 كيف أنشئ روليت جديد؟</b>\n"
-        "1. انقر على زر 'روليت جديد'\n"
-        "2. حدد عدد الفائزين\n"
-        "3. اختر القناة المشروطة\n"
-        "4. أضف نص الروليت\n"
-        "5. اختر مدة العد التنازلي\n\n"
-        "<b>🏆 كيف أربح الجوائز؟</b>\n"
-        "1. ابحث عن روليت\n"
-        "2. اشترك بالقناة المطلوبة\n"
-        "3. اضغط على زر المشاركة\n"
-        "4. تحقق من الهوية\n"
-        "5. انتظر النتيجة!\n\n"
-        "<b>⏱️ ماذا يعني العد التنازلي؟</b>\n"
-        "هو عدد الثواني قبل اختيار الفائزين\n"
-        "افتراضياً 10 ثواني\n\n"
-        "<b>❌ لماذا لا أستطيع المشاركة؟</b>\n"
-        "• ربما لم تشترك في القناة\n"
-        "• ربما انتهت الروليت\n"
-        "• ربما تشارك بالفعل\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        "📞 تواصل مع الدعم: @" + BOT_USERNAME
-    )
-    return message
-
-def get_about_message():
-    """رسالة حول البوت"""
-    message = (
-        "<b>ℹ️ حول Roulette RedFox</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "<b>🤖 معلومات البوت:</b>\n"
-        "• الاسم: Roulette RedFox\n"
-        "• الإصدار: 2.0.0\n"
-        "• المنصة: Telegram\n"
-        "• اللغة: العربية\n\n"
-        "<b>🎯 المزايا الرئيسية:</b>\n"
-        "✨ إنشاء روليت احترافي\n"
-        "✨ اختيار فائزين عشوائي\n"
-        "✨ إدارة اشتراكات تلقائية\n"
-        "✨ تقارير وإحصائيات\n"
-        "✨ نظام إشعارات متقدم\n"
-        "✨ لوحة تحكم للمسؤولين\n\n"
-        "<b>🌟 إحصائيات البوت:</b>\n"
-    )
-    
-    stats = get_bot_statistics()
-    message += (
-        f"👥 المستخدمين: {stats['total_users']}\n"
-        f"🎰 إجمالي الروليتات: {stats['total_roulettes']}\n"
-        f"🟢 روليتات نشطة: {stats['active_roulettes']}\n"
-        f"🏆 روليتات منتهية: {stats['finished_roulettes']}\n\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-        f"📧 البريد الإلكتروني: support@redfox.bot\n"
-        f"🌐 الموقع: www.redfox-roulette.com\n"
-        f"📱 تطبيق الجوال: قريباً\n"
-    )
-    
-    return message
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# 🛠️ UTILITY & HELPER FUNCTIONS
-# ═════════════════════════════════════════════════════════════════════════════════
-
-def get_bot_link():
-    """الحصول على رابط البوت"""
-    return f"https://t.me/{BOT_USERNAME}"
-
-def escape_html(text):
-    """تجنب أحرف HTML"""
-    replacements = {
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;"
-    }
-    for char, replacement in replacements.items():
-        text = text.replace(char, replacement)
-    return text
-
-def format_timestamp(timestamp_str):
-    """تنسيق الطابع الزمني"""
-    try:
-        dt = datetime.fromisoformat(timestamp_str)
-        return dt.strftime("%d/%m/%Y %H:%M:%S")
-    except:
-        return "غير متوفر"
-
-def get_user_info(user_id):
-    """الحصول على معلومات المستخدم"""
-    return db.fetch_one(
-        "SELECT username, first_name, joined_date, total_participations, total_wins FROM users WHERE user_id = ?",
-        (user_id,)
-    )
-
-def get_roulette_info(roulette_key):
-    """الحصول على معلومات الروليت"""
-    return db.fetch_one(
-        "SELECT id, message_text, winners_count, status, created_date, participants_count FROM roulettes WHERE roulette_key = ?",
-        (roulette_key,)
-    )
-
-def calculate_roulette_progress(roulette_id):
-    """حساب تقدم الروليت"""
-    roulette = db.fetch_one("SELECT winners_count FROM roulettes WHERE id = ?", (roulette_id,))
-    participants = db.fetch_all("SELECT COUNT(*) FROM participants WHERE roulette_id = ?", (roulette_id,))
-    
-    if roulette and participants:
-        winners_needed = roulette[0]
-        total_participants = participants[0][0]
-        percentage = (total_participants / max(winners_needed, 1)) * 100
-        return min(percentage, 100)
-    return 0
-
-def format_countdown_display(seconds):
-    """تنسيق عرض العد التنازلي"""
-    if seconds > 60:
-        minutes = seconds // 60
-        secs = seconds % 60
-        return f"{minutes}:{secs:02d}"
-    return f"00:{seconds:02d}"
-
-@bot.callback_query_handler(func=lambda call: True)
-def dummy_callback(call):
-    bot.answer_callback_query(call.id)
-
-print("\n" + "="*60)
-print("Bot RedFox Roulette is running now!")
-print("="*60)
-print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-print("="*60 + "\n")
-
-def run_bot_with_retry():
-    retry_count = 0
-    max_retries = 3
-    consecutive_409_errors = 0
-    
-    while retry_count < max_retries:
-        try:
-            print("[INFO] Starting bot polling...")
-            bot.infinity_polling(timeout=15, long_polling_timeout=15, interval=0)
-            break
-            
-        except KeyboardInterrupt:
-            print("\n[INFO] Bot stopped by user")
-            try:
-                bot.stop_polling()
-            except:
-                pass
-            break
-            
-        except Exception as e:
-            error_msg = str(e)
-            
-            # Handle Error 409 - Multiple instances
-            if "409" in error_msg and "Conflict" in error_msg:
-                consecutive_409_errors += 1
-                retry_count += 1
-                
-                print(f"\n[ERROR 409] Conflict detected (attempt {retry_count}/{max_retries})")
-                print(f"[INFO] Consecutive 409 errors: {consecutive_409_errors}")
-                
-                # Stop current polling attempt
-                try:
-                    bot.stop_polling()
-                except:
-                    pass
-                
-                # Wait longer on each retry
-                wait_time = 60 + (retry_count * 30)  # 60s, 90s, 120s
-                print(f"[INFO] Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-                
-                if retry_count < max_retries:
-                    print("[INFO] Attempting to reconnect...")
-                    continue
-                else:
-                    print("[ERROR] Max retries reached. Please check for other bot instances.")
-                    break
-            else:
-                # Other errors
-                consecutive_409_errors = 0
-                logger.error(f"[ERROR] {error_msg}")
-                print(f"[ERROR] {error_msg}")
-                
-                # Try once more for non-409 errors
-                if retry_count < max_retries - 1:
-                    retry_count += 1
-                    print(f"[INFO] Retrying ({retry_count}/{max_retries})...")
-                    time.sleep(10)
-                    continue
-                else:
-                    print("[ERROR] Failed to recover from error.")
-                    break
-
-def run_bot_with_retry():
-    """تشغيل البوت مع إعادة المحاولة"""
-    max_retries = 3
-    retry_count = 0
-    consecutive_409_errors = 0
-    
-    while True:
-        try:
-            print("[INFO] Starting bot polling...")
-            logger.info("[BOT] Initialization complete. Polling started.")
-            bot.infinity_polling(timeout=30, long_polling_timeout=30)
-            break
-        except Exception as e:
-            error_msg = str(e)
-            
-            # 409 Conflict - another bot instance
-            if "409" in error_msg or "Conflict" in error_msg:
-                consecutive_409_errors += 1
-                print(f"[ERROR 409] Conflict detected ({consecutive_409_errors})")
-                
-                if consecutive_409_errors >= 2:
-                    print("[ERROR] Multiple 409 errors. Check for other instances.")
-                    retry_count += 1
-                
-                if retry_count < max_retries:
-                    print("[INFO] Attempting to reconnect...")
-                    continue
-                else:
-                    print("[ERROR] Max retries reached. Please check for other bot instances.")
-                    break
-            else:
-                # Other errors
-                consecutive_409_errors = 0
-                logger.error(f"[ERROR] {error_msg}")
-                print(f"[ERROR] {error_msg}")
-                
-                # Try once more for non-409 errors
-                if retry_count < max_retries - 1:
-                    retry_count += 1
-                    print(f"[INFO] Retrying ({retry_count}/{max_retries})...")
-                    time.sleep(10)
-                    continue
-                else:
-                    print("[ERROR] Failed to recover from error.")
-                    break
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# 🛡️ ENHANCED SECURITY & ADMIN FEATURES
-# ═════════════════════════════════════════════════════════════════════════════════
-
-@bot.message_handler(commands=['admin'])
-def admin_panel(message):
-    """لوحة التحكم للمسؤولين"""
-    user_id = message.from_user.id
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_admin")
+def back_to_admin(call):
+    user_id = call.from_user.id
     
     if user_id != ADMIN_ID:
-        bot.send_message(user_id, "<b>❌ ليس لديك صلاحية الوصول لهذه الميزة</b>")
         return
     
     keyboard = create_admin_keyboard()
-    bot.send_message(user_id,
-                   "<b>🔐 لوحة التحكم الإدارية</b>\n\n"
-                   "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                   "اختر من الخيارات أدناه لإدارة البوت",
-                   reply_markup=keyboard)
+    bot.edit_message_text(
+        "<b>🔐 لوحة التحكم الإدارية</b>\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "اختر من الخيارات أدناه",
+        call.from_user.id,
+        call.message.message_id,
+        reply_markup=keyboard
+    )
+    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "bot_stats")
 def show_bot_stats(call):
-    """عرض إحصائيات البوت"""
     user_id = call.from_user.id
     
     if user_id != ADMIN_ID:
@@ -3269,7 +2869,6 @@ def show_bot_stats(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == "user_count")
 def show_user_count(call):
-    """عرض عدد المستخدمين"""
     user_id = call.from_user.id
     
     if user_id != ADMIN_ID:
@@ -3295,1421 +2894,36 @@ def show_user_count(call):
     bot.edit_message_text(message, call.from_user.id, call.message.message_id, reply_markup=keyboard)
     bot.answer_callback_query(call.id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "back_to_admin")
-def back_to_admin(call):
-    """العودة إلى لوحة التحكم"""
-    user_id = call.from_user.id
-    
-    if user_id != ADMIN_ID:
-        return
-    
-    keyboard = create_admin_keyboard()
-    bot.edit_message_text(
-        "<b>🔐 لوحة التحكم الإدارية</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "اختر من الخيارات أدناه",
-        call.from_user.id,
-        call.message.message_id,
-        reply_markup=keyboard
-    )
+@bot.callback_query_handler(func=lambda call: True)
+def dummy_callback(call):
     bot.answer_callback_query(call.id)
 
-# ═════════════════════════════════════════════════════════════════════════════════
-# 📲 USER INFORMATION & PROFILE SYSTEM
-# ═════════════════════════════════════════════════════════════════════════════════
-
-@bot.callback_query_handler(func=lambda call: call.data == "my_stats")
-def show_user_stats(call):
-    """عرض إحصائيات المستخدم"""
-    user_id = call.from_user.id
-    message_text = format_statistics_message(user_id)
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(
-        types.InlineKeyboardButton("🏆 الأفضل", callback_data="top_winners"),
-        types.InlineKeyboardButton("📝 رولياتي", callback_data="my_roulettes")
-    )
-    keyboard.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
-    
-    bot.edit_message_text(message_text, user_id, call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "top_winners")
-def show_top_winners(call):
-    """عرض أفضل الفائزين"""
-    users = get_top_users(10)
-    
-    message = (
-        "<b>🏆 أفضل الفائزين</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-    )
-    
-    if users:
-        for i, (user_id, first_name, wins, participations) in enumerate(users, 1):
-            win_rate = (wins / max(participations, 1)) * 100
-            message += f"{i}. 👤 {first_name}\n"
-            message += f"   🏆 الفوز: {wins} | 🎰 المشاركات: {participations}\n"
-            message += f"   📈 النسبة: {win_rate:.1f}%\n\n"
-    else:
-        message += "<i>لا يوجد بيانات حتى الآن</i>\n"
-    
-    message += "<b>━━━━━━━━━━━━━━━━━━━━━━</b>"
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
-    
-    bot.edit_message_text(message, call.from_user.id, call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "bot_info")
-def show_bot_info(call):
-    """عرض معلومات البوت"""
-    message = get_about_message()
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(
-        types.InlineKeyboardButton("❓ مساعدة", callback_data="help"),
-        types.InlineKeyboardButton("📞 دعم", url=f"https://t.me/{BOT_USERNAME}")
-    )
-    keyboard.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
-    
-    bot.edit_message_text(message, call.from_user.id, call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "help")
-def show_help(call):
-    """عرض المساعدة"""
-    message = get_help_message()
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
-    
-    bot.edit_message_text(message, call.from_user.id, call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# 🎯 ADVANCED ROULETTE MANAGEMENT
-# ═════════════════════════════════════════════════════════════════════════════════
-
-@bot.callback_query_handler(func=lambda call: call.data == "my_roulettes")
-def show_my_roulettes(call):
-    """عرض روليتاتي"""
-    user_id = call.from_user.id
-    roulettes = db.fetch_all(
-        "SELECT id, message_text, status, created_date, participants_count FROM roulettes WHERE creator_id = ? ORDER BY created_date DESC LIMIT 5",
-        (user_id,)
-    )
-    
-    message = "<b>📝 رولياتي</b>\n\n<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-    
-    if roulettes:
-        for i, (rid, text, status, created, part_count) in enumerate(roulettes, 1):
-            status_emoji = "🟢" if status == "active" else "🏆" if status == "finished" else "⏸️"
-            created_date = format_timestamp(created)
-            message += f"{i}. {status_emoji} {text}\n"
-            message += f"   📅 {created_date} | 👥 {part_count}\n\n"
-    else:
-        message += "<i>لم تنشئ أي روليتات بعد</i>\n"
-    
-    message += "<b>━━━━━━━━━━━━━━━━━━━━━━</b>"
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
-    
-    bot.edit_message_text(message, user_id, call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "my_channels")
-def show_my_channels(call):
-    """عرض قنواتي"""
-    user_id = call.from_user.id
-    channels = db.fetch_all(
-        "SELECT channel_id, channel_name, join_date FROM channels WHERE owner_id = ?",
-        (user_id,)
-    )
-    
-    message = "<b>📢 قنواتي</b>\n\n<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-    
-    if channels:
-        for i, (ch_id, ch_name, join_date) in enumerate(channels, 1):
-            date_formatted = format_timestamp(join_date)
-            message += f"{i}. 📢 {ch_name}\n"
-            message += f"   🔗 {ch_id}\n"
-            message += f"   📅 {date_formatted}\n\n"
-    else:
-        message += "<i>لم تضف أي قنوات بعد</i>\n\n"
-    
-    message += "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
-    message += "\n✨ <b>نصيحة:</b> أضف قنواتك لإنشاء روليتات احترافية"
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
-    
-    bot.edit_message_text(message, user_id, call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# ⚙️ SETTINGS & PREFERENCES
-# ═════════════════════════════════════════════════════════════════════════════════
-
-@bot.callback_query_handler(func=lambda call: call.data == "settings_menu")
-def show_settings_menu(call):
-    """عرض قائمة الإعدادات"""
-    user_id = call.from_user.id
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(
-        types.InlineKeyboardButton("🔔 الإشعارات", callback_data="notification_settings"),
-        types.InlineKeyboardButton("🌐 اللغة", callback_data="language_settings")
-    )
-    keyboard.row(
-        types.InlineKeyboardButton("🔒 الخصوصية", callback_data="privacy_settings"),
-        types.InlineKeyboardButton("⚡ الأداء", callback_data="performance_settings")
-    )
-    keyboard.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main"))
-    
-    message = (
-        "<b>⚙️ الإعدادات</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "اختر الإعدادات التي تريد تخصيصها"
-    )
-    
-    bot.edit_message_text(message, user_id, call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "notification_settings")
-def notification_settings(call):
-    """إعدادات الإشعارات"""
-    user_id = call.from_user.id
-    
-    # Check current notification status
-    reminder = db.fetch_one("SELECT enabled FROM reminders WHERE user_id = ?", (user_id,))
-    is_enabled = reminder[0] == 1 if reminder else False
-    
-    keyboard = types.InlineKeyboardMarkup()
-    if is_enabled:
-        keyboard.add(types.InlineKeyboardButton("🔔 ✅ الإشعارات مفعلة", callback_data="toggle_notifications"))
-    else:
-        keyboard.add(types.InlineKeyboardButton("🔕 ❌ الإشعارات معطلة", callback_data="toggle_notifications"))
-    
-    keyboard.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_menu"))
-    
-    message = (
-        "<b>🔔 إعدادات الإشعارات</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        f"الحالة الحالية: {'✅ مفعلة' if is_enabled else '❌ معطلة'}\n\n"
-        "اضغط على الزر أدناه لتغيير الإعدادات"
-    )
-    
-    bot.edit_message_text(message, user_id, call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "toggle_notifications")
-def toggle_notifications(call):
-    """تبديل الإشعارات"""
-    user_id = call.from_user.id
-    
-    reminder = db.fetch_one("SELECT enabled FROM reminders WHERE user_id = ?", (user_id,))
-    if reminder:
-        new_status = 0 if reminder[0] == 1 else 1
-        db.execute("UPDATE reminders SET enabled = ? WHERE user_id = ?", (new_status, user_id))
-    else:
-        db.execute("INSERT INTO reminders (user_id, enabled) VALUES (?, ?)", (user_id, 1))
-    
-    bot.answer_callback_query(call.id, "✅ تم تحديث الإعدادات", show_alert=False)
-    notification_settings(call)  # Refresh the settings display
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# 💬 LANGUAGE & LOCALIZATION SYSTEM
-# ═════════════════════════════════════════════════════════════════════════════════
-
-@bot.callback_query_handler(func=lambda call: call.data == "language_settings")
-def language_settings(call):
-    """إعدادات اللغة"""
-    user_id = call.from_user.id
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(
-        types.InlineKeyboardButton("🇸🇦 العربية", callback_data="lang_ar"),
-        types.InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")
-    )
-    keyboard.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_menu"))
-    
-    message = (
-        "<b>🌐 اختر اللغة</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "اللغة الحالية: 🇸🇦 العربية\n\n"
-        "اختر اللغة المفضلة لديك"
-    )
-    
-    bot.edit_message_text(message, user_id, call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("lang_"))
-def change_language(call):
-    """تغيير اللغة"""
-    user_id = call.from_user.id
-    language = call.data.split("_")[1]
-    
-    db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", 
-              (f"user_{user_id}_lang", language))
-    
-    bot.answer_callback_query(call.id, "✅ تم تحديث اللغة", show_alert=False)
-    language_settings(call)
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# 🔐 PRIVACY & SECURITY SETTINGS
-# ═════════════════════════════════════════════════════════════════════════════════
-
-@bot.callback_query_handler(func=lambda call: call.data == "privacy_settings")
-def privacy_settings(call):
-    """إعدادات الخصوصية"""
-    user_id = call.from_user.id
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(
-        types.InlineKeyboardButton("👁️ ظهور الملف", callback_data="visibility_public"),
-        types.InlineKeyboardButton("🔒 مخفي", callback_data="visibility_private")
-    )
-    keyboard.row(
-        types.InlineKeyboardButton("🚫 حظر الرسائل", callback_data="block_messages"),
-        types.InlineKeyboardButton("📧 حذف البيانات", callback_data="delete_data")
-    )
-    keyboard.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_menu"))
-    
-    message = (
-        "<b>🔐 إعدادات الخصوصية</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "🔒 تحكم كامل في بيانات خصوصيتك\n\n"
-        "اختر الإعدادات المفضلة لديك"
-    )
-    
-    bot.edit_message_text(message, user_id, call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "performance_settings")
-def performance_settings(call):
-    """إعدادات الأداء"""
-    user_id = call.from_user.id
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(
-        types.InlineKeyboardButton("🔋 اقتصادي", callback_data="perf_eco"),
-        types.InlineKeyboardButton("⚡ متوازن", callback_data="perf_balanced"),
-        types.InlineKeyboardButton("🚀 عالي", callback_data="perf_high")
-    )
-    keyboard.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_menu"))
-    
-    message = (
-        "<b>⚡ إعدادات الأداء</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "الوضع الحالي: ⚡ متوازن\n\n"
-        "اختر مستوى الأداء المفضل"
-    )
-    
-    bot.edit_message_text(message, user_id, call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# 📊 ADVANCED ANALYTICS & REPORTING
-# ═════════════════════════════════════════════════════════════════════════════════
-
-def generate_user_report(user_id):
-    """إنشاء تقرير المستخدم"""
-    user_info = get_user_info(user_id)
-    user_stats = get_user_stats(user_id)
-    ranking = get_user_ranking(user_id)
-    
-    if not user_info:
-        return None
-    
-    username, first_name, joined_date, _, _ = user_info
-    
-    report = {
-        "user_id": user_id,
-        "username": username,
-        "name": first_name,
-        "joined_date": joined_date,
-        "stats": user_stats,
-        "ranking": ranking
-    }
-    
-    return report
-
-def generate_roulette_report(roulette_id):
-    """إنشاء تقرير الروليت"""
-    roulette = db.fetch_one(
-        "SELECT message_text, winners_count, created_date, status, participants_count, countdown_seconds FROM roulettes WHERE id = ?",
-        (roulette_id,)
-    )
-    
-    if not roulette:
-        return None
-    
-    participants = db.fetch_all(
-        "SELECT COUNT(*) FROM participants WHERE roulette_id = ?",
-        (roulette_id,)
-    )
-    
-    winners = db.fetch_all(
-        "SELECT first_name FROM participants WHERE roulette_id = ? ORDER BY join_time DESC LIMIT ?",
-        (roulette_id, roulette[1])
-    )
-    
-    report = {
-        "roulette_id": roulette_id,
-        "title": roulette[0],
-        "winners_count": roulette[1],
-        "created_date": roulette[2],
-        "status": roulette[3],
-        "participants_count": participants[0][0] if participants else 0,
-        "countdown": roulette[5],
-        "winners": [w[0] for w in winners] if winners else []
-    }
-    
-    return report
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# 📝 ADVANCED MESSAGE FORMATTING
-# ═════════════════════════════════════════════════════════════════════════════════
-
-def format_user_card(user_id):
-    """تنسيق بطاقة المستخدم"""
-    user_info = get_user_info(user_id)
-    stats = get_user_stats(user_id)
-    ranking = get_user_ranking(user_id)
-    
-    if not user_info:
-        return "<b>❌ لم يتم العثور على المستخدم</b>"
-    
-    username, first_name, joined_date, _, _ = user_info
-    joined_formatted = format_timestamp(joined_date)
-    
-    card = (
-        f"<b>👤 بطاقة المستخدم</b>\n\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        f"📛 <b>الاسم:</b> {first_name}\n"
-        f"🆔 <b>المعرف:</b> <code>{user_id}</code>\n"
-        f"👤 <b>اليوزر:</b> @{username or 'لا يوجد'}\n"
-        f"📅 <b>تاريخ الانضمام:</b> {joined_formatted}\n\n"
-        f"<b>═════ الإحصائيات ═════</b>\n\n"
-        f"🎰 <b>المشاركات:</b> {stats['participations']}\n"
-        f"🏆 <b>الفوز:</b> {stats['wins']}\n"
-        f"🥇 <b>الترتيب:</b> #{ranking or 'غير مصنف'}\n"
-        f"📈 <b>معدل الفوز:</b> {(stats['wins']/max(stats['participations'],1)*100):.1f}%\n\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>"
-    )
-    
-    return card
-
-def format_roulette_card(roulette_key):
-    """تنسيق بطاقة الروليت"""
-    roulette = db.fetch_one(
-        "SELECT id, message_text, winners_count, created_date, status, participants_count, countdown_seconds FROM roulettes WHERE roulette_key = ?",
-        (roulette_key,)
-    )
-    
-    if not roulette:
-        return "<b>❌ لم يتم العثور على الروليت</b>"
-    
-    rid, text, winners, created, status, part_count, countdown = roulette
-    created_formatted = format_timestamp(created)
-    status_emoji = "🟢" if status == "active" else "🏆" if status == "finished" else "⏸️"
-    
-    card = (
-        f"<b>🎰 بطاقة الروليت</b>\n\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        f"📝 <b>الاسم:</b> {text}\n"
-        f"🔑 <b>المفتاح:</b> <code>{roulette_key}</code>\n"
-        f"🟡 <b>الحالة:</b> {status_emoji} {status}\n"
-        f"🏆 <b>عدد الفائزين:</b> {winners}\n"
-        f"👥 <b>المشاركون:</b> {part_count}\n"
-        f"⏱️ <b>العد التنازلي:</b> {countdown} ثانية\n"
-        f"📅 <b>تاريخ الإنشاء:</b> {created_formatted}\n\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>"
-    )
-    
-    return card
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# 🎁 REWARDS & ACHIEVEMENTS SYSTEM
-# ═════════════════════════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 📢 MULTI-CHANNEL CONDITION SUPPORT - ENHANCED
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# أولاً: إضافة جدول جديد في قاعدة البيانات لتخزين قنوات الشرط للروليتات
-def add_multi_channel_support():
-    """إضافة دعم القنوات المتعددة في قاعدة البيانات"""
-    with db_lock:
-        conn = sqlite3.connect(db.db_name, check_same_thread=False)
-        cursor = conn.cursor()
-        
-        # جدول لقنوات الشرط الخاصة بكل روليت
-        cursor.execute('''CREATE TABLE IF NOT EXISTS roulette_condition_channels
-            (id INTEGER PRIMARY KEY AUTOINCREMENT,
-             roulette_id INTEGER,
-             channel_id TEXT,
-             channel_name TEXT,
-             FOREIGN KEY (roulette_id) REFERENCES roulettes(id))''')
-        
-        # جدول لتتبع قنوات الشرط لكل مشارك
-        cursor.execute('''CREATE TABLE IF NOT EXISTS participant_channels_status
-            (id INTEGER PRIMARY KEY AUTOINCREMENT,
-             participant_id INTEGER,
-             roulette_id INTEGER,
-             channel_id TEXT,
-             is_subscribed INTEGER DEFAULT 0,
-             checked_at TEXT,
-             FOREIGN KEY (participant_id) REFERENCES participants(id),
-             FOREIGN KEY (roulette_id) REFERENCES roulettes(id))''')
-        
-        conn.commit()
-        conn.close()
-
-# استدعاء الدالة لإنشاء الجداول
-add_multi_channel_support()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 📋 FUNCTIONS FOR MULTI-CHANNEL MANAGEMENT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def add_condition_channel_to_roulette(roulette_id, channel_id, channel_name):
-    """إضافة قناة شرط للروليت"""
-    return db.execute(
-        "INSERT INTO roulette_condition_channels (roulette_id, channel_id, channel_name) VALUES (?, ?, ?)",
-        (roulette_id, channel_id, channel_name)
-    )
-
-def get_roulette_condition_channels(roulette_id):
-    """الحصول على قنوات الشرط للروليت"""
-    return db.fetch_all(
-        "SELECT channel_id, channel_name FROM roulette_condition_channels WHERE roulette_id = ?",
-        (roulette_id,)
-    )
-
-def remove_condition_channel_from_roulette(roulette_id, channel_id):
-    """إزالة قناة شرط من الروليت"""
-    return db.execute(
-        "DELETE FROM roulette_condition_channels WHERE roulette_id = ? AND channel_id = ?",
-        (roulette_id, channel_id)
-    )
-
-def check_user_subscription_all_channels(user_id, roulette_id):
-    """التحقق من اشتراك المستخدم في جميع قنوات الشرط"""
-    # الحصول على جميع قنوات الشرط للروليت
-    channels = get_roulette_condition_channels(roulette_id)
-    
-    if not channels:
-        return True, []  # لا توجد قنوات شرط
-    
-    missing_channels = []
-    
-    for channel_id, channel_name in channels:
-        if not is_user_subscribed_to_channel(user_id, channel_id):
-            missing_channels.append((channel_id, channel_name))
-    
-    if missing_channels:
-        return False, missing_channels
-    else:
-        return True, []
-
-def update_participant_channel_status(participant_id, roulette_id, channel_id, is_subscribed):
-    """تحديث حالة اشتراك المشارك في قناة محددة"""
-    return db.execute(
-        "INSERT OR REPLACE INTO participant_channels_status (participant_id, roulette_id, channel_id, is_subscribed, checked_at) VALUES (?, ?, ?, ?, ?)",
-        (participant_id, roulette_id, channel_id, is_subscribed, datetime.now().isoformat())
-    )
-
-def get_participant_channel_status(participant_id, roulette_id):
-    """الحصول على حالة اشتراك المشارك في جميع القنوات"""
-    return db.fetch_all(
-        "SELECT channel_id, is_subscribed, checked_at FROM participant_channels_status WHERE participant_id = ? AND roulette_id = ?",
-        (participant_id, roulette_id)
-    )
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🎰 MODIFIED ROULETTE CREATION WITH MULTI-CHANNEL SUPPORT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("roulette_channel:"))
-def select_roulette_channel_enhanced(call):
-    """تحديد قناة الروليت مع دعم القنوات المتعددة"""
-    user_id = call.from_user.id
-    channel_id = call.data.split(":")[1]
-    message_id = call.message.message_id
-    
-    user_states[user_id]["channel_id"] = channel_id
-    user_states[user_id]["message_id"] = message_id
-    user_states[user_id]["state"] = "create_roulette_condition_channels"
-    
-    # بدء عملية إضافة قنوات الشرط
-    user_states[user_id]["condition_channels"] = []  # قائمة لقنوات الشرط
-    user_states[user_id]["current_channel_index"] = 0
-    
-    condition_message = (
-        "<b>🔗 قنوات الشرط المتعددة</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "<b>✅ تم اختيار قناة الروليت الرئيسية</b>\n\n"
-        "<b>📋 نظام القنوات المتعددة:</b>\n"
-        "• يمكنك إضافة حتى 10 قنوات كشروط اشتراك\n"
-        "• يجب على المشاركين الاشتراك في <b>جميع</b> القنوات\n"
-        "• يمكنك التوقف في أي وقت بإرسال /done\n\n"
-        "<b>🎯 القناة الأولى:</b>\n"
-        "أرسل معرف أو رابط القناة الأولى كشرط للاشتراك\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "<i>أرسل معرف القناة أو /done للانتهاء</i>"
-    )
+#صنع من قبل RedFox يمنع تغيير الحقوق.
+def main():
+    print("\n" + "="*60)
+    print("🎰 RedFox Roulette Bot")
+    print("="*60)
+    print(f"📅 التاريخ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🤖 البوت: @{BOT_USERNAME}")
+    print(f"👑 الأدمن: {ADMIN_ID}")
+    print("="*60)
+    print("[✓] قاعدة البيانات مهيأة")
+    print("[✓] نظام القنوات المتعددة جاهز")
+    print("[✓] جميع المعالجات جاهزة")
+    print("="*60 + "\n")
     
     try:
-        bot.edit_message_text(condition_message, user_id, message_id)
-    except:
-        bot.send_message(user_id, condition_message)
-
-# معالج الرسائل لإضافة قنوات شرط متعددة
-@bot.message_handler(func=lambda message: user_states.get(message.from_user.id, {}).get("state") == "create_roulette_condition_channels")
-def handle_condition_channels(message):
-    """معالجة إضافة قنوات الشرط المتعددة"""
-    user_id = message.from_user.id
-    text = message.text.strip()
-    message_id = user_states.get(user_id, {}).get("message_id")
-    
-    # التحقق من الأمر /done
-    if text.lower() == "/done":
-        # التحقق من وجود قنوات على الأقل
-        condition_channels = user_states[user_id].get("condition_channels", [])
-        
-        if not condition_channels:
-            error_msg = (
-                "<b>❌ يجب إضافة قناة شرط واحدة على الأقل</b>\n\n"
-                "الرجاء إرسال معرف قناة واحدة على الأقل"
-            )
-            if message_id:
-                try:
-                    bot.edit_message_text(error_msg, user_id, message_id)
-                except:
-                    bot.send_message(user_id, error_msg)
-            else:
-                bot.send_message(user_id, error_msg)
-            return
-        
-        # الانتقال إلى الخطوة التالية (إرسال نص الروليت)
-        user_states[user_id]["state"] = "create_roulette_text"
-        user_states[user_id]["condition_channel"] = condition_channels[0][0]  # حفظ أول قناة للحفاظ على التوافق
-        
-        success_message = (
-            f"<b>✅ تم إضافة {len(condition_channels)} قناة كشروط اشتراك</b>\n\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"<b>📋 القنوات المضافة:</b>\n"
-        )
-        
-        for i, (ch_id, ch_name) in enumerate(condition_channels, 1):
-            success_message += f"{i}. {ch_name} ({ch_id})\n"
-        
-        success_message += (
-            f"\n<b>⚠️ ملاحظة:</b>\n"
-            f"يجب على المشاركين الاشتراك في <b>جميع</b> هذه القنوات\n\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"<b>📝 الخطوة التالية: إرسال نص الروليت</b>\n"
-            f"اكتب النص الذي سيظهر مع الروليت\n\n"
-            f"💡 <b>تلميح:</b> يمكنك استخدام التنسيق والتعبيرات 😊"
-        )
-        
-        if message_id:
-            try:
-                bot.edit_message_text(success_message, user_id, message_id)
-            except:
-                sent = bot.send_message(user_id, success_message)
-                user_states[user_id]["message_id"] = sent.message_id
-        else:
-            sent = bot.send_message(user_id, success_message)
-            user_states[user_id]["message_id"] = sent.message_id
-        
-        return
-    
-    # معالجة معرف القناة
-    channel_id = None
-    channel_name = None
-    
-    if message.forward_from_chat:
-        channel_id = str(message.forward_from_chat.id)
-        channel_name = message.forward_from_chat.title
-    elif text.startswith("@"):
-        channel_id = text
-        channel_name = text[1:]
-    elif "t.me" in text:
-        parts = text.replace("https://", "").replace("http://", "").split("/")
-        channel_id = "@" + parts[-1]
-        channel_name = parts[-1]
-    
-    if channel_id:
-        try:
-            # التحقق مما إذا كانت القناة صالحة والبوت مشرف فيها
-            bot_member = bot.get_chat_member(channel_id, bot.get_me().id)
-            bot_is_admin = bot_member.status in ['administrator', 'creator']
-            
-            if not bot_is_admin:
-                error_message = (
-                    f"<b>❌ البوت ليس ادمن في هذه القناة!</b>\n\n"
-                    f"القناة: {channel_name}\n\n"
-                    f"<b>الحل:</b>\n"
-                    f"1️⃣ أضفني كمشرف في القناة\n"
-                    f"2️⃣ أعطني صلاحية \"حذف الرسائل\"\n\n"
-                    f"أو أرسل معرف قناة أخرى\n"
-                    f"أو أرسل /done للانتهاء"
-                )
-                bot.send_message(user_id, error_message)
-                return
-            
-            # التحقق من عدم إضافة القناة مسبقاً
-            condition_channels = user_states[user_id].get("condition_channels", [])
-            existing_channels = [ch[0] for ch in condition_channels]
-            
-            if channel_id in existing_channels:
-                bot.send_message(user_id, 
-                               f"<b>⚠️ القناة مضافة بالفعل</b>\n\n"
-                               f"القناة: {channel_name}\n\n"
-                               f"أرسل قناة أخرى أو /done للانتهاء")
-                return
-            
-            # التحقق من الحد الأقصى للقنوات (10 قنوات)
-            if len(condition_channels) >= 10:
-                bot.send_message(user_id,
-                               "<b>❌ وصلت للحد الأقصى</b>\n\n"
-                               "يمكنك إضافة 10 قنوات كحد أقصى\n"
-                               "أرسل /done للانتهاء")
-                return
-            
-            # إضافة القناة إلى القائمة
-            condition_channels.append((channel_id, channel_name))
-            user_states[user_id]["condition_channels"] = condition_channels
-            
-            # إرسال رسالة تأكيد
-            confirm_message = (
-                f"<b>✅ تم إضافة القناة #{len(condition_channels)}</b>\n\n"
-                f"<b>📢 القناة:</b> {channel_name}\n"
-                f"<b>🔗 المعرف:</b> {channel_id}\n\n"
-                f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                f"<b>📊 الإجمالي:</b> {len(condition_channels)} قناة\n\n"
-            )
-            
-            if len(condition_channels) < 10:
-                confirm_message += (
-                    "<b>📝 الخطوة التالية:</b>\n"
-                    "أرسل معرف القناة التالية\n"
-                    "أو أرسل /done للانتهاء من إضافة القنوات\n\n"
-                    "<i>يمكنك إضافة حتى 10 قنوات</i>"
-                )
-            else:
-                confirm_message += (
-                    "<b>🎉 وصلت للحد الأقصى!</b>\n\n"
-                    "أرسل /done للانتهاء من إضافة القنوات"
-                )
-            
-            bot.send_message(user_id, confirm_message)
-            
-        except Exception as e:
-            logger.error(f"Error checking channel: {e}")
-            bot.send_message(user_id,
-                           f"<b>❌ خطأ في التحقق من القناة</b>\n\n"
-                           f"تأكد من:\n"
-                           f"• معرف القناة صحيح\n"
-                           f"• البوت مشرف في القناة\n"
-                           f"• القناة عامة أو البوت عضو فيها\n\n"
-                           f"حاول مرة أخرى أو أرسل /done")
-    else:
-        bot.send_message(user_id,
-                       "<b>❌ لم أستطع قراءة معرف القناة</b>\n\n"
-                       "<b>طرق إرسال القناة:</b>\n"
-                       "1️⃣ @channel_name\n"
-                       "2️⃣ https://t.me/channel_name\n"
-                       "3️⃣ أعيد توجيه رسالة من القناة\n\n"
-                       "أو أرسل /done للانتهاء")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 📝 MODIFIED ROULETTE TEXT HANDLING
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def handle_roulette_text_enhanced(message):
-    """معالجة نص الروليت مع دعم القنوات المتعددة"""
-    user_id = message.from_user.id
-    message_id = user_states.get(user_id, {}).get("message_id")
-    
-    if message.text and ("t.me" in message.text or "http" in message.text):
-        error_message = "<b>❌ روابط ممنوعة!</b>"
-        bot.send_message(user_id, error_message)
-        return
-    
-    message_text = get_html_text(message) or f"محتوى {message.content_type}"
-    
-    # حفظ النص والانتقال إلى اختيار وقت العد التنازلي
-    user_states[user_id]["message_text"] = message_text
-    user_states[user_id]["state"] = "create_roulette_countdown"
-    
-    countdown_message = (
-        "<b>⏱️ كم ثانية للعداد التنازلي؟</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "أرسل عدد الثواني (10-300):\n\n"
-        "<b>✅ أمثلة:</b>\n"
-        "• 10 (سريع)\n"
-        "• 30 (متوسط)\n"
-        "• 60 (طبيعي)\n"
-        "• 120 (بطيء)\n\n"
-        "<i>افتراضي: 30 ثانية</i>"
-    )
-    
-    if message_id:
-        try:
-            bot.edit_message_text(countdown_message, user_id, message_id)
-        except:
-            sent = bot.send_message(user_id, countdown_message)
-            user_states[user_id]["message_id"] = sent.message_id
-    else:
-        sent = bot.send_message(user_id, countdown_message)
-        user_states[user_id]["message_id"] = sent.message_id
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🎰 MODIFIED ROULETTE CREATION FINAL STEP
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def handle_roulette_countdown_enhanced(message):
-    """إنشاء الروليت النهائي مع دعم القنوات المتعددة"""
-    user_id = message.from_user.id
-    message_id = user_states.get(user_id, {}).get("message_id")
-    
-    try:
-        countdown = int(message.text) if message.text.isdigit() else 30
-        if countdown < 10:
-            countdown = 10
-        elif countdown > 300:
-            countdown = 300
-    except:
-        countdown = 30
-    
-    # الحصول على جميع البيانات
-    winners_count = user_states[user_id].get("winners_count")
-    channel_id = user_states[user_id].get("channel_id")
-    condition_channels = user_states[user_id].get("condition_channels", [])
-    message_text = user_states[user_id].get("message_text")
-    
-    if not all([winners_count, channel_id, condition_channels, message_text]):
-        error_message = "<b>❌ بيانات غير مكتملة</b>"
-        bot.send_message(user_id, error_message)
-        user_states[user_id] = {}
-        return
-    
-    # إنشاء مفتاح الروليت
-    roulette_key = generate_roulette_key()
-    bot_link = get_bot_link()
-    
-    # بناء نص الروليت مع قائمة القنوات
-    roulette_text = f"🎰 {message_text}\n\n"
-    roulette_text += f"<b>📋 شروط الاشتراك:</b>\n"
-    
-    for i, (ch_id, ch_name) in enumerate(condition_channels, 1):
-        channel_mention = f"@{ch_id[1:]}" if ch_id.startswith("@") else ch_id
-        roulette_text += f"{i}. 🔗 {channel_mention}\n"
-    
-    roulette_text += f"\n<b>🏆 عدد الفائزين:</b> {winners_count}\n"
-    roulette_text += f"<b>📊 المشاركون: 0</b>\n"
-    roulette_text += f"<b>⏱️ وقت العد:</b> {countdown} ثانية\n\n"
-    roulette_text += f'<a href="{bot_link}">🎰 Roulette RedFox</a>'
-    
-    # إنشاء لوحة المفاتيح
-    keyboard = types.InlineKeyboardMarkup()
-    deeplink = f"https://t.me/{BOT_USERNAME}?start=verify_{roulette_key}"
-    reminder_deeplink = f"https://t.me/{BOT_USERNAME}?start=remind_{roulette_key}"
-    
-    keyboard.row(
-        types.InlineKeyboardButton("🎲 المشاركة", url=deeplink),
-        types.InlineKeyboardButton("🔔 التذكير", url=reminder_deeplink)
-    )
-    keyboard.row(
-        types.InlineKeyboardButton("⏸️ إيقاف", callback_data=f"pause:{roulette_key}"),
-        types.InlineKeyboardButton("▶️ بدء", callback_data=f"start:{roulette_key}")
-    )
-    
-    try:
-        # إرسال الروليت في القناة
-        sent_message = bot.send_message(channel_id, roulette_text, reply_markup=keyboard)
-        message_id_roulette = sent_message.message_id
-        
-        # حفظ الروليت في قاعدة البيانات
-        db.execute(
-            "INSERT INTO roulettes (roulette_key, creator_id, channel_id, condition_channel, winners_count, message_text, message_id, participants_count, status, created_date, winners, prize_text, end_date, channel_name, countdown_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (roulette_key, user_id, channel_id, condition_channels[0][0], winners_count, 
-             message_text, message_id_roulette, 0, "active", datetime.now().isoformat(), "", "", None, "", countdown)
-        )
-        
-        # الحصول على معرف الروليت
-        roulette_id = db.fetch_one("SELECT last_insert_rowid()")[0]
-        
-        # حفظ قنوات الشرط في الجدول الجديد
-        for ch_id, ch_name in condition_channels:
-            add_condition_channel_to_roulette(roulette_id, ch_id, ch_name)
-        
-        # إرسال إشعار للمشرف
-        try:
-            admin_msg = (
-                f"<b>🎰 روليت جديدة مع {len(condition_channels)} قنوات شرط!</b>\n\n"
-                f"👤 المنشئ: @{message.from_user.username or 'Unknown'}\n"
-                f"🏆 الفائزين: {winners_count}\n"
-                f"⏱️ العد: {countdown} ثانية\n"
-                f"📊 القنوات: {len(condition_channels)}"
-            )
-            bot.send_message(ADMIN_ID, admin_msg)
-        except:
-            pass
-        
-        # إرسال رسالة نجاح للمستخدم
-        success_message = (
-            f"<b>✅ تم إنشاء الروليت بنجاح!</b>\n\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"<b>🎯 التفاصيل:</b>\n"
-            f"📝 النص: {message_text[:50]}...\n"
-            f"🏆 الفائزين: {winners_count}\n"
-            f"📊 القنوات: {len(condition_channels)}\n"
-            f"⏱️ العد: {countdown} ثانية\n\n"
-            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"<i>سيتم إخطارك عند انضمام مشاركين جدد</i>"
-        )
-        
-        main_keyboard = create_main_menu_keyboard(user_id)
-        bot.send_message(user_id, success_message, reply_markup=main_keyboard)
-        
+        print("[INFO] Starting bot polling...")
+        print("[INFO] Bot is now running. Press Ctrl+C to stop.")
+        bot.infinity_polling(timeout=30, long_polling_timeout=30, interval=0)
+    except KeyboardInterrupt:
+        print("\n[INFO] Bot stopped by user")
     except Exception as e:
-        logger.error(f"Error creating roulette: {e}")
-        error_message = f"<b>❌ خطأ في إنشاء الروليت: {str(e)[:50]}</b>"
-        bot.send_message(user_id, error_message)
-    
-    # مسح حالة المستخدم
-    user_states[user_id] = {}
+        logger.error(f"[ERROR] {e}")
+        print(f"[ERROR] {e}")
+        print("[INFO] Restarting in 5 seconds...")
+        time.sleep(5)
+        main()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🔐 MODIFIED VERIFICATION SYSTEM FOR MULTI-CHANNEL
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("verify:"))
-def verify_participant_multi_channel(call):
-    """التحقق من المشارك مع دعم القنوات المتعددة"""
-    user_id = call.from_user.id
-    parts = call.data.split(":")
-    roulette_key = parts[1]
-    selected_emoji = parts[2]
-    correct_emoji = parts[3]
-    
-    # الحصول على معلومات الروليت
-    roulette = db.fetch_one(
-        "SELECT id, status FROM roulettes WHERE roulette_key = ?",
-        (roulette_key,)
-    )
-    
-    if not roulette:
-        bot.answer_callback_query(call.id, "❌ الروليت غير موجودة", show_alert=True)
-        return
-    
-    roulette_id, status = roulette
-    
-    if status != "active":
-        bot.answer_callback_query(call.id, "❌ انتهت الروليت", show_alert=True)
-        return
-    
-    # التحقق من صحة الرمز
-    if selected_emoji != correct_emoji:
-        bot.answer_callback_query(call.id, "❌ إجابة خاطئة، حاول مرة أخرى", show_alert=True)
-        
-        # إنشاء رمز تحقق جديد
-        emojis = ["🎯", "⚽", "🎮", "🏀", "🎾", "⚾", "🏈", "🎳", "🏓", "🎲"]
-        correct_emoji_new = random.choice(emojis)
-        other_emojis = [e for e in emojis if e != correct_emoji_new]
-        random.shuffle(other_emojis)
-        
-        keyboard = types.InlineKeyboardMarkup()
-        buttons = [types.InlineKeyboardButton(emoji,
-                     callback_data=f"verify:{roulette_key}:{emoji}:{correct_emoji_new}")
-                   for emoji in [correct_emoji_new] + other_emojis]
-        keyboard.row(*buttons[:3])
-        keyboard.row(*buttons[3:6])
-        
-        bot.edit_message_text(
-            f"<b>🔐 تحقق من الهوية</b>\n\n"
-            f"<b>اختر الرمز التالي:</b> <code>{correct_emoji_new}</code>\n\n"
-            f"<b>حاول مرة أخرى</b>",
-            user_id, call.message.message_id,
-            reply_markup=keyboard
-        )
-        return
-    
-    bot.answer_callback_query(call.id, "✅ إجابة صحيحة!")
-    
-    # التحقق من اشتراك المستخدم في جميع القنوات
-    is_subscribed, missing_channels = check_user_subscription_all_channels(user_id, roulette_id)
-    
-    if not is_subscribed:
-        # بناء رسالة القنوات المفقودة
-        missing_message = (
-            "<b>❌ يجب الاشتراك في جميع القنوات أولاً</b>\n\n"
-            "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            "<b>القنوات المطلوبة:</b>\n"
-        )
-        
-        for i, (ch_id, ch_name) in enumerate(missing_channels, 1):
-            channel_link = f"https://t.me/{ch_id[1:]}" if ch_id.startswith("@") else ch_id
-            missing_message += f"{i}. <a href=\"{channel_link}\">{ch_name}</a>\n"
-        
-        missing_message += (
-            f"\n<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"<i>بعد الاشتراك في جميع القنوات، حاول مرة أخرى</i>"
-        )
-        
-        # إرسال زر للتحقق مرة أخرى
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("🔄 تحقق من الاشتراكات", 
-                     callback_data=f"check_subscription:{roulette_key}"))
-        
-        bot.edit_message_text(missing_message, user_id, call.message.message_id, reply_markup=keyboard)
-        return
-    
-    # التحقق من عدم مشاركة المستخدم مسبقاً
-    existing = db.fetch_one(
-        "SELECT id FROM participants WHERE user_id = ? AND roulette_id = ?",
-        (user_id, roulette_id)
-    )
-    
-    if existing:
-        bot.send_message(user_id, "<b>⚠️ أنت مشترك بالفعل في هذه الروليت</b>")
-        return
-    
-    # تسجيل المشارك
-    username = call.from_user.username or "NoUsername"
-    first_name = call.from_user.first_name or "User"
-    
-    db.execute(
-        "INSERT INTO participants VALUES (NULL, ?, ?, ?, ?, ?)",
-        (user_id, roulette_id, username, first_name, datetime.now().isoformat())
-    )
-    
-    # الحصول على معرف المشارك
-    participant_id = db.fetch_one("SELECT last_insert_rowid()")[0]
-    
-    # تحديث إحصائيات المستخدم
-    update_user_stats(user_id, participations=1)
-    
-    # تحديث عدد المشاركين في الروليت
-    count = db.fetch_one("SELECT participants_count FROM roulettes WHERE id = ?", (roulette_id,))[0]
-    new_count = count + 1
-    db.execute("UPDATE roulettes SET participants_count = ? WHERE id = ?",
-             (new_count, roulette_id))
-    
-    # تسجيل حالة اشتراك المشارك في جميع القنوات
-    channels = get_roulette_condition_channels(roulette_id)
-    for ch_id, ch_name in channels:
-        update_participant_channel_status(participant_id, roulette_id, ch_id, 1)
-    
-    # إرسال إشعار للمنشئ
-    try:
-        creator_id = db.fetch_one("SELECT creator_id FROM roulettes WHERE id = ?", (roulette_id,))[0]
-        channel_info = db.fetch_one("SELECT channel_id FROM roulettes WHERE id = ?", (roulette_id,))[0]
-        
-        participant_message = (
-            f"<b>✅ مشارك جديد!</b>\n\n"
-            f"👤 <b>الاسم:</b> {first_name}\n"
-            f"🔗 <b>اليوزر:</b> @{username}\n"
-            f"🆔 <b>المعرف:</b> <code>{user_id}</code>\n"
-            f"📊 <b>إجمالي المشاركين:</b> {new_count}\n"
-            f"✅ <b>الحالة:</b> مشترك في جميع القنوات"
-        )
-        
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(
-            types.InlineKeyboardButton("👁️ عرض المعلومات", 
-                 callback_data=f"view_participant:{roulette_key}:{user_id}"),
-            types.InlineKeyboardButton("🚫 طرد المشارك", 
-                 callback_data=f"remove_participant:{roulette_key}:{user_id}")
-        )
-        
-        bot.send_message(creator_id, participant_message, reply_markup=keyboard)
-        
-        # تحديث رسالة الروليت في القناة
-        update_roulette_message(roulette_id, channel_info, new_count)
-        
-    except Exception as e:
-        logger.error(f"Error notifying creator: {e}")
-    
-    # إرسال تأكيد للمشارك
-    confirmation_message = (
-        "<b>✅ تم التسجيل بنجاح!</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "🎉 <b>تمت إضافتك إلى الروليت</b>\n\n"
-        "✅ <b>أنت مشترك في جميع القنوات المطلوبة</b>\n"
-        "🔔 <b>سيتم إخطارك عند إعلان الفائزين</b>\n\n"
-        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        "💡 <i>حظاً موفقاً في الروليت!</i>"
-    )
-    
-    bot.edit_message_text(confirmation_message, user_id, call.message.message_id)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🔄 UPDATED ROULETTE MESSAGE FUNCTION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def update_roulette_message(roulette_id, channel_id, participants_count):
-    """تحديث رسالة الروليت في القناة"""
-    try:
-        # الحصول على معلومات الروليت
-        roulette = db.fetch_one(
-            "SELECT message_id, message_text, winners_count, countdown_seconds FROM roulettes WHERE id = ?",
-            (roulette_id,)
-        )
-        
-        if not roulette:
-            return
-        
-        message_id, message_text, winners_count, countdown = roulette
-        
-        # الحصول على قنوات الشرط
-        channels = get_roulette_condition_channels(roulette_id)
-        
-        # بناء النص المحدث
-        updated_text = f"🎰 {message_text}\n\n"
-        updated_text += f"<b>📋 شروط الاشتراك:</b>\n"
-        
-        for i, (ch_id, ch_name) in enumerate(channels, 1):
-            channel_mention = f"@{ch_id[1:]}" if ch_id.startswith("@") else ch_id
-            updated_text += f"{i}. 🔗 {channel_mention}\n"
-        
-        updated_text += f"\n<b>🏆 عدد الفائزين:</b> {winners_count}\n"
-        updated_text += f"<b>📊 المشاركون: {participants_count}</b>\n"
-        updated_text += f"<b>⏱️ وقت العد:</b> {countdown} ثانية\n\n"
-        updated_text += f'<a href="{get_bot_link()}">🎰 Roulette RedFox</a>'
-        
-        # تحديث الرسالة في القناة
-        bot.edit_message_text(updated_text, channel_id, message_id)
-        
-    except Exception as e:
-        logger.error(f"Error updating roulette message: {e}")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🔄 NEW CALLBACK FOR SUBSCRIPTION CHECK
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("check_subscription:"))
-def check_subscription_callback(call):
-    """التحقق من الاشتراكات مرة أخرى"""
-    user_id = call.from_user.id
-    roulette_key = call.data.split(":")[1]
-    
-    # الحصول على معرف الروليت
-    roulette = db.fetch_one(
-        "SELECT id FROM roulettes WHERE roulette_key = ?",
-        (roulette_key,)
-    )
-    
-    if not roulette:
-        bot.answer_callback_query(call.id, "❌ الروليت غير موجودة", show_alert=True)
-        return
-    
-    roulette_id = roulette[0]
-    
-    # التحقق من الاشتراكات
-    is_subscribed, missing_channels = check_user_subscription_all_channels(user_id, roulette_id)
-    
-    if is_subscribed:
-        bot.answer_callback_query(call.id, "✅ أنت مشترك في جميع القنوات!", show_alert=True)
-        
-        # إعادة توجيه المستخدم إلى التحقق
-        emojis = ["🎯", "⚽", "🎮", "🏀", "🎾", "⚾", "🏈", "🎳", "🏓", "🎲"]
-        correct_emoji = random.choice(emojis)
-        other_emojis = [e for e in emojis if e != correct_emoji]
-        random.shuffle(other_emojis)
-        
-        keyboard = types.InlineKeyboardMarkup()
-        buttons = [types.InlineKeyboardButton(emoji,
-                     callback_data=f"verify:{roulette_key}:{emoji}:{correct_emoji}")
-                   for emoji in [correct_emoji] + other_emojis]
-        keyboard.row(*buttons[:3])
-        keyboard.row(*buttons[3:6])
-        
-        bot.edit_message_text(
-            f"<b>🔐 تحقق من الهوية</b>\n\n"
-            f"<b>اختر الرمز التالي:</b> <code>{correct_emoji}</code>\n\n"
-            f"<b>لديك محاولات غير محدودة</b>",
-            user_id, call.message.message_id,
-            reply_markup=keyboard
-        )
-    else:
-        # بناء رسالة القنوات المفقودة
-        missing_message = (
-            "<b>❌ ما زلت غير مشترك في بعض القنوات</b>\n\n"
-            "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            "<b>القنوات المطلوبة:</b>\n"
-        )
-        
-        for i, (ch_id, ch_name) in enumerate(missing_channels, 1):
-            channel_link = f"https://t.me/{ch_id[1:]}" if ch_id.startswith("@") else ch_id
-            missing_message += f"{i}. <a href=\"{channel_link}\">{ch_name}</a>\n"
-        
-        missing_message += (
-            f"\n<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            f"<i>بعد الاشتراك في جميع القنوات، اضغط على الزر أدناه</i>"
-        )
-        
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("🔄 تحقق مرة أخرى", 
-                     callback_data=f"check_subscription:{roulette_key}"))
-        
-        bot.edit_message_text(missing_message, user_id, call.message.message_id, reply_markup=keyboard)
-        bot.answer_callback_query(call.id, "❌ ما زالت هناك قنوات مفقودة", show_alert=True)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🎯 ENHANCED VERIFICATION FOR DEEPLINKS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@bot.message_handler(commands=['start'])
-def send_welcome_enhanced(message):
-    """ترحيب محسن مع دعم القنوات المتعددة"""
-    user_id = message.from_user.id
-    username = message.from_user.username or "NoUsername"
-    first_name = message.from_user.first_name or "User"
-    
-    if is_user_blocked(user_id):
-        bot.reply_to(message, "<b>❌ تم حظر حسابك من قبل الإدارة</b>")
-        return
-    
-    add_user(user_id, username, first_name)
-    
-    # التحقق من رابط التحقق (deeplink)
-    args = message.text.split()
-    if len(args) > 1 and args[1].startswith("verify_"):
-        roulette_key = args[1][7:] if len(args[1]) > 7 else ""
-        
-        if not roulette_key:
-            bot.send_message(user_id, "<b>❌ الروليت غير متوفرة</b>")
-            return
-        
-        roulette = db.fetch_one(
-            "SELECT id, status FROM roulettes WHERE roulette_key = ?",
-            (roulette_key,)
-        )
-        
-        if not roulette:
-            bot.send_message(user_id, "<b>❌ الروليت غير متوفرة</b>")
-            return
-        
-        roulette_id, status = roulette
-        
-        if status != "active":
-            bot.send_message(user_id, "<b>❌ انتهت الروليت بالفعل</b>")
-            return
-        
-        # التحقق من اشتراك المستخدم في جميع القنوات
-        is_subscribed, missing_channels = check_user_subscription_all_channels(user_id, roulette_id)
-        
-        if not is_subscribed:
-            missing_message = (
-                "<b>❌ يجب الاشتراك في جميع القنوات أولاً</b>\n\n"
-                "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                "<b>القنوات المطلوبة:</b>\n"
-            )
-            
-            for i, (ch_id, ch_name) in enumerate(missing_channels, 1):
-                channel_link = f"https://t.me/{ch_id[1:]}" if ch_id.startswith("@") else ch_id
-                missing_message += f"{i}. <a href=\"{channel_link}\">{ch_name}</a>\n"
-            
-            missing_message += (
-                f"\n<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                f"<i>بعد الاشتراك، استخدم نفس الرابط للمشاركة</i>"
-            )
-            
-            bot.send_message(user_id, missing_message)
-            return
-        
-        # إظهار تحقق الرموز
-        emojis = ["🎯", "⚽", "🎮", "🏀", "🎾", "⚾", "🏈", "🎳", "🏓", "🎲"]
-        correct_emoji = random.choice(emojis)
-        other_emojis = [e for e in emojis if e != correct_emoji]
-        random.shuffle(other_emojis)
-        
-        keyboard = types.InlineKeyboardMarkup()
-        buttons = [types.InlineKeyboardButton(emoji,
-                     callback_data=f"verify:{roulette_key}:{emoji}:{correct_emoji}")
-                   for emoji in [correct_emoji] + other_emojis]
-        keyboard.row(*buttons[:3])
-        keyboard.row(*buttons[3:6])
-        
-        bot.send_message(
-            user_id,
-            "<b>🔐 تحقق من الهوية</b>\n\n"
-            "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            "<b>⚠️ اختر الرمز الصحيح أدناه:</b>\n\n"
-            f"<b>🎯 الرمز المطلوب: {correct_emoji}</b>\n\n"
-            "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            "💡 <i>لديك محاولات غير محدودة</i>\n"
-            "✅ <i>اختر الرمز الصحيح للمشاركة</i>",
-            reply_markup=keyboard
-        )
-        return
-    
-    # باقي كود الترحيب ...
-    # (يبقى كما هو)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 📊 ADMIN TOOLS FOR MULTI-CHANNEL MANAGEMENT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@bot.callback_query_handler(func=lambda call: call.data == "view_roulette_channels")
-def view_roulette_channels(call):
-    """عرض قنوات الشرط لروليت معينة (للأدمن)"""
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ غير مسموح", show_alert=True)
-        return
-    
-    # طلب معرف الروليت
-    user_states[ADMIN_ID] = {"state": "view_roulette_channels"}
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🔙 إلغاء", callback_data="back_to_admin"))
-    
-    bot.send_message(
-        ADMIN_ID,
-        "<b>📋 عرض قنوات الشرط لروليت</b>\n\n"
-        "أرسل مفتاح الروليت (roulette_xxxx):",
-        reply_markup=keyboard
-    )
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 🎯 START BOT WITH ENHANCED FEATURES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-print("[MULTI-CHANNEL SUPPORT] ═════════════════════════════════════")
-print("[✓] Multi-channel condition system loaded")
-print("[✓] Database tables updated")
-print("[✓] Enhanced verification system ready")
-print("[✓] Admin tools for channel management available")
-print("[✓] Support for up to 10 channels per roulette")
-print("[✓] Real-time subscription checking enabled")
-
-# ======== استبدال معالجات الرسائل القديمة ========
-
-# استبدال handle_condition_channel بـ handle_condition_channels
-# إعادة توجيه handle_text_message لمعالجة الحالة الجديدة
-def handle_text_message_enhanced(message):
-    """معالج الرسائل المحسن"""
-    user_id = message.from_user.id
-    
-    if user_id not in user_states:
-        return
-    
-    state = user_states.get(user_id, {}).get("state")
-    
-    if state == "create_roulette_condition_channels":
-        handle_condition_channels(message)
-    # باقي الحالات تبقى كما هي...
-    elif state == "link_channel":
-        handle_link_channel(message)
-    elif state == "create_roulette_winners":
-        handle_winners_count(message)
-    elif state == "create_roulette_text":
-        handle_roulette_text_enhanced(message)
-    elif state == "create_roulette_countdown":
-        handle_roulette_countdown_enhanced(message)
-    elif state == "broadcast":
-        handle_broadcast(message)
-    elif state == "send_to_user_id":
-        handle_send_to_user_id(message)
-    elif state == "send_to_user_message":
-        handle_send_to_user_message(message)
-    elif state == "add_channel":
-        handle_add_channel(message)
-    elif state == "delete_channel":
-        handle_delete_channel(message)
-    elif state == "block_user":
-        handle_block_user(message)
-    elif state == "unblock_user":
-        handle_unblock_user(message)
-    elif state == "search_user":
-        handle_search_user(message)
-    elif state == "add_required_channel":
-        handle_add_required_channel(message)
-    elif state == "view_roulette_channels":
-        handle_view_roulette_channels(message)
-
-def handle_view_roulette_channels(message):
-    """معالجة عرض قنوات الروليت"""
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    roulette_key = message.text.strip()
-    
-    # البحث عن الروليت
-    roulette = db.fetch_one(
-        "SELECT id FROM roulettes WHERE roulette_key = ?",
-        (roulette_key,)
-    )
-    
-    if not roulette:
-        bot.send_message(ADMIN_ID, "<b>❌ لم يتم العثور على الروليت</b>")
-        user_states[ADMIN_ID] = {}
-        return
-    
-    roulette_id = roulette[0]
-    
-    # الحصول على قنوات الشرط
-    channels = get_roulette_condition_channels(roulette_id)
-    
-    if not channels:
-        bot.send_message(ADMIN_ID, f"<b>📋 الروليت: {roulette_key}</b>\n\nلا توجد قنوات شرط")
-    else:
-        message_text = f"<b>📋 قنوات شرط الروليت: {roulette_key}</b>\n\n"
-        
-        for i, (ch_id, ch_name) in enumerate(channels, 1):
-            message_text += f"{i}. {ch_name}\n   <code>{ch_id}</code>\n\n"
-        
-        message_text += f"<b>الإجمالي:</b> {len(channels)} قناة"
-        
-        bot.send_message(ADMIN_ID, message_text)
-    
-    user_states[ADMIN_ID] = {}
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 📝 UPDATE BOT INFO WITH MULTI-CHANNEL FEATURES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@bot.callback_query_handler(func=lambda call: call.data == "bot_info_enhanced")
-def show_bot_info_enhanced(call):
-    """معلومات البوت المحسنة"""
-    user_id = call.from_user.id
-    stats = get_bot_statistics()
-    
-    text = (
-        f"<b>ℹ️ معلومات البوت المتقدمة</b>\n\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        f"<b>🤖 معلومات عامة:</b>\n"
-        f"• <b>اسم البوت:</b> RedFoxRouletteBot\n"
-        f"• <b>الإصدار:</b> 2.1.0 (Multi-Channel)\n"
-        f"• <b>نوع الخدمة:</b> بوت روليت متقدم\n"
-        f"• <b>اللغة:</b> العربية\n\n"
-        f"<b>✨ الميزات الجديدة:</b>\n"
-        f"✅ دعم حتى 10 قنوات شرط للروليت الواحد\n"
-        f"✅ تحقق تلقائي من جميع الاشتراكات\n"
-        f"✅ إدارة متقدمة للقنوات المتعددة\n"
-        f"✅ تحديث مباشر للاشتراكات\n"
-        f"✅ لوحة تحكم محسنة\n\n"
-        f"<b>📊 إحصائيات عامة:</b>\n"
-        f"• <b>إجمالي المستخدمين:</b> {stats['total_users']}\n"
-        f"• <b>إجمالي الرولياتات:</b> {stats['total_roulettes']}\n"
-        f"• <b>الرولياتات النشطة:</b> {stats['active_roulettes']}\n"
-        f"• <b>إجمالي المشاركين:</b> {stats['total_participants']}\n\n"
-        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        f"💡 <i>شكرًا لاستخدامك البوت مع الميزات المتقدمة!</i>"
-    )
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🔙 العودة", callback_data="back_to_main"))
-    
-    bot.edit_message_text(text, user_id, call.message.message_id,
-                         reply_markup=keyboard)
-
-print("[SYSTEM] Multi-channel support fully integrated")
-print("[READY] Bot is now running with enhanced multi-channel features")
+if __name__ == "__main__":
+    main()
