@@ -1111,6 +1111,10 @@ async def admin_top_command(update, context):
         await message.reply_text("هذا الأمر مخصص للكروبات.")
         return
 
+    if not await is_group_admin(update, context):
+        await message.reply_text("هذا الأمر مخصص لمشرفي الكروب فقط.")
+        return
+
     try:
         administrators = await context.bot.get_chat_administrators(chat.id)
         admins = [item.user for item in administrators if not item.user.is_bot]
@@ -1187,6 +1191,10 @@ async def group_text_commands(update, context):
         )
 
     elif text == "توب":
+        if not await is_group_admin(update, context):
+            await message.reply_text("هذا الأمر مخصص لمشرفي الكروب فقط.")
+            return
+
         await show_top(
             chat.id,
             context,
@@ -1829,15 +1837,20 @@ async def clean_command(update, context):
 
 async def top_command(update, context):
     chat = update.effective_chat
+    message = update.effective_message
 
     if chat and chat.type in (
         ChatType.GROUP,
         ChatType.SUPERGROUP,
     ):
+        if not await is_group_admin(update, context):
+            await message.reply_text("هذا الأمر مخصص لمشرفي الكروب فقط.")
+            return
+
         await show_top(
             chat.id,
             context,
-            update.effective_message,
+            message,
         )
 
 
