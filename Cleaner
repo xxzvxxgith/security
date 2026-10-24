@@ -585,45 +585,36 @@ async def track_message(update, context):
 
     ensure_group(chat.id, chat.title or "")
 
-    # -----------------------------------------------------
-    # أولاً: التوب يحتسب جميع رسائل الأعضاء.
-    # يشمل النصوص العادية والميديا والروابط وغيرها.
-    # -----------------------------------------------------
-
-    with db() as con:
-        con.execute("""
-            INSERT INTO users(chat_id,user_id,name,messages)
-            VALUES(?,?,?,1)
-            ON CONFLICT(chat_id,user_id) DO UPDATE SET
-                name=excluded.name,
-                messages=users.messages+1
-        """, (
-            chat.id,
-            user.id,
-            user.full_name or str(user.id),
-        ))
-
-    # عدّاد مستقل لرسائل مشرفي الكروب؛ لا يؤثر في التوب العام.
+    # التوبان منفصلان: رسائل الأعضاء للتوب العام فقط،
+    # ورسائل المشرفين لتوب المشرفين فقط.
+    is_admin = False
+    role_checked = False
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
-        if member.status in (
+        is_admin = member.status in (
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.OWNER,
-        ):
-            with db() as con:
-                con.execute("""
-                    INSERT INTO admin_messages(chat_id,user_id,name,messages)
-                    VALUES(?,?,?,1)
-                    ON CONFLICT(chat_id,user_id) DO UPDATE SET
-                        name=excluded.name,
-                        messages=admin_messages.messages+1
-                """, (
-                    chat.id,
-                    user.id,
-                    user.full_name or str(user.id),
-                ))
+        )
+        role_checked = True
     except TelegramError as exc:
-        log.debug("تعذر تسجيل رسالة المشرف %s: %s", user.id, exc)
+        # إذا تعذر التحقق من الرتبة، لا نضيف الرسالة لأي توب
+        # حتى لا تدخل رسالة مشرف بالغلط في التوب العام.
+        log.debug("تعذر التحقق من رتبة المستخدم %s: %s", user.id, exc)
+
+    if role_checked:
+        table = "admin_messages" if is_admin else "users"
+        with db() as con:
+            con.execute(f"""
+                INSERT INTO {table}(chat_id,user_id,name,messages)
+                VALUES(?,?,?,1)
+                ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                    name=excluded.name,
+                    messages={table}.messages+1
+            """, (
+                chat.id,
+                user.id,
+                user.full_name or str(user.id),
+            ))
 
     # -----------------------------------------------------
     # ثانياً: سجل التنظيف يسجل أنواعاً محددة فقط.
@@ -743,14 +734,23 @@ def stats_text():
 
 
 async def show_top(chat_id, context, message=None):
+    # استبعاد المشرفين الحاليين أيضاً من السجلات القديمة.
+    admin_ids = set()
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id)
+        admin_ids = {item.user.id for item in admins}
+    except TelegramError as exc:
+        log.warning("تعذر جلب مشرفي الكروب للتوب العام %s: %s", chat_id, exc)
+
     with db() as con:
-        rows = con.execute("""
-            SELECT name,messages
+        all_rows = con.execute("""
+            SELECT name,user_id,messages
             FROM users
             WHERE chat_id=?
             ORDER BY messages DESC
-            LIMIT 10
         """, (chat_id,)).fetchall()
+
+    rows = [row for row in all_rows if row["user_id"] not in admin_ids][:10]
 
     if not rows:
         text = "لا توجد إحصائيات تفاعل حتى الآن."
@@ -1618,16 +1618,22 @@ async def panel_callback(update, context):
     elif data.startswith("topgroup:"):
         chat_id = int(data.split(":", 1)[1])
 
+        try:
+            admins = await context.bot.get_chat_administrators(chat_id)
+            admin_ids = {item.user.id for item in admins}
+        except TelegramError:
+            admin_ids = set()
+
         with db() as con:
-            rows = con.execute("""
+            all_rows = con.execute("""
                 SELECT name,user_id,messages
                 FROM users
                 WHERE chat_id=?
                 ORDER BY messages DESC
-                LIMIT 10
             """, (chat_id,)).fetchall()
 
-        lines = ["🏆 <b>توب الكروب</b>\n"]
+        rows = [row for row in all_rows if row["user_id"] not in admin_ids][:10]
+        lines = ["🏆 <b>توب الأعضاء فقط</b>\n"]
 
         if not rows:
             lines.append("لا توجد بيانات مسجلة.")
