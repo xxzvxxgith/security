@@ -28,9 +28,9 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError, BadRequest, Forbidden
 
 
-BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8906278700:AAGf5AZs6tKkPtROSxYjJPjLS4cuHX8tW5E')
-OWNER_ID = int(os.environ.get('OWNER_ADMIN_ID', '1537665613'))
-OWNER_USERNAME = os.environ.get('OWNER_USERNAME', '@xxzvxx')
+BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8401614136:AAE_RHy_z0rGZuAfLT484RRDrlYoQHO6rDM')
+OWNER_ID = int(os.environ.get('OWNER_ADMIN_ID', '2087179061'))
+OWNER_USERNAME = os.environ.get('OWNER_USERNAME', '@SS00G')
 
 DATA_DIR = 'bot_data'
 USERS_FILE = f'{DATA_DIR}/users.json'
@@ -1356,4 +1356,4 @@ def main():
     bot.run()
 
 if __name__ == '__main__':
-    main()
+    main() 
