@@ -988,20 +988,66 @@ async def moderate_message(update, context):
     if not group or not group.get("enabled", 1):
         return
 
-    # استثناء مشرفي الكروب من الحذف والاشتراك الإجباري.
+    # الردود ممنوعة على الأعضاء ومشرفي المجموعة أيضاً،
+    # باستثناء مالك البوت ومالك المجموعة فقط.
+    # الرد على رسالة المستخدم نفسه يبقى مسموحاً.
+    is_group_owner = False
     try:
         member = await context.bot.get_chat_member(
             chat.id, user.id
         )
-
-        if member.status in (
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        ):
-            return
-
+        is_group_owner = member.status == ChatMemberStatus.OWNER
     except TelegramError:
-        pass
+        member = None
+
+    if (
+        group.get("replies_enabled", 1)
+        and message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.id != user.id
+        and not is_owner(user.id)
+        and not is_group_owner
+    ):
+        delete_text = (
+            group.get("delete_message")
+            or "ممنوع إرسال الردود"
+        )
+
+        if delete_text == "ممنوع إرسال الردود":
+            with db() as con:
+                row = con.execute("""
+                    SELECT delete_message
+                    FROM groups
+                    WHERE chat_id=0
+                """).fetchone()
+
+            if row and row["delete_message"]:
+                delete_text = row["delete_message"]
+
+        if await safe_delete(
+            chat.id,
+            message.message_id,
+            context,
+        ):
+            try:
+                await context.bot.send_message(
+                    chat.id,
+                    f"{user.mention_html()} "
+                    f"{html.escape(delete_text)}",
+                    parse_mode="HTML",
+                )
+            except TelegramError:
+                pass
+
+        return
+
+    # استثناء مشرفي الكروب من بقية أنواع الحذف والاشتراك الإجباري.
+    # هذا الاستثناء يأتي بعد فحص الردود حتى تُطبّق عليهم قاعدة منع الردود.
+    if member and member.status in (
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+    ):
+        return
 
     if await subscription_gate(update, context, group):
         return
@@ -1040,45 +1086,6 @@ async def moderate_message(update, context):
     ):
         delete = True
 
-    # حذف الرد على رسالة عضو آخر.
-    if (
-        group.get("replies_enabled", 1)
-        and message.reply_to_message
-        and message.reply_to_message.from_user
-        and message.reply_to_message.from_user.id != user.id
-    ):
-        delete_text = (
-            group.get("delete_message")
-            or "ممنوع إرسال الردود"
-        )
-
-        if delete_text == "ممنوع إرسال الردود":
-            with db() as con:
-                row = con.execute("""
-                    SELECT delete_message
-                    FROM groups
-                    WHERE chat_id=0
-                """).fetchone()
-
-            if row and row["delete_message"]:
-                delete_text = row["delete_message"]
-
-        if await safe_delete(
-            chat.id,
-            message.message_id,
-            context,
-        ):
-            try:
-                await context.bot.send_message(
-                    chat.id,
-                    f"{user.mention_html()} "
-                    f"{html.escape(delete_text)}",
-                    parse_mode="HTML",
-                )
-            except TelegramError:
-                pass
-
-        return
 
     if delete:
         await safe_delete(
@@ -1987,4 +1994,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
