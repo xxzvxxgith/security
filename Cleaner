@@ -34,9 +34,9 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = os.getenv("BOT_TOKEN", "8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY").strip()
+TOKEN = os.getenv("BOT_TOKEN", "8712130465:AAHo97ZQAx9BCd1mNsGbVUXj4jhlndYPr0w").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "1537665613"))
-DEFAULT_ADMINS = {OWNER_ID, 6369115613}
+DEFAULT_ADMINS = {OWNER_ID, 1593947628}
 
 DB_PATH = "bot.db"
 CLEAN_HOURS = 24
@@ -591,12 +591,13 @@ async def track_message(update, context):
     role_checked = False
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
-        is_admin = member.status in (
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
+        # Telegram API status values are strings: "creator", "administrator",
+        # "member", etc. Use the raw values here to avoid enum-version differences.
+        is_admin = str(member.status).lower() in (
+            "administrator", "creator", "owner"
         )
         role_checked = True
-    except TelegramError as exc:
+    except Exception as exc:
         # إذا تعذر التحقق من الرتبة، لا نضيف الرسالة لأي توب
         # حتى لا تدخل رسالة مشرف بالغلط في التوب العام.
         log.debug("تعذر التحقق من رتبة المستخدم %s: %s", user.id, exc)
@@ -739,8 +740,13 @@ async def show_top(chat_id, context, message=None):
     try:
         admins = await context.bot.get_chat_administrators(chat_id)
         admin_ids = {item.user.id for item in admins}
-    except TelegramError as exc:
+    except Exception as exc:
         log.warning("تعذر جلب مشرفي الكروب للتوب العام %s: %s", chat_id, exc)
+        if message:
+            await message.reply_text("تعذر التحقق من قائمة المشرفين حالياً؛ لم أعرض التوب حتى لا تظهر إحصائياتهم ضمن توب الأعضاء.")
+        else:
+            await context.bot.send_message(chat_id, "تعذر التحقق من قائمة المشرفين حالياً؛ لم أعرض التوب حتى لا تظهر إحصائياتهم ضمن توب الأعضاء.")
+        return
 
     with db() as con:
         all_rows = con.execute("""
@@ -1621,8 +1627,11 @@ async def panel_callback(update, context):
         try:
             admins = await context.bot.get_chat_administrators(chat_id)
             admin_ids = {item.user.id for item in admins}
-        except TelegramError:
-            admin_ids = set()
+        except Exception:
+            await query.edit_message_text(
+                "تعذر التحقق من قائمة المشرفين حالياً؛ لم أعرض التوب حتى لا تظهر إحصائياتهم ضمن توب الأعضاء."
+            )
+            return
 
         with db() as con:
             all_rows = con.execute("""
@@ -1978,4 +1987,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
