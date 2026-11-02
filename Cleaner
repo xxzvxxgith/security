@@ -1105,11 +1105,24 @@ async def resolve_target(update, context, target_text):
     message = update.effective_message
     chat = update.effective_chat
 
+    # عند الاستهداف بالرد: from_user يرجع كائن User مباشرة، وليس ChatMember.
+    # نحوله إلى ChatMember حتى نستطيع فحص الرتبة ثم استخراج المستخدم بشكل موحّد.
     if message.reply_to_message and message.reply_to_message.from_user and not target_text:
-        return message.reply_to_message.from_user
+        replied_user = message.reply_to_message.from_user
+        try:
+            return await context.bot.get_chat_member(chat.id, replied_user.id)
+        except TelegramError:
+            # حتى لو تعذر جلب العضوية، نرجع User نفسه؛ member_user يتعامل مع الحالتين.
+            return replied_user
 
     token = (target_text or "").strip().split()[0] if (target_text or "").strip() else ""
     if not token:
+        if message.reply_to_message and message.reply_to_message.from_user:
+            replied_user = message.reply_to_message.from_user
+            try:
+                return await context.bot.get_chat_member(chat.id, replied_user.id)
+            except TelegramError:
+                return replied_user
         return None
 
     token = token.strip(",،")
@@ -1139,7 +1152,10 @@ async def resolve_target(update, context, target_text):
 
 
 def member_user(member):
-    return getattr(member, "user", None)
+    """يدعم ChatMember (يحمل .user) وUser مباشرة (مثل الرد على رسالة)."""
+    if member is None:
+        return None
+    return getattr(member, "user", member)
 
 
 async def moderation_command(update, context, parsed):
