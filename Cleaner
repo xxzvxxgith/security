@@ -17,11 +17,14 @@ import time
 import html
 import sqlite3
 import logging
+import re
+from datetime import datetime, timezone
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ChatPermissions,
 )
 from telegram.constants import ChatType, ChatMemberStatus
 from telegram.error import TelegramError
@@ -34,7 +37,7 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = os.getenv("BOT_TOKEN", "8712130465:AAHo97ZQAx9BCd1mNsGbVUXj4jhlndYPr0w").strip()
+TOKEN = os.getenv("BOT_TOKEN", "8707884664:AAGEbtnhOIfRYsxw8Nb9MhnaM6LYQVqC0GY").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "1537665613"))
 DEFAULT_ADMINS = {OWNER_ID, 1593947628}
 
@@ -129,6 +132,28 @@ def init_db():
             channel TEXT DEFAULT '',
             group_link TEXT DEFAULT ''
         );
+
+        CREATE TABLE IF NOT EXISTS member_directory(
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT DEFAULT '',
+            full_name TEXT DEFAULT '',
+            PRIMARY KEY(chat_id,user_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_member_directory_username
+        ON member_directory(chat_id, username);
+
+        CREATE TABLE IF NOT EXISTS active_moderations(
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            until_ts INTEGER NOT NULL,
+            actor_id INTEGER NOT NULL,
+            PRIMARY KEY(chat_id,user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_active_moderations_expiry
+        ON active_moderations(until_ts);
         """)
 
         # ترقية قاعدة البيانات القديمة دون حذف بياناتها.
@@ -319,6 +344,20 @@ async def bot_can_delete(chat_id, context):
         return False
 
 
+async def bot_can_restrict(chat_id, context):
+    try:
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
+        return (
+            me.status == ChatMemberStatus.OWNER
+            or (
+                me.status == ChatMemberStatus.ADMINISTRATOR
+                and bool(getattr(me, "can_restrict_members", False))
+            )
+        )
+    except TelegramError:
+        return False
+
+
 async def safe_delete(chat_id, message_id, context):
     try:
         await context.bot.delete_message(
@@ -362,6 +401,9 @@ def home_kb():
         [
             ("👥 إدارة المشرفين", "admins"),
             ("🏆 التوب", "topmenu"),
+        ],
+        [
+            ("🔇 إعدادات الكتم والتقييد", "moderation_help"),
         ],
         [
             ("🟢 تشغيل / إيقاف البوت", "global_toggle"),
@@ -584,6 +626,19 @@ async def track_message(update, context):
         return
 
     ensure_group(chat.id, chat.title or "")
+
+    # حفظ اليوزر والآيدي حتى يمكن استهداف العضو باليوزر لاحقاً.
+    with db() as con:
+        con.execute("""
+            INSERT INTO member_directory(chat_id,user_id,username,full_name)
+            VALUES(?,?,?,?)
+            ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                username=excluded.username,
+                full_name=excluded.full_name
+        """, (
+            chat.id, user.id, (user.username or "").lower(),
+            user.full_name or str(user.id),
+        ))
 
     # التوبان منفصلان: رسائل الأعضاء للتوب العام فقط،
     # ورسائل المشرفين لتوب المشرفين فقط.
@@ -955,6 +1010,295 @@ async def subscription_gate(update, context, group):
 
 
 # =========================================================
+# الكتم والتقييد المؤقتان
+# =========================================================
+
+DURATION_SECONDS = {
+    "5 دقائق": 5 * 60,
+    "10 دقائق": 10 * 60,
+    "30 دقيقة": 30 * 60,
+    "ساعة": 60 * 60,
+}
+
+ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+
+def active_moderation(chat_id, user_id):
+    now = int(time.time())
+    with db() as con:
+        row = con.execute(
+            "SELECT kind,until_ts FROM active_moderations WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id),
+        ).fetchone()
+        if row and int(row["until_ts"]) <= now:
+            con.execute(
+                "DELETE FROM active_moderations WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
+            )
+            return None
+    return dict(row) if row else None
+
+
+def save_moderation(chat_id, user_id, kind, until_ts, actor_id):
+    with db() as con:
+        con.execute("""
+            INSERT INTO active_moderations(chat_id,user_id,kind,until_ts,actor_id)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                kind=excluded.kind, until_ts=excluded.until_ts, actor_id=excluded.actor_id
+        """, (chat_id, user_id, kind, until_ts, actor_id))
+
+
+def remove_moderation(chat_id, user_id):
+    with db() as con:
+        con.execute(
+            "DELETE FROM active_moderations WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id),
+        )
+
+
+async def expire_moderations(context):
+    """تنظيف سجلات المدد المنتهية؛ تقييد تيليجرام نفسه ينتهي تلقائياً عند until_date."""
+    now = int(time.time())
+    with db() as con:
+        con.execute("DELETE FROM active_moderations WHERE until_ts<=?", (now,))
+
+
+def parse_moderation_command(text):
+    normalized = (text or "").strip().translate(ARABIC_DIGITS)
+    normalized = re.sub(r"\s+", " ", normalized)
+
+    if normalized.startswith("رفع القيود"):
+        target_text = normalized[len("رفع القيود"):].strip()
+        return "lift", None, target_text
+
+    match = re.match(r"^(كتم|تقييد)\b(.*)$", normalized)
+    if not match:
+        return None
+
+    action = "mute" if match.group(1) == "كتم" else "restrict"
+    rest = match.group(2).strip()
+    rest = re.sub(r"^لمدة\s*", "", rest)
+
+    duration_match = re.search(
+        r"(?<!\d)(5\s*دقائق|10\s*دقائق|30\s*دقيقة|ساعة)(?!\w)",
+        rest,
+    )
+    if not duration_match:
+        return None
+
+    duration_raw = re.sub(r"\s+", " ", duration_match.group(1)).strip()
+    duration_key = duration_raw
+    if duration_key.startswith("5"):
+        duration_key = "5 دقائق"
+    elif duration_key.startswith("10"):
+        duration_key = "10 دقائق"
+    elif duration_key.startswith("30"):
+        duration_key = "30 دقيقة"
+
+    target_text = (rest[:duration_match.start()] + " " + rest[duration_match.end():]).strip()
+    target_text = re.sub(r"^لمدة\s*|\s+لمدة\s*$", "", target_text).strip()
+    return action, duration_key, target_text
+
+
+async def resolve_target(update, context, target_text):
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if message.reply_to_message and message.reply_to_message.from_user and not target_text:
+        return message.reply_to_message.from_user
+
+    token = (target_text or "").strip().split()[0] if (target_text or "").strip() else ""
+    if not token:
+        return None
+
+    token = token.strip(",،")
+    if token.startswith("@"):
+        username = token[1:].lower()
+        with db() as con:
+            row = con.execute("""
+                SELECT user_id,full_name,username
+                FROM member_directory
+                WHERE chat_id=? AND username=?
+                ORDER BY user_id DESC LIMIT 1
+            """, (chat.id, username)).fetchone()
+        if not row:
+            return None
+        try:
+            return await context.bot.get_chat_member(chat.id, int(row["user_id"]))
+        except TelegramError:
+            return None
+
+    token = token.translate(ARABIC_DIGITS)
+    if token.lstrip("-").isdigit():
+        try:
+            return await context.bot.get_chat_member(chat.id, int(token))
+        except TelegramError:
+            return None
+    return None
+
+
+def member_user(member):
+    return getattr(member, "user", None)
+
+
+async def moderation_command(update, context, parsed):
+    message = update.effective_message
+    chat = update.effective_chat
+    actor = update.effective_user
+
+    if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply_text("هذا الأمر يعمل داخل المجموعات فقط.")
+        return
+
+    try:
+        actor_member = await context.bot.get_chat_member(chat.id, actor.id)
+    except TelegramError:
+        await message.reply_text("تعذر التحقق من صلاحياتك.")
+        return
+
+    actor_is_admin = actor_member.status in (
+        ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER
+    )
+    if not actor_is_admin and not is_owner(actor.id):
+        await message.reply_text("❌ هذه الأوامر للمالك ومشرفي المجموعة فقط.")
+        return
+
+    action, duration_key, target_text = parsed
+    target_member = await resolve_target(update, context, target_text)
+    target = member_user(target_member) if target_member else None
+    if not target:
+        await message.reply_text(
+            "لم أستطع تحديد العضو. استخدم الرد على رسالته، أو آيديه، "
+            "أو يوزره إذا سبق أن أرسل رسالة في المجموعة."
+        )
+        return
+
+    if target.is_bot:
+        await message.reply_text("لا يمكن تطبيق هذا الإجراء على بوت.")
+        return
+
+    if target.id == actor.id:
+        await message.reply_text("لا يمكنك تطبيق الإجراء على نفسك.")
+        return
+
+    try:
+        target_status = target_member.status
+        if target_status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR):
+            await message.reply_text("لا يمكن معاقبة مالك المجموعة أو أحد مشرفيها.")
+            return
+    except Exception:
+        pass
+
+    if action == "lift":
+        current = active_moderation(chat.id, target.id)
+        if not current:
+            await message.reply_text("ℹ️ لا توجد حالة كتم أو تقييد مسجلة لهذا العضو.")
+            return
+
+        if current["kind"] == "mute":
+            remove_moderation(chat.id, target.id)
+            await message.reply_text(
+                f"✅ تم رفع الكتم عن {target.mention_html()}.",
+                parse_mode="HTML",
+            )
+            return
+
+        try:
+            # restrictChatMember مع صلاحيات المجموعة الافتراضية يرفع تقييد العضو.
+            chat_info = await context.bot.get_chat(chat.id)
+            default_permissions = chat_info.permissions or ChatPermissions(
+                can_send_messages=True, can_send_audios=True,
+                can_send_documents=True, can_send_photos=True,
+                can_send_videos=True, can_send_video_notes=True,
+                can_send_voice_notes=True, can_send_polls=True,
+                can_send_other_messages=True, can_add_web_page_previews=True,
+            )
+            await context.bot.restrict_chat_member(
+                chat.id, target.id, permissions=default_permissions,
+                use_independent_chat_permissions=True,
+            )
+            remove_moderation(chat.id, target.id)
+            await message.reply_text(
+                f"✅ تم رفع التقييد عن {target.mention_html()}.",
+                parse_mode="HTML",
+            )
+        except TelegramError as exc:
+            log.warning("تعذر رفع التقييد عن %s: %s", target.id, exc)
+            await message.reply_text(
+                "❌ تعذر رفع التقييد. تأكد أن البوت مشرف ويملك صلاحية تقييد الأعضاء."
+            )
+        return
+
+    if not duration_key or duration_key not in DURATION_SECONDS:
+        await message.reply_text("المدة غير صحيحة. المتاح: 5 دقائق، 10 دقائق، 30 دقيقة، ساعة.")
+        return
+
+    until_ts = int(time.time()) + DURATION_SECONDS[duration_key]
+    until_dt = datetime.fromtimestamp(until_ts, tz=timezone.utc)
+
+    if action == "mute" and not await bot_can_delete(chat.id, context):
+        await message.reply_text("❌ يجب منح البوت صلاحية حذف الرسائل حتى يعمل الكتم.")
+        return
+    if action == "restrict" and not await bot_can_restrict(chat.id, context):
+        await message.reply_text("❌ يجب أن يكون البوت مشرفاً مع صلاحية تقييد الأعضاء.")
+        return
+
+    try:
+        if action == "mute":
+            save_moderation(chat.id, target.id, "mute", until_ts, actor.id)
+            action_label = "الكتم"
+        else:
+            await context.bot.restrict_chat_member(
+                chat.id, target.id,
+                permissions=ChatPermissions(
+                    can_send_messages=False, can_send_audios=False,
+                    can_send_documents=False, can_send_photos=False,
+                    can_send_videos=False, can_send_video_notes=False,
+                    can_send_voice_notes=False, can_send_polls=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False,
+                ),
+                until_date=until_dt,
+                use_independent_chat_permissions=True,
+            )
+            save_moderation(chat.id, target.id, "restrict", until_ts, actor.id)
+            action_label = "التقييد"
+
+        await message.reply_text(
+            f"✅ تم {action_label} {target.mention_html()} لمدة {duration_key}.\n"
+            f"ينتهي تلقائياً بعد انتهاء المدة.",
+            parse_mode="HTML",
+        )
+    except TelegramError as exc:
+        log.warning("فشل %s للعضو %s في %s: %s", action, target.id, chat.id, exc)
+        remove_moderation(chat.id, target.id)
+        await message.reply_text(
+            "❌ فشل تنفيذ الإجراء. تأكد أن البوت مشرف ويملك صلاحية تقييد الأعضاء. "
+            "إذا كان العضو مشرفاً أو أعلى رتبة فلن يمكن معاقبته."
+        )
+
+
+async def show_moderation_help(message):
+    await message.reply_text(
+        "🔇 <b>إعدادات الكتم والتقييد</b>\n\n"
+        "<b>1- الكتم:</b> 5 دقائق، 10 دقائق، 30 دقيقة، ساعة.\n"
+        "عند الكتم، أي رسالة يرسلها العضو تُحذف تلقائياً حتى تنتهي المدة.\n\n"
+        "<b>2- التقييد:</b> 5 دقائق، 10 دقائق، 30 دقيقة، ساعة.\n"
+        "يمنع العضو من إرسال الرسائل والوسائط والاستطلاعات. وينتهي تلقائياً.\n\n"
+        "<b>طريقة الاستعمال:</b>\n"
+        "اعمل رد على رسالة العضو واكتب مثلاً: <code>كتم لمدة 5 دقائق</code>\n"
+        "أو: <code>تقييد لمدة ساعة</code>\n"
+        "ويمكن إضافة الآيدي أو اليوزر بعد الأمر، مثل: <code>كتم لمدة 10 دقائق 123456</code> أو <code>تقييد @username لمدة 30 دقيقة</code>.\n\n"
+        "<b>رفع القيود:</b> اكتب <code>رفع القيود</code> بالرد على العضو، أو أضف آيديه/يوزره.\n\n"
+        "⚠️ الأوامر للمالك ومشرفي المجموعة فقط. يجب أن يكون البوت مشرفاً مع صلاحية تقييد الأعضاء. "
+        "ملاحظة: تيليجرام لا يوفّر للبوت صلاحية منع تفاعلات الرياكشن لعضو واحد بشكل مستقل.",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+# =========================================================
 # الردود التلقائية والإشراف على الكروبات
 # =========================================================
 
@@ -979,6 +1323,12 @@ async def moderate_message(update, context):
     # التوب يحسب كل الرسائل.
     # سجل التنظيف يستقبل الأنواع المحددة فقط.
     await track_message(update, context)
+
+    # الكتم مستقل عن إعدادات الحذف العامة: رسائل المكتوم تُحذف دائماً.
+    moderation = active_moderation(chat.id, user.id)
+    if moderation and moderation["kind"] == "mute":
+        await safe_delete(chat.id, message.message_id, context)
+        return
 
     if setting("enabled", "1") != "1":
         return
@@ -1194,6 +1544,18 @@ async def group_text_commands(update, context):
 
     text = message.text.strip()
 
+    parsed_moderation = parse_moderation_command(text)
+    if parsed_moderation:
+        await moderation_command(update, context, parsed_moderation)
+        return
+
+    if text in ("إعدادات الكتم", "اعدادات الكتم", "إعدادات التقييد", "اعدادات التقييد"):
+        if not await is_group_admin(update, context):
+            await message.reply_text("هذه الإعدادات للمشرفين فقط.")
+            return
+        await show_moderation_help(message)
+        return
+
     if text == "تنظيف":
         await clean_24h(update, context)
 
@@ -1383,6 +1745,25 @@ async def panel_callback(update, context):
 
     if data == "home":
         await show_home(query, user.id)
+
+    elif data == "moderation_help":
+        await query.edit_message_text(
+            "🔇 <b>إعدادات الكتم والتقييد</b>\n\n"
+            "<b>الكتم:</b> 5 دقائق، 10 دقائق، 30 دقيقة، ساعة.\n"
+            "رسائل العضو المكتوم تُحذف تلقائياً.\n\n"
+            "<b>التقييد:</b> 5 دقائق، 10 دقائق، 30 دقيقة، ساعة.\n"
+            "يمنع إرسال النصوص والوسائط والاستطلاعات، ويرفع تيليجرام التقييد عند انتهاء المدة.\n\n"
+            "<b>أمثلة:</b>\n"
+            "• بالرد: <code>كتم لمدة 5 دقائق</code>\n"
+            "• بالرد: <code>تقييد لمدة ساعة</code>\n"
+            "• بالآيدي: <code>كتم لمدة 10 دقائق 123456</code>\n"
+            "• باليوزر: <code>تقييد @username لمدة 30 دقيقة</code>\n"
+            "• رفع الاثنين: <code>رفع القيود</code> بالرد أو مع الآيدي/اليوزر.\n\n"
+            "الأوامر للمالك ومشرفي المجموعة فقط. يلزم منح البوت صلاحية تقييد الأعضاء.\n"
+            "ملاحظة: لا يتيح Telegram Bot API منع رياكشنات عضو محدد بشكل مستقل.",
+            parse_mode="HTML",
+            reply_markup=back_kb(),
+        )
 
     elif data == "stats":
         await query.edit_message_text(
@@ -1986,6 +2367,13 @@ def main():
 
     app.add_error_handler(error_handler)
 
+    # تنظيف سجلات الكتم/التقييد المنتهية دورياً.
+    if app.job_queue:
+        app.job_queue.run_repeating(
+            expire_moderations, interval=15, first=5,
+            name="expire_moderations",
+        )
+
     log.info("Cleaner started.")
 
     app.run_polling(
@@ -1995,3 +2383,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
