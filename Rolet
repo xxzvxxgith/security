@@ -1,1359 +1,1340 @@
+# -*- coding: utf-8 -*-
+"""
+NewYear.py — بوت أشجار ومعايدات رأس السنة
+Python 3.10+ | aiogram 3 | aiosqlite
 
+التثبيت:
+    pip install -U aiogram aiosqlite
 
-import os
-import json
-import uuid
-import random
+التشغيل:
+    ضع BOT_TOKEN و OWNER_ID في متغيرات البيئة، ثم:
+    python NewYear.py
+
+Termux:
+    pkg update && pkg install python
+    pip install -U aiogram aiosqlite
+    export BOT_TOKEN="8906278700:AAGf5AZs6tKkPtROSxYjJPjLS4cuHX8tW5E"
+    export OWNER_ID="1537665613"
+    python NewYear.py
+
+ملاحظة الخصوصية:
+    الرسائل تُسلَّم إلى صاحب الشجرة المقصود فقط. لا توجد نسخة خفية للإدارة.
+    أُضيف تنبيه للمرسل بأن الرسالة تصل إلى صاحب الشجرة وقد تُراجع عند الإبلاغ
+    أو الاشتباه بإساءة الاستخدام.
+"""
+
 import asyncio
 import logging
-import re
+import os
+import secrets
 import string
-import time
-import html
-from datetime import datetime, timedelta
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional, List, Dict, Tuple, Any
+from urllib.parse import quote
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ChatMember, BotCommand, LabeledPrice, MessageOriginChannel
+import aiosqlite
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, BotCommand
 )
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters, PreCheckoutQueryHandler,
-    ChatMemberHandler
-)
-from telegram.constants import ParseMode
-from telegram.error import TelegramError, BadRequest, Forbidden
 
+# ============================= الإعدادات =============================
 
-BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8401614136:AAE_RHy_z0rGZuAfLT484RRDrlYoQHO6rDM')
-OWNER_ID = int(os.environ.get('OWNER_ADMIN_ID', '2087179061'))
-OWNER_USERNAME = os.environ.get('OWNER_USERNAME', '@SS00G')
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
+DB_PATH = os.getenv("DB_PATH", "NewYear.db")
+TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Baghdad")
+PAGE_SIZE = 5
+BROADCAST_DELAY = 0.05
+MAX_MESSAGE_LENGTH = 3500
 
-DATA_DIR = 'bot_data'
-USERS_FILE = f'{DATA_DIR}/users.json'
-ROULETTES_FILE = f'{DATA_DIR}/roulettes.json'
-BOUND_CHANNELS_FILE = f'{DATA_DIR}/bound_channels.json'
-BANNED_USERS_FILE = f'{DATA_DIR}/banned_users.json'
-SETTINGS_FILE = f'{DATA_DIR}/settings.json'
-TEMP_FILE = f'{DATA_DIR}/temp_data.json'
+if not BOT_TOKEN:
+    raise SystemExit("❌ ضع BOT_TOKEN في متغيرات البيئة قبل التشغيل.")
+if not OWNER_ID_RAW.isdigit():
+    raise SystemExit("❌ ضع OWNER_ID رقمياً في متغيرات البيئة قبل التشغيل.")
 
-os.makedirs(DATA_DIR, exist_ok=True)
-
+OWNER_ID = int(OWNER_ID_RAW)
+try:
+    LOCAL_TZ = ZoneInfo(TIMEZONE_NAME)
+except Exception:
+    LOCAL_TZ = timezone.utc
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
-logger = logging.getLogger("RouletteBot")
+log = logging.getLogger("NewYear")
+
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
 
-class RouletteState(Enum):
-    ACTIVE = "active"
-    PAUSED = "paused"
-    DRAWING = "drawing"
-    FINISHED = "finished"
+# ============================= الحالات =============================
 
-class DrawMethod(Enum):
-    MANUAL = "manual"
-    AUTOMATIC = "automatic"
-
-class RouletteType(Enum):
-    NORMAL = "normal"
-    PROTECTED = "protected"
+class UserStates(StatesGroup):
+    waiting_greeting = State()
 
 
-class DataManager:
-    """مدير البيانات المركزي - يضمن حفظ وتحميل البيانات بأمان"""
-    
-    def __init__(self):
-        self._lock = asyncio.Lock()
-        self._cache: Dict[str, Any] = {}
-        self._init_files()
-    
-    def _init_files(self):
-        defaults = {
-            USERS_FILE: {},
-            ROULETTES_FILE: {},
-            BOUND_CHANNELS_FILE: {},
-            BANNED_USERS_FILE: {},
-            TEMP_FILE: {},
-            SETTINGS_FILE: {
-                'bot_active': True,
-                'forced_channels': {},
-                'maintenance_msg': 'البوت متوقف للصيانة حالياً 🔧',
-                'admin_ids': [],
-                'referral_points': 2,
-                'daily_gift_points': 5,
-                'roulette_min_bet': 5,
-                'roulette_max_bet': 500
-            }
-        }
-        for filepath, default in defaults.items():
-            if not os.path.exists(filepath):
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    json.dump(default, f, ensure_ascii=False, indent=2)
-    
-    def _read(self, filepath: str) -> Dict:
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-    
-    def _write(self, filepath: str, data: Dict) -> bool:
-        try:
-            temp_path = f"{filepath}.tmp"
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(temp_path, filepath)
-            return True
-        except Exception as e:
-            logger.error(f"خطأ في الكتابة: {e}")
-            return False
-    
-    async def get_users(self) -> Dict:
-        async with self._lock:
-            return self._read(USERS_FILE)
-    
-    async def save_users(self, data: Dict) -> bool:
-        async with self._lock:
-            return self._write(USERS_FILE, data)
-    
-    async def get_roulettes(self) -> Dict:
-        async with self._lock:
-            return self._read(ROULETTES_FILE)
-    
-    async def save_roulettes(self, data: Dict) -> bool:
-        async with self._lock:
-            return self._write(ROULETTES_FILE, data)
-    
-    async def get_bound_channels(self) -> Dict:
-        async with self._lock:
-            return self._read(BOUND_CHANNELS_FILE)
-    
-    async def save_bound_channels(self, data: Dict) -> bool:
-        async with self._lock:
-            return self._write(BOUND_CHANNELS_FILE, data)
-    
-    async def get_banned(self) -> Dict:
-        async with self._lock:
-            return self._read(BANNED_USERS_FILE)
-    
-    async def save_banned(self, data: Dict) -> bool:
-        async with self._lock:
-            return self._write(BANNED_USERS_FILE, data)
-    
-    async def get_settings(self) -> Dict:
-        async with self._lock:
-            return self._read(SETTINGS_FILE)
-    
-    async def save_settings(self, data: Dict) -> bool:
-        async with self._lock:
-            return self._write(SETTINGS_FILE, data)
-    
-    async def get_temp(self, user_id: int) -> Dict:
-        async with self._lock:
-            data = self._read(TEMP_FILE)
-            return data.get(str(user_id), {})
-    
-    async def save_temp(self, user_id: int, temp_data: Dict) -> bool:
-        async with self._lock:
-            data = self._read(TEMP_FILE)
-            data[str(user_id)] = temp_data
-            return self._write(TEMP_FILE, data)
-    
-    async def delete_temp(self, user_id: int) -> bool:
-        async with self._lock:
-            data = self._read(TEMP_FILE)
-            if str(user_id) in data:
-                del data[str(user_id)]
-            return self._write(TEMP_FILE, data)
-
-data_manager = DataManager()
+class AdminStates(StatesGroup):
+    waiting_channel = State()
+    waiting_admin_id = State()
+    waiting_remove_admin_id = State()
+    waiting_broadcast = State()
+    waiting_broadcast_confirm = State()
+    waiting_user_id = State()
+    waiting_ban_id = State()
+    waiting_unban_id = State()
 
 
-class Texts:
-    WELCOME = (
-        "👋 : <b>أهلاً بك - {name}</b>\n\n"
-        "📍 • <b>روليت لإنشاء السحوبات والمسابقات والروليت السريع 🎡</b>\n\n"
-        "📍 • <b>استمتع وابدأ الآن بالاختيار من القائمة أدناه 👇</b>"
-    )
-    
-    CHANNEL_SELECTION_PROMPT = (
-        "🎯 <b>يرجى تحديد القناة أو القروب للسحب 🎯</b>\n\n"
-        "❝ <tg-spoiler>تأكد أولا انك مشرف في القناة او القروب وان البوت أيضا مشرف</tg-spoiler> ❞\n"
-        "❝ <tg-spoiler>إذا لم تظهر القناة أو الجروب وتأكدت ان البوت بها كمشرف وأنت كمشرف إذا يمكنك تسجيله يدويا من الأسفل</tg-spoiler> 📥 ❞"
-    )
+# ============================= قاعدة البيانات =============================
 
-    QUICK_ROULETTE_HOME = (
-        "⚙️ <b>قسم روليت سريع</b> 🎡\n\n"
-        "• <b>انشاء روليت:</b> انشاء روليت سريع\n"
-        "• <b>الاعدادات:</b> تحكم في اعادة اللعبة\n\n"
-        "❝ 🔻 <b>اختر ماتريده من القائمة ادناه</b> ❞"
-    )
-
-    CONTEST_HOME = (
-        "قسم إنشاء المسابقات 🐣\n\n"
-        "❝ 🔻 <b>اختر ما تريدمن القائمة أدناه</b> ❞"
-    )
-
-    QUICK_ROULETTE_SETTINGS = (
-        "⚙️ <b>اعدادات الروليت السريع</b> 🔵\n\n"
-        "❝ 🔻 <b>يمكنك التحكم في ما يلي</b> ❞\n\n"
-        "- <b>كليشة اللعبة :</b> {text}\n"
-        "- <b>اسماء المشاركين :</b> {show_names}\n"
-        "- <b>شرط التصويت:</b> {vote_cond}\n"
-        "- <b>شرط التفاعل:</b> {interact_cond}\n\n"
-        "❝ 🔻 <b>اختر ماتريده من القائمة ادناه</b> ❞"
-    )
-
-    CHANNEL_BINDING_CHANNEL = (
-        "ل إضافة قناة اتبع الخطوات التالية:\n\n"
-        "1️⃣ أضف البوت @ajushx_bot كمشرف في قناتك.\n"
-        "2️⃣ قم بإعادة توجيه أي رسالة من قناتك إلى البوت\n\n"
-        "≡✨ <b>ملاحظة:</b>\n"
-        "جميع المشرفين الآخرين في القناة سيتمكنون أيضًا من استخدام البوت بعد إضافته"
-    )
-
-    CHANNEL_BINDING_GROUP = (
-        "ل إضافة جروب اتبع الخطوات التالية:\n\n"
-        "1️⃣ أضف البوت @ajushx_bot كمشرف في الجروب الخاص بك\n"
-        "2️⃣ إذهب للجروب الخاص بك بعد إضافة البوت و اكتب <code>← تفعيل روليت</code>"
-    )
-    
-    ROULETTE_TEXT_PROMPT = (
-        "📝 أرسل كليشة السحب\n\n"
-        "1 - للتشويش: <code>&lt;tg-spoiler&gt;نص&lt;/tg-spoiler&gt;</code>\n"
-        "2 - للتعريض: <code>&lt;b&gt;نص&lt;/b&gt;</code>\n"
-        "3 - للمائل: <code>&lt;i&gt;نص&lt;/i&gt;</code>\n"
-        "4 - للاقتباس: <code>&lt;blockquote&gt;نص&lt;/blockquote&gt;</code>\n\n"
-        "⚠️ يرجى عدم إرسال روابط نهائياً"
-    )
-    
-    NOT_YOUR_COMMAND = "❗ هذا الأمر مخصص لمنشئ الروليت فقط"
-    BOT_MAINTENANCE = "🔧 البوت متوقف حالياً للصيانة"
-    FORCED_CHANNELS_PROMPT = "⚠️ عليك الانضمام للقنوات التالية أولاً:"
-
-    SUPPORT_TEXT = (
-        "⭐ <b>دعم البوت</b>\n\n"
-        "ادفع 5 نجوم تيليجرام لدعم تطوير البوت 💖\n"
-        "كل نجمة تساعدنا في الاستمرار وتطوير ميزات جديدة!\n\n"
-        "👇 اضغط على الزر أدناه للدفع:"
-    )
+async def db():
+    conn = await aiosqlite.connect(DB_PATH)
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA foreign_keys = ON")
+    await conn.execute("PRAGMA journal_mode = WAL")
+    return conn
 
 
-class Keyboards:
-    @staticmethod
-    def main_menu(user_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
-        buttons = [
-            [
-                InlineKeyboardButton("🐣 انشاء سحب", callback_data="start_roulette", style="primary"),
-                InlineKeyboardButton("🎡 روليت سريع", callback_data="quick_roulette", style="primary")
-            ],
-            [
-                InlineKeyboardButton("🏆 انشاء مسابقة", callback_data="create_contest", style="primary")
-            ],
-            [
-                InlineKeyboardButton("⏱️ سحوباتي", callback_data="my_roulettes", style="success"),
-                InlineKeyboardButton("📝 الشروط والأحكام", callback_data="terms", style="success")
-            ],
-            [
-                InlineKeyboardButton("🌟 دعم البوت", callback_data="bot_support", style="success"),
-                InlineKeyboardButton("🧑‍💻 الدعم الفني", url="https://t.me/SS00G", style="success")
-            ],
-            [
-                InlineKeyboardButton("📊 احصائياتي", callback_data="my_stats", style="primary")
-            ]
-        ]
-        if is_admin:
-            buttons.append([InlineKeyboardButton("⚙️ لوحة الأدمن", callback_data="admin_panel", style="primary")])
-        return InlineKeyboardMarkup(buttons)
+async def init_db():
+    async with await db() as con:
+        await con.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT NOT NULL,
+            unique_code TEXT UNIQUE NOT NULL,
+            joined_at TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            referred_by INTEGER,
+            is_banned INTEGER NOT NULL DEFAULT 0
+        );
 
-    @staticmethod
-    def contest_menu() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("❤️ انشاء مسابقة لايك", callback_data="contest_like", style="primary")],
-            [InlineKeyboardButton("🏆 انشاء مسابقة يستحق", callback_data="contest_deserve", style="primary")],
-            [
-                InlineKeyboardButton("➕ تسجيل قناة", callback_data="add_channel", style="primary"),
-                InlineKeyboardButton("➕ تسجيل قروب", callback_data="add_group", style="primary")
-            ],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="back_main", style="danger")]
-        ])
-    
-    @staticmethod
-    def support_menu() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("ادفع 5 نجوم", callback_data="pay_5_stars", style="success")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="back_main", style="danger")]
-        ])
+        CREATE TABLE IF NOT EXISTS greetings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            receiver_id INTEGER NOT NULL,
+            sender_id INTEGER,
+            sender_name TEXT NOT NULL,
+            message_text TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(receiver_id) REFERENCES users(user_id)
+        );
 
-    @staticmethod
-    def quick_roulette_menu() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎡 انشاء روليت", callback_data="qr_create", style="primary")],
-            [InlineKeyboardButton("⚙️ الاعدادات", callback_data="qr_settings", style="primary")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="back_main", style="danger")]
-        ])
+        CREATE TABLE IF NOT EXISTS visits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            visitor_id INTEGER NOT NULL,
+            first_seen TEXT NOT NULL,
+            UNIQUE(owner_id, visitor_id)
+        );
 
-    @staticmethod
-    def quick_roulette_settings_menu(settings_data: dict) -> InlineKeyboardMarkup:
-        show_names_txt = "اسماء المشاركين : مخفي" if not settings_data.get('show_names', False) else "اسماء المشاركين : ظاهر"
-        vote_txt = "شرط التصويت"
-        interact_txt = "شرط التفاعل"
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"👥 {show_names_txt}", callback_data="qr_toggle_names", style="primary"),
-             InlineKeyboardButton(f"🖊️ كليشة اللعبة", callback_data="qr_edit_text", style="primary")],
-            [InlineKeyboardButton(f"🗳️ {vote_txt}", callback_data="qr_vote_cond", style="primary"),
-             InlineKeyboardButton(f"🔗 {interact_txt}", callback_data="qr_interact_cond", style="primary")],
-            [InlineKeyboardButton("🔄 الرجوع للافتراضي", callback_data="qr_reset_defaults", style="success")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="quick_roulette", style="danger")]
-        ])
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            added_at TEXT NOT NULL,
+            added_by INTEGER NOT NULL
+        );
 
-    @staticmethod
-    def selection_menu(back_target: str = "quick_roulette") -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("➕ تسجيل قناة", callback_data="add_channel", style="primary"),
-                InlineKeyboardButton("➕ تسجيل جروب", callback_data="add_group", style="primary")
-            ],
-            [
-                InlineKeyboardButton("🗑️ حذف قناة", callback_data="delete_channel_menu", style="danger")
-            ],
-            [
-                InlineKeyboardButton("🔙 رجوع", callback_data=back_target, style="danger")
-            ]
-        ])
+        CREATE TABLE IF NOT EXISTS required_channels (
+            channel_id TEXT PRIMARY KEY,
+            channel_title TEXT,
+            invite_url TEXT NOT NULL
+        );
 
-    @staticmethod
-    def add_channel_menu() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="start_roulette", style="danger")]])
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
 
-    @staticmethod
-    def add_group_menu() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="start_roulette", style="danger")]])
+        CREATE TABLE IF NOT EXISTS broadcasts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            started_by INTEGER NOT NULL,
+            total INTEGER NOT NULL DEFAULT 0,
+            success INTEGER NOT NULL DEFAULT 0,
+            failed INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'running'
+        );
 
-    @staticmethod
-    def delete_channel_menu_kb() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="start_roulette", style="danger")]])
+        CREATE TABLE IF NOT EXISTS admin_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT,
+            created_at TEXT NOT NULL
+        );
 
-    @staticmethod
-    def roulette_control(roulette_id: str, is_active: bool, can_draw: bool = False) -> InlineKeyboardMarkup:
-        buttons = [
-            [InlineKeyboardButton("🎁 المشاركة", callback_data=f"join_{roulette_id}", style="success")],
-            [InlineKeyboardButton("🔔 ذكرني إذا فزت", callback_data=f"remind_{roulette_id}", style="primary")],
-        ]
-        if can_draw:
-            buttons.append([InlineKeyboardButton("🏁 ابدأ السحب", callback_data=f"draw_{roulette_id}", style="primary")])
-        toggle_text = "⏸️ إيقاف المشاركة" if is_active else "▶️ تشغيل المشاركة"
-        buttons.append([
-            InlineKeyboardButton(toggle_text, callback_data=f"toggle_{roulette_id}", style="danger"),
-            InlineKeyboardButton("📊 المشاركون", callback_data=f"participants_{roulette_id}", style="primary")
-        ])
-        return InlineKeyboardMarkup(buttons)
-    
-    @staticmethod
-    def admin_panel() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats", style="primary")],
-            [InlineKeyboardButton("📢 قنوات إجبارية", callback_data="admin_forced", style="primary")],
-            [InlineKeyboardButton("🚫 المحظورين", callback_data="admin_banned", style="danger")],
-            [InlineKeyboardButton("📣 إذاعة", callback_data="admin_broadcast", style="primary")],
-            [InlineKeyboardButton("⚙️ الإعدادات", callback_data="admin_settings", style="primary")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="back_main", style="danger")]
-        ])
-    
-    @staticmethod
-    def back_button(callback: str = "back_main", text: str = "🔙 رجوع") -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=callback, style="danger")]])
+        CREATE INDEX IF NOT EXISTS idx_greetings_receiver_year
+            ON greetings(receiver_id, year, id);
+        CREATE INDEX IF NOT EXISTS idx_visits_owner
+            ON visits(owner_id);
+        """)
+        await con.execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES('greetings_open','1')"
+        )
+        await con.commit()
 
 
-def get_display_name(user) -> str:
-    if user.first_name:
-        return user.first_name
-    if user.username:
-        return f"@{user.username}"
-    return f"User_{user.id}"
-
-def generate_id(length: int = 8) -> str:
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+def now_local():
+    return datetime.now(LOCAL_TZ)
 
 
-class RouletteMasterBot:
-    def __init__(self):
-        self.app: Optional[Application] = None
-        self.active_timers: Dict[str, asyncio.Task] = {}
-        self.user_states: Dict[int, str] = {}
-    
-    def build_app(self) -> Application:
-        self.app = Application.builder().token(BOT_TOKEN).build()
-        
-        self.app.add_handler(CommandHandler("start", self.cmd_start))
-        self.app.add_handler(CommandHandler("admin", self.cmd_admin))
-        self.app.add_handler(CommandHandler("cancel", self.cmd_cancel))
-        self.app.add_handler(CommandHandler("help", self.cmd_help))
+def now_iso():
+    return now_local().isoformat(timespec="seconds")
 
-        self.app.add_error_handler(self.error_handler)
-        
-        self.app.add_handler(CallbackQueryHandler(self.handle_callback))
-        self.app.add_handler(PreCheckoutQueryHandler(self.precheckout_callback))
-        self.app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, self.successful_payment_callback))
-        
-        self.app.add_handler(MessageHandler(
-            filters.ALL & ~filters.COMMAND,
-            self.handle_message
-        ))
-        
-        self.app.post_init = self.post_init
-        return self.app
-    
-    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """معالج الأخطاء لمنع توقف البوت"""
-        logger.error(f"حدث خطأ: {context.error}")
-    
-    async def post_init(self, app: Application):
-        commands = [
-            BotCommand("start", "بدء البوت"),
-            BotCommand("admin", "لوحة الأدمن"),
-            BotCommand("help", "المساعدة"),
-            BotCommand("cancel", "إلغاء العملية"),
-        ]
-        await app.bot.set_my_commands(commands)
-        logger.info("✅ البوت جاهز للعمل")
-    
-    def run(self):
-        app = self.build_app()
-        logger.info("🚀 بدء تشغيل البوت...")
-        app.run_polling(drop_pending_updates=True)
-    
-    async def is_admin(self, user_id: int) -> bool:
-        if user_id == OWNER_ID:
-            return True
-        settings = await data_manager.get_settings()
-        return user_id in settings.get('admin_ids', [])
-    
-    async def is_banned(self, user_id: int) -> bool:
-        banned = await data_manager.get_banned()
-        return str(user_id) in banned.get('global', [])
-    
-    async def is_bot_active(self) -> bool:
-        settings = await data_manager.get_settings()
-        return settings.get('bot_active', True)
-    
-    async def check_membership(self, bot, channel_id: int, user_id: int) -> bool:
-        try:
-            member = await bot.get_chat_member(channel_id, user_id)
-            return member.status in ['member', 'administrator', 'creator']
-        except (BadRequest, Forbidden):
-            return False
-    
-    async def check_forced_channels(self, bot, user_id: int) -> Tuple[bool, List[str]]:
-        settings = await data_manager.get_settings()
-        forced = settings.get('forced_channels', {})
-        if not forced:
-            return True, []
-        missing = []
-        for ch_id, ch_data in forced.items():
-            if not await self.check_membership(bot, int(ch_id), user_id):
-                missing.append(ch_data.get('link', ch_id))
-        return len(missing) == 0, missing
-    
-    async def register_user(self, bot, user) -> bool:
-        users = await data_manager.get_users()
-        user_id = str(user.id)
-        if user_id in users:
-            users[user_id]['last_seen'] = datetime.now().isoformat()
-            users[user_id]['name'] = get_display_name(user)
-            await data_manager.save_users(users)
-            return False
-        
-        users[user_id] = {
-            'id': user.id,
-            'username': user.username,
-            'name': get_display_name(user),
-            'join_date': datetime.now().isoformat(),
-            'last_seen': datetime.now().isoformat(),
-            'referral_code': f"REF{user.id}",
-            'referrals': 0,
-            'roulettes_created': 0,
-            'roulettes_won': 0,
-            'points': 0
-        }
-        await data_manager.save_users(users)
+
+def current_year():
+    return now_local().year
+
+
+def html_escape(value):
+    import html
+    return html.escape(str(value or ""))
+
+
+async def log_admin(admin_id: int, action: str, details: str = ""):
+    async with await db() as con:
+        await con.execute(
+            "INSERT INTO admin_logs(admin_id,action,details,created_at) VALUES(?,?,?,?)",
+            (admin_id, action, details, now_iso())
+        )
+        await con.commit()
+
+
+async def is_admin(user_id: int) -> bool:
+    if user_id == OWNER_ID:
         return True
-    
-    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
+    async with await db() as con:
+        cur = await con.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,))
+        return await cur.fetchone() is not None
 
-        if update.effective_chat.type != 'private':
-            return
-            
-        if await self.is_banned(user.id):
-            await update.message.reply_text("🚫 تم حظرك من استخدام البوت")
-            return
-        if not await self.is_bot_active() and not await self.is_admin(user.id):
-            await update.message.reply_text(Texts.BOT_MAINTENANCE)
-            return
-        
-        joined, missing = await self.check_forced_channels(context.bot, user.id)
-        if not joined:
-            text = Texts.FORCED_CHANNELS_PROMPT + "\n"
-            keyboard = [[InlineKeyboardButton("📢 اشترك", url=link, style="primary")] for link in missing]
-            keyboard.append([InlineKeyboardButton("✅ تحققت", callback_data="check_forced", style="success")])
-            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-            return
-        
-        await self.register_user(context.bot, user)
-        is_admin = await self.is_admin(user.id)
-        await update.message.reply_text(
-            Texts.WELCOME.format(name=get_display_name(user)),
-            parse_mode=ParseMode.HTML,
-            reply_markup=Keyboards.main_menu(user.id, is_admin)
+
+async def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
+
+
+async def get_setting(key: str, default: str = "") -> str:
+    async with await db() as con:
+        cur = await con.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = await cur.fetchone()
+        return row["value"] if row else default
+
+
+async def set_setting(key: str, value: str):
+    async with await db() as con:
+        await con.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value)
         )
-    
-    async def cmd_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.type != 'private': return
-        if not await self.is_admin(update.effective_user.id):
-            return
-        await update.message.reply_text("⚙️ لوحة الأدمن", reply_markup=Keyboards.admin_panel())
-    
-    async def cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.type != 'private': return
-        user_id = update.effective_user.id
-        self.user_states.pop(user_id, None)
-        await data_manager.delete_temp(user_id)
-        await update.message.reply_text("✅ تم الإلغاء", reply_markup=Keyboards.back_button())
-    
-    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.type != 'private': return
-        help_text = "📚 <b>دليل استخدام البوت</b>\n\n1️⃣ أضف البوت مشرفاً\n2️⃣ أنشئ روليت بسهولة"
-        await update.message.reply_text(help_text, parse_mode=ParseMode.HTML, reply_markup=Keyboards.back_button())
-    
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        user = query.from_user
-        data = query.data
-        
-        await query.answer()
-        if await self.is_banned(user.id):
-            return
-        
-        handlers = {
-            'back_main': self.back_to_main,
-            'check_forced': self.check_forced_callback,
-            'start_roulette': self.start_roulette,
-            'create_contest': self.show_contest_menu,
-            'contest_like': self.start_roulette,
-            'contest_deserve': self.start_roulette,
-            'quick_roulette': self.show_quick_roulette_menu,
-            'qr_create': self.start_roulette,
-            'qr_settings': self.show_quick_roulette_settings,
-            'qr_toggle_names': self.toggle_qr_names,
-            'qr_edit_text': self.prompt_qr_text,
-            'qr_vote_cond': self.prompt_qr_vote,
-            'qr_interact_cond': self.prompt_qr_interact,
-            'qr_reset_defaults': self.reset_qr_defaults,
-            'add_channel': self.start_add_channel,
-            'add_group': self.start_add_group,
-            'view_channels': self.view_my_channels,
-            'delete_channel_menu': self.delete_channel_menu,
-            'my_roulettes': self.show_my_roulettes,
-            'cycle_roulette_filter': self.cycle_roulette_filter,
-            'my_stats': self.show_stats,
-            'reminders_info': self.reminders_info,
-            'terms': self.show_terms,
-            'bot_support': self.show_support,
-            'pay_5_stars': self.pay_stars_callback,
-            'admin_panel': self.show_admin_panel,
-            'admin_stats': self.show_admin_stats,
-            'admin_forced': self.manage_forced_channels,
-            'admin_banned': self.manage_banned,
-            'admin_broadcast': self.start_broadcast,
-            'admin_settings': self.show_settings,
-        }
-        
-        if data in handlers:
-            await handlers[data](update, context)
-            return
-        
-        if data.startswith('join_'):
-            await self.join_roulette(update, context, data[5:])
-        elif data.startswith('remind_'):
-            await self.set_reminder(update, context, data[7:])
-        elif data.startswith('toggle_'):
-            await self.toggle_roulette(update, context, data[7:])
-        elif data.startswith('draw_'):
-            await self.start_draw(update, context, data[5:])
-        elif data.startswith('participants_'):
-            await self.view_participants(update, context, data[13:])
-        elif data.startswith('del_ch_'):
-            await self.delete_channel(update, context, data[7:])
-        elif data.startswith('sel_ch_'):
-            await self.handle_selected_channel(update, context, data[7:])
-    
-    async def show_contest_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.callback_query.edit_message_text(
-            Texts.CONTEST_HOME,
-            parse_mode=ParseMode.HTML,
-            reply_markup=Keyboards.contest_menu()
-        )
-
-    async def back_to_main(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        user = query.from_user
-        self.user_states.pop(user.id, None)
-        await data_manager.delete_temp(user.id)
-        is_admin = await self.is_admin(user.id)
-        try:
-            await query.edit_message_text(
-                Texts.WELCOME.format(name=get_display_name(user)),
-                parse_mode=ParseMode.HTML,
-                reply_markup=Keyboards.main_menu(user.id, is_admin)
-            )
-        except BadRequest as e:
-            if "Message is not modified" in str(e):
-                pass
-            else:
-                raise e
-    
-    async def check_forced_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        user = query.from_user
-        joined, missing = await self.check_forced_channels(context.bot, user.id)
-        if joined:
-            await self.register_user(context.bot, user)
-            is_admin = await self.is_admin(user.id)
-            await query.edit_message_text(
-                Texts.WELCOME.format(name=get_display_name(user)),
-                parse_mode=ParseMode.HTML,
-                reply_markup=Keyboards.main_menu(user.id, is_admin)
-            )
-        else:
-            await query.answer("❌ لم تشترك في جميع القنوات", show_alert=True)
-    
-
-    async def show_support(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.callback_query.edit_message_text(
-            Texts.SUPPORT_TEXT,
-            parse_mode=ParseMode.HTML,
-            reply_markup=Keyboards.support_menu()
-        )
-
-    async def pay_stars_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await context.bot.send_invoice(
-            chat_id=query.message.chat_id,
-            title="دعم البوت ⭐",
-            description="شراء دعم البوت في روليت تناهيد مقابل 5 نجوم",
-            payload="support_5_stars",
-            provider_token="",  
-            currency="XTR",     
-            prices=[LabeledPrice(label="دعم البوت", amount=5)],
-            start_parameter="support"
-        )
-
-    async def precheckout_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.pre_checkout_query
-        await query.answer(ok=True)
-
-    async def successful_payment_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "✅ شكراً لك على دعمك! تم استلام نجومك بنجاح 💖",
-            reply_markup=Keyboards.back_button()
-        )
-
-    async def show_quick_roulette_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.callback_query.edit_message_text(
-            Texts.QUICK_ROULETTE_HOME,
-            parse_mode=ParseMode.HTML,
-            reply_markup=Keyboards.quick_roulette_menu()
-        )
-
-    async def show_quick_roulette_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.callback_query.from_user.id
-        temp = await data_manager.get_temp(user_id)
-        qr_settings = temp.get('qr_settings', {
-            'text': '• مرحبا بكم في لعبه روليت 👑',
-            'show_names': False,
-            'vote_cond': 'متاح بالطلب',
-            'interact_cond': 'متاح بالطلب'
-        })
-        temp['qr_settings'] = qr_settings
-        await data_manager.save_temp(user_id, temp)
-
-        show_names_str = "ظاهر" if qr_settings['show_names'] else "مخفي"
-        text_msg = Texts.QUICK_ROULETTE_SETTINGS.format(
-            text=qr_settings['text'],
-            show_names=show_names_str,
-            vote_cond=qr_settings['vote_cond'],
-            interact_cond=qr_settings['interact_cond']
-        )
-        await update.callback_query.edit_message_text(
-            text_msg,
-            parse_mode=ParseMode.HTML,
-            reply_markup=Keyboards.quick_roulette_settings_menu(qr_settings)
-        )
-
-    async def toggle_qr_names(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.callback_query.from_user.id
-        temp = await data_manager.get_temp(user_id)
-        qr_settings = temp.get('qr_settings', {
-            'text': '• مرحبا بكم في لعبه روليت 👑',
-            'show_names': False,
-            'vote_cond': 'متاح بالطلب',
-            'interact_cond': 'متاح بالطلب'
-        })
-        qr_settings['show_names'] = not qr_settings['show_names']
-        temp['qr_settings'] = qr_settings
-        await data_manager.save_temp(user_id, temp)
-        
-        await update.callback_query.answer("تم التحديث ✅", show_alert=True)
-        await self.show_quick_roulette_settings(update, context)
-
-    async def prompt_qr_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.callback_query.from_user.id
-        self.user_states[user_id] = 'awaiting_qr_text'
-        temp = await data_manager.get_temp(user_id)
-        qr_settings = temp.get('qr_settings', {'text': '• مرحبا بكم في لعبه روليت 👑'})
-        
-        current_text = qr_settings.get('text', '')
-        prompt_msg = (
-            "✍️ <b>أرسل كليشة اللعبة</b>\n\n"
-            "اكتب نص السحب الذي تريد نشره في القناة.\n"
-            "يمكنك استخدام تنسيقات تيليجرام، مثل:\n"
-            "• نص عريض\n"
-            "• نص مائل\n"
-            "• نص مقتبس\n\n"
-            f"📌 <b>النص الحالي:</b>\n<blockquote>{current_text}</blockquote>"
-        )
-        await update.callback_query.edit_message_text(
-            prompt_msg,
-            parse_mode=ParseMode.HTML,
-            reply_markup=Keyboards.back_button("qr_settings")
-        )
-
-    async def prompt_qr_vote(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.callback_query.from_user.id
-        self.user_states[user_id] = 'awaiting_qr_vote'
-        await update.callback_query.edit_message_text(
-            "🗳️ <b>ارسل كود المتسابق الذي تريد جعله شرطاً لـ التصويت في الروليت السريع</b>\n\n"
-            "📌 مثال على الكود: <code>C12345678</code>\n\n"
-            "⚠️ <b>ملاحظة:</b> لن يتمكن أي شخص من المشاركة في الروليت قبل إتمام التصويت للمتسابق المحدد",
-            parse_mode=ParseMode.HTML,
-            reply_markup=Keyboards.back_button("qr_settings")
-        )
-
-    async def prompt_qr_interact(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.callback_query.from_user.id
-        self.user_states[user_id] = 'awaiting_qr_interact'
-        await update.callback_query.edit_message_text(
-            "🔗 <b>أرسل رابط المنشور المراد التفاعل معه كشرط للمشاركة في الروليت السريع:</b>\n\n"
-            "📌 سيتم إلزام المستخدم بالضغط مرتين لتأكيد تفاعله على المنشور قبل الانضمام ✅",
-            parse_mode=ParseMode.HTML,
-            reply_markup=Keyboards.back_button("qr_settings")
-        )
-
-    async def reset_qr_defaults(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.callback_query.from_user.id
-        temp = await data_manager.get_temp(user_id)
-        temp['qr_settings'] = {
-            'text': '• مرحبا بكم في لعبه روليت 👑',
-            'show_names': False,
-            'vote_cond': 'متاح بالطلب',
-            'interact_cond': 'متاح بالطلب'
-        }
-        await data_manager.save_temp(user_id, temp)
-        await update.callback_query.answer("تمت استعادة الإعدادات الافتراضية ✅", show_alert=True)
-        await self.show_quick_roulette_settings(update, context)
+        await con.commit()
 
 
-    async def start_roulette(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        user_id = query.from_user.id
-        data = query.data
-        
-        back_target = "quick_roulette"
-        if data in ['contest_like', 'contest_deserve']:
-            back_target = "create_contest"
-        elif data in ['start_roulette']:
-            back_target = "back_main"
-            
-        channels = await data_manager.get_bound_channels()
-        user_channels = channels.get(str(user_id), {})
-        
-        if not user_channels:
-            try:
-                await query.answer("❌ لا توجد قنوات أو مجموعات مسجلة!", show_alert=True)
-            except:
-                pass
-            await query.edit_message_text(
-                "❌ <b>لا توجد قنوات أو مجموعات مسجلة!</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=Keyboards.selection_menu(back_target)
-            )
-            return
+async def get_user(user_id: int):
+    async with await db() as con:
+        cur = await con.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+        return await cur.fetchone()
 
-        keyboard = []
-        for ch_id, ch_data in user_channels.items():
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"📢 {ch_data.get('title', ch_id)}",
-                    callback_data=f"sel_ch_{ch_id}",
-                    style="primary"
-                )
-            ])
-        keyboard.append([
-            InlineKeyboardButton("➕ تسجيل قناة", callback_data="add_channel", style="success"), 
-            InlineKeyboardButton("➕ تسجيل قروب", callback_data="add_group", style="success")
+
+async def get_user_by_code(code: str):
+    async with await db() as con:
+        cur = await con.execute("SELECT * FROM users WHERE unique_code=?", (code,))
+        return await cur.fetchone()
+
+
+def make_code(length=10):
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+async def ensure_user(tg_user, referred_by=None):
+    user_id = tg_user.id
+    existing = await get_user(user_id)
+    code = existing["unique_code"] if existing else make_code()
+    async with await db() as con:
+        await con.execute("""
+            INSERT INTO users(user_id,username,full_name,unique_code,joined_at,last_seen,referred_by)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                full_name=excluded.full_name,
+                last_seen=excluded.last_seen
+        """, (
+            user_id, tg_user.username, tg_user.full_name, code,
+            now_iso(), now_iso(), referred_by if not existing else None
+        ))
+        await con.commit()
+    return await get_user(user_id)
+
+
+async def user_is_banned(user_id: int) -> bool:
+    row = await get_user(user_id)
+    return bool(row and row["is_banned"])
+
+
+# ============================= لوحات المفاتيح =============================
+
+def main_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎄 شجرتي الخاصة", callback_data="my_tree"),
+         InlineKeyboardButton(text="📥 مشاركة رابط شجرتي", callback_data="share")],
+        [InlineKeyboardButton(text="📈 نشاط شجرتي", callback_data="activity"),
+         InlineKeyboardButton(text="💌 معايداتي", callback_data="inbox:0")],
+        [InlineKeyboardButton(text="📦 الأرشيف", callback_data="archive"),
+         InlineKeyboardButton(text="👥 الأصدقاء", callback_data="friends")],
+        [InlineKeyboardButton(text="⏳ العد التنازلي", callback_data="countdown"),
+         InlineKeyboardButton(text="⚙️ الإعدادات", callback_data="settings")],
+        [InlineKeyboardButton(text="ℹ️ حول البوت", callback_data="about")]
+    ])
+
+
+def back_keyboard(target="home"):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ رجوع", callback_data=target)]
+    ])
+
+
+def admin_keyboard(owner=False):
+    rows = [
+        [InlineKeyboardButton(text="📊 الإحصائيات العامة", callback_data="adm:stats")],
+        [InlineKeyboardButton(text="📢 إذاعة للأعضاء", callback_data="adm:broadcast")],
+        [InlineKeyboardButton(text="📣 قنوات الاشتراك الإجباري", callback_data="adm:channels")],
+        [InlineKeyboardButton(text="🔎 البحث عن مستخدم", callback_data="adm:lookup")],
+        [InlineKeyboardButton(text="🚫 حظر مستخدم", callback_data="adm:ban"),
+         InlineKeyboardButton(text="🔓 فك الحظر", callback_data="adm:unban")],
+        [InlineKeyboardButton(text="🟢 حالة استقبال المعايدات", callback_data="adm:toggle_greetings")],
+        [InlineKeyboardButton(text="📜 سجل الإدارة", callback_data="adm:logs")]
+    ]
+    if owner:
+        rows.insert(4, [InlineKeyboardButton(text="👮 إدارة المشرفين", callback_data="adm:admins")])
+    rows.append([InlineKeyboardButton(text="⬅️ القائمة الرئيسية", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def channels_keyboard(channels):
+    rows = []
+    for row in channels:
+        rows.append([
+            InlineKeyboardButton(text=f"🗑 حذف {row['channel_title'] or row['channel_id']}",
+                                 callback_data=f"channel_del:{row['channel_id']}")
         ])
-        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data=back_target, style="danger")])
-        
-        await query.edit_message_text(
-            Texts.CHANNEL_SELECTION_PROMPT,
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    async def start_add_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.callback_query.from_user.id
-        self.user_states[user_id] = 'awaiting_channel_forward'
-        temp = await data_manager.get_temp(user_id)
-        temp['state'] = 'awaiting_channel_forward'
-        await data_manager.save_temp(user_id, temp)
-        
-        await update.callback_query.edit_message_text(
-            Texts.CHANNEL_BINDING_CHANNEL,
-            parse_mode=ParseMode.HTML,
-            reply_markup=Keyboards.add_channel_menu()
-        )
+    rows.extend([
+        [InlineKeyboardButton(text="➕ إضافة قناة", callback_data="channel_add")],
+        [InlineKeyboardButton(text="⬅️ لوحة الإدارة", callback_data="admin")]
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def start_add_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.callback_query.from_user.id
-        self.user_states[user_id] = 'awaiting_group_activation'
-        temp = await data_manager.get_temp(user_id)
-        temp['state'] = 'awaiting_group_activation'
-        await data_manager.save_temp(user_id, temp)
-        
-        await update.callback_query.edit_message_text(
-            Texts.CHANNEL_BINDING_GROUP,
-            parse_mode=ParseMode.HTML,
-            reply_markup=Keyboards.add_group_menu()
+
+# ============================= الاشتراك الإجباري =============================
+
+async def get_channels():
+    async with await db() as con:
+        cur = await con.execute("SELECT * FROM required_channels ORDER BY channel_title")
+        return await cur.fetchall()
+
+
+async def check_subscription(user_id: int):
+    channels = await get_channels()
+    if not channels:
+        return True, []
+    missing = []
+    for channel in channels:
+        try:
+            member = await bot.get_chat_member(channel["channel_id"], user_id)
+            if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+                missing.append(channel)
+        except TelegramAPIError:
+            # لا نسمح بالتجاوز إذا تعذر التحقق؛ نوضح المشكلة للمستخدم.
+            missing.append(channel)
+    return len(missing) == 0, missing
+
+
+async def subscription_gate(message: Message = None, callback: CallbackQuery = None):
+    user = message.from_user if message else callback.from_user
+    ok, missing = await check_subscription(user.id)
+    if ok:
+        return True
+
+    rows = []
+    for ch in missing:
+        rows.append([InlineKeyboardButton(
+            text=f"📢 الاشتراك في {ch['channel_title'] or 'القناة'}",
+            url=ch["invite_url"]
+        )])
+    rows.append([InlineKeyboardButton(text="✅ تحققت من الاشتراك", callback_data="check_sub")])
+    text = "🔒 <b>الاشتراك مطلوب لاستخدام البوت</b>\n\nاشترك في القنوات التالية ثم اضغط «تحققت من الاشتراك»."
+    if message:
+        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    else:
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await callback.answer()
+    return False
+
+
+# ============================= إحصائيات ومعلومات =============================
+
+async def get_counts(user_id: int):
+    async with await db() as con:
+        cur = await con.execute("SELECT COUNT(*) n FROM greetings WHERE receiver_id=?", (user_id,))
+        greetings = (await cur.fetchone())["n"]
+        cur = await con.execute("SELECT COUNT(*) n FROM visits WHERE owner_id=?", (user_id,))
+        visits = (await cur.fetchone())["n"]
+        cur = await con.execute(
+            "SELECT COUNT(*) n FROM users WHERE referred_by=?", (user_id,)
         )
-    
-    async def view_my_channels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.callback_query.from_user.id
-        channels = await data_manager.get_bound_channels()
-        user_channels = channels.get(str(user_id), {})
-        
-        if not user_channels:
-            await update.callback_query.edit_message_text(
-                "❌ <b>لا توجد قنوات أو مجموعات مسجلة!</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=Keyboards.selection_menu()
-            )
-            return
-        
-        text = "📝 <b>قنواتك ومجموعاتك المربوطة:</b>\n\n"
-        for ch_id, ch_data in user_channels.items():
-            text += f"• {ch_data.get('title', 'غير معروف')}\n"
-            text += f"  @{ch_data.get('username', 'لا يوجد')}\n\n"
-        
-        await update.callback_query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=Keyboards.back_button("start_roulette")
+        joined = (await cur.fetchone())["n"]
+        cur = await con.execute(
+            "SELECT COUNT(*) n FROM greetings WHERE receiver_id=? AND created_at>=?",
+            (user_id, (now_local().replace(hour=0, minute=0, second=0, microsecond=0)).isoformat())
         )
-    
-    async def delete_channel_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.callback_query.from_user.id
-        channels = await data_manager.get_bound_channels()
-        user_channels = channels.get(str(user_id), {})
-        
-        if not user_channels:
-            await update.callback_query.edit_message_text(
-                "🗑️ <b>حذف قناة أو مجموعة</b>\n\nلا توجد قنوات مسجلة.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=Keyboards.delete_channel_menu_kb()
+        today = (await cur.fetchone())["n"]
+    return greetings, visits, joined, today
+
+
+def tree_link(bot_username: str, code: str):
+    return f"https://t.me/{bot_username}?start={code}"
+
+
+def countdown_text():
+    now = now_local()
+    target = datetime(now.year + 1, 1, 1, 0, 0, 0, tzinfo=LOCAL_TZ)
+    delta = target - now
+    seconds = max(0, int(delta.total_seconds()))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    return (
+        f"⏳ <b>العد التنازلي لرأس السنة {now.year + 1}</b>\n\n"
+        f"🎉 باقي:\n"
+        f"📅 <b>{days:,}</b> يوم\n"
+        f"🕒 <b>{hours:02}</b> ساعة\n"
+        f"⏱ <b>{minutes:02}</b> دقيقة\n"
+        f"⚡ <b>{secs:02}</b> ثانية\n\n"
+        f"<i>التوقيت: {now.strftime('%Y-%m-%d %H:%M:%S')} ({TIMEZONE_NAME})</i>"
+    )
+
+
+# ============================= أوامر البداية =============================
+
+async def start_handler_unused(message: Message, state: FSMContext):
+    await state.clear()
+    user = message.from_user
+    if await user_is_banned(user.id):
+        return await message.answer("🚫 حسابك محظور من استخدام البوت.")
+    if not await subscription_gate(message=message):
+        return
+
+    args = (message.text or "").split(maxsplit=1)
+    referral_owner = None
+    if len(args) > 1:
+        payload = args[1].strip()
+        if payload and payload != "home":
+            target = await get_user_by_code(payload)
+            if target and int(target["user_id"]) != user.id:
+                referral_owner = int(target["user_id"])
+
+    await ensure_user(user, referral_owner)
+    if referral_owner:
+        async with await db() as con:
+            await con.execute(
+                "INSERT OR IGNORE INTO visits(owner_id,visitor_id,first_seen) VALUES(?,?,?)",
+                (referral_owner, user.id, now_iso())
             )
-            return
-        
-        keyboard = []
-        for ch_id, ch_data in user_channels.items():
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"🗑️ {ch_data.get('title', ch_id)}",
-                    callback_data=f"del_ch_{ch_id}",
-                    style="danger"
-                )
+            await con.commit()
+
+    me = await bot.get_me()
+    profile = await get_user(user.id)
+    count, _, _, _ = await get_counts(user.id)
+    text = (
+        f"🎄 <b>أهلاً بك في NewYear</b>\n\n"
+        f"مرحباً {html_escape(user.first_name)} ✨\n"
+        f"هنا تصنع شجرتك الخاصة وتستقبل أجمل معايدات أصدقائك.\n\n"
+        f"💌 معايداتك الحالية: <b>{count}</b>\n"
+        f"🗓️ السنة الحالية: <b>{current_year()}</b>\n\n"
+        f"اختر ما تريد من القائمة:"
+    )
+    await message.answer(text, reply_markup=main_keyboard())
+
+
+# ============================= استقبال المعايدة =============================
+
+@dp.message(UserStates.waiting_greeting)
+async def receive_greeting(message: Message, state: FSMContext):
+    data = await state.get_data()
+    receiver_id = int(data.get("receiver_id", 0))
+    if not receiver_id:
+        await state.clear()
+        return await message.answer("انتهت جلسة إرسال المعايدة. افتح رابط الشجرة من جديد.")
+    if await get_setting("greetings_open", "1") != "1":
+        await state.clear()
+        return await message.answer("⛔ استقبال المعايدات متوقف حالياً.")
+    if message.from_user.id == receiver_id:
+        await state.clear()
+        return await message.answer("لا يمكنك إرسال معايدة إلى شجرتك الخاصة.")
+    if not message.text:
+        return await message.answer("حالياً أرسل المعايدة كنص فقط ✍️")
+    text = message.text.strip()
+    if not text or len(text) > MAX_MESSAGE_LENGTH:
+        return await message.answer(f"اكتب معايدة بين 1 و{MAX_MESSAGE_LENGTH} حرف.")
+    receiver = await get_user(receiver_id)
+    if not receiver:
+        await state.clear()
+        return await message.answer("هذه الشجرة لم تعد متاحة.")
+    sender_name = message.from_user.full_name or "صديق مجهول"
+    async with await db() as con:
+        await con.execute(
+            "INSERT INTO greetings(receiver_id,sender_id,sender_name,message_text,year,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (receiver_id, message.from_user.id, sender_name, text, current_year(), now_iso())
+        )
+        await con.commit()
+
+    await state.clear()
+    try:
+        await bot.send_message(
+            receiver_id,
+            "💌 <b>وصلتك معايدة جديدة!</b>\n\n"
+            f"👤 المرسل: {html_escape(sender_name)}\n"
+            f"📝 المعايدة:\n{html_escape(text)}\n\n"
+            f"🗓️ السنة: {current_year()}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💌 عرض معايداتي", callback_data="inbox:0")]
             ])
-        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="start_roulette", style="primary")])
-        
-        await update.callback_query.edit_message_text(
-            "🗑️ <b>اختر القناة أو المجموعة لحذفها:</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-    
-    async def delete_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str):
-        user_id = update.callback_query.from_user.id
-        channels = await data_manager.get_bound_channels()
-        user_channels = channels.get(str(user_id), {})
-        
-        if channel_id in user_channels:
-            del user_channels[channel_id]
-            channels[str(user_id)] = user_channels
-            await data_manager.save_bound_channels(channels)
-            await update.callback_query.answer("✅ تم حذف القناة بنجاح", show_alert=True)
-        else:
-            await update.callback_query.answer("❌ القناة غير موجودة", show_alert=True)
-        
-        await self.delete_channel_menu(update, context)
+    except TelegramForbiddenError:
+        pass
+    await message.answer(
+        "🎉 <b>تم إرسال معايدتك بنجاح!</b>\n\n"
+        "وصلت رسالتك إلى صاحب الشجرة. قد تُراجع الرسائل عند الإبلاغ أو الاشتباه بإساءة الاستخدام.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 القائمة الرئيسية", callback_data="home")]
+        ])
+    )
 
-    async def handle_selected_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str):
-        user_id = update.callback_query.from_user.id
-        temp = await data_manager.get_temp(user_id)
-        temp['channel_id'] = channel_id
-        await data_manager.save_temp(user_id, temp)
-        
-        await self.message_publish_quick(update, context, user_id)
 
-    async def message_publish_quick(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-        temp = await data_manager.get_temp(user_id)
-        channel_id = temp.get('channel_id')
-        qr_settings = temp.get('qr_settings', {
-            'text': '• مرحبا بكم في لعبه روليت 👑',
-            'show_names': False
-        })
-        
-        if not channel_id:
-            return
+# ============================= أزرار المستخدم =============================
 
-        roulette_id = generate_id()
-        text = f"{qr_settings.get('text', '')}\n\n👥 المشاركين: 0"
-        
-        try:
-            sent = await context.bot.send_message(
-                chat_id=int(channel_id),
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=Keyboards.roulette_control(roulette_id, True, False)
+@dp.callback_query(F.data == "check_sub")
+async def check_sub_callback(call: CallbackQuery):
+    if await user_is_banned(call.from_user.id):
+        return await call.answer("حسابك محظور.", show_alert=True)
+    ok, missing = await check_subscription(call.from_user.id)
+    if not ok:
+        return await call.answer("لم يكتمل الاشتراك بعد. اشترك في جميع القنوات أولاً.", show_alert=True)
+    await call.answer("تم التحقق بنجاح ✅")
+    await ensure_user(call.from_user)
+    await call.message.edit_text("✅ تم التحقق من اشتراكك. اضغط للمتابعة:", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🏠 القائمة الرئيسية", callback_data="home")]]
+    ))
+
+
+@dp.callback_query(F.data == "home")
+async def home_callback(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if not await subscription_gate(callback=call):
+        return
+    if await user_is_banned(call.from_user.id):
+        return await call.answer("حسابك محظور.", show_alert=True)
+    await ensure_user(call.from_user)
+    await call.answer()
+    await call.message.edit_text("🎄 <b>القائمة الرئيسية</b>\n\nاختر القسم الذي تريده:", reply_markup=main_keyboard())
+
+
+@dp.callback_query(F.data == "my_tree")
+async def my_tree_callback(call: CallbackQuery):
+    if not await subscription_gate(callback=call):
+        return
+    row = await ensure_user(call.from_user)
+    me = await bot.get_me()
+    link = tree_link(me.username, row["unique_code"])
+    count, visits, joined, today = await get_counts(call.from_user.id)
+    text = (
+        "🎄 <b>شجرتك الخاصة</b>\n\n"
+        f"👤 الاسم: {html_escape(call.from_user.full_name)}\n"
+        f"💌 المعايدات: <b>{count}</b>\n"
+        f"👀 الزيارات الفريدة: <b>{visits}</b>\n\n"
+        f"🔗 رابط شجرتك:\n<code>{link}</code>"
+    )
+    await call.answer()
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 مشاركة الرابط", url=f"https://t.me/share/url?url={quote(link, safe='')}")],
+        [InlineKeyboardButton(text="📈 نشاط شجرتي", callback_data="activity")],
+        [InlineKeyboardButton(text="⬅️ رجوع", callback_data="home")]
+    ]))
+
+
+@dp.callback_query(F.data == "share")
+async def share_callback(call: CallbackQuery):
+    if not await subscription_gate(callback=call):
+        return
+    row = await ensure_user(call.from_user)
+    me = await bot.get_me()
+    link = tree_link(me.username, row["unique_code"])
+    await call.answer()
+    await call.message.edit_text(
+        "📥 <b>شارك رابط شجرتك</b>\n\n"
+        "انسخ الرابط وأرسله لأصدقائك حتى يكتبون لك أجمل المعايدات:\n\n"
+        f"<code>{link}</code>\n\n"
+        "كل شخص يدخل من رابطك ويبدأ البوت تُسجَّل زيارته الفريدة.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 مشاركة الرابط", url=f"https://t.me/share/url?url={quote(link, safe='')}")],
+            [InlineKeyboardButton(text="⬅️ رجوع", callback_data="home")]
+        ])
+    )
+
+
+@dp.callback_query(F.data == "activity")
+async def activity_callback(call: CallbackQuery):
+    if not await subscription_gate(callback=call):
+        return
+    greetings, visits, joined, today = await get_counts(call.from_user.id)
+    async with await db() as con:
+        cur = await con.execute(
+            "SELECT year,COUNT(*) n FROM greetings WHERE receiver_id=? GROUP BY year ORDER BY year DESC",
+            (call.from_user.id,)
+        )
+        years = await cur.fetchall()
+    year_text = "\n".join([f"• {r['year']}: {r['n']} معايدة" for r in years]) or "لا توجد معايدات بعد."
+    await call.answer()
+    await call.message.edit_text(
+        "📈 <b>نشاط شجرتك</b>\n\n"
+        f"👀 الزيارات الفريدة: <b>{visits}</b>\n"
+        f"👥 مستخدمون جدد عبر رابطك: <b>{joined}</b>\n"
+        f"💌 إجمالي المعايدات: <b>{greetings}</b>\n"
+        f"📨 معايدات اليوم: <b>{today}</b>\n\n"
+        f"📅 <b>حسب السنوات:</b>\n{year_text}",
+        reply_markup=back_keyboard("home")
+    )
+
+
+async def show_greetings(call: CallbackQuery, year=None, page=0):
+    user_id = call.from_user.id
+    offset = page * PAGE_SIZE
+    async with await db() as con:
+        if year is None:
+            cur = await con.execute(
+                "SELECT * FROM greetings WHERE receiver_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+                (user_id, PAGE_SIZE, offset)
             )
-        except Exception as e:
-            await update.callback_query.message.reply_text(f"❗ فشل النشر في القناة: {e}")
-            return
-        
-        roulettes = await data_manager.get_roulettes()
-        roulettes[roulette_id] = {
-            'id': roulette_id,
-            'creator_id': str(user_id),
-            'channel_id': channel_id,
-            'message_id': sent.message_id,
-            'text': qr_settings.get('text', ''),
-            'participants': [],
-            'participant_names': {},
-            'winners': [],
-            'reminders': [],
-            'state': RouletteState.ACTIVE.value,
-            'created_at': datetime.now().isoformat()
-        }
-        await data_manager.save_roulettes(roulettes)
-        await data_manager.delete_temp(user_id)
-        
-        await update.callback_query.edit_message_text(
-            f"✅ <b>تم نشر الروليت السريع بنجاح!</b>\n🆔 المعرف: <code>{roulette_id}</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=Keyboards.back_button()
-        )
-
-
-    async def show_my_roulettes(self, update: Update, context: ContextTypes.DEFAULT_TYPE, filter_type: str = None):
-        user_id = update.callback_query.from_user.id
-        temp = await data_manager.get_temp(user_id)
-        
-        if filter_type is None:
-            current_filter = temp.get('my_roulettes_filter', 'all')
-        else:
-            current_filter = filter_type
-
-        temp['my_roulettes_filter'] = current_filter
-        await data_manager.save_temp(user_id, temp)
-
-        filter_names = {
-            'all': ('كل السحوبات', 'الكل'),
-            'active': ('النشطة فقط', 'النشطة'),
-            'finished': ('المنتهية فقط', 'المنتهية')
-        }
-        
-        filter_text, filter_btn = filter_names.get(current_filter, filter_names['all'])
-        
-        roulettes_data = await data_manager.get_roulettes()
-        user_roulettes = []
-        for r_id, r in roulettes_data.items():
-            if str(r.get('creator_id')) == str(user_id):
-                if current_filter == 'active' and r.get('state') not in [RouletteState.ACTIVE.value, RouletteState.PAUSED.value]:
-                    continue
-                if current_filter == 'finished' and r.get('state') != RouletteState.FINISHED.value:
-                    continue
-                user_roulettes.append(r)
-
-        text = f"🎁 <b>سحوباتي</b>\n\n"
-        if not user_roulettes:
-            text += f"لا توجد سحوبات ضمن فلتر «{filter_text}»."
-        else:
-            text += f"<b>قائمة السحوبات ({filter_text}):</b>\n\n"
-            for i, r in enumerate(user_roulettes, 1):
-                status_icon = "🟢" if r.get('state') == RouletteState.ACTIVE.value else "🔴"
-                safe_text = html.escape(r.get('text', '')[:20])
-                text += f"{i}. {status_icon} {safe_text}...\n"
-
-        keyboard = [
-            [InlineKeyboardButton(f"فلتر: {filter_btn}", callback_data="cycle_roulette_filter", style="success")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="back_main", style="danger")]
-        ]
-        
-        try:
-            await update.callback_query.edit_message_text(
-                text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(keyboard)
+            count_cur = await con.execute(
+                "SELECT COUNT(*) n FROM greetings WHERE receiver_id=?", (user_id,)
             )
-        except BadRequest as e:
-            if "Message is not modified" in str(e):
-                pass
-            else:
-                raise e
-
-    async def cycle_roulette_filter(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.callback_query.from_user.id
-        temp = await data_manager.get_temp(user_id)
-        current = temp.get('my_roulettes_filter', 'all')
-        
-        if current == 'all':
-            next_filter = 'active'
-        elif current == 'active':
-            next_filter = 'finished'
         else:
-            next_filter = 'all'
-            
-        await self.show_my_roulettes(update, context, filter_type=next_filter)
-
-    async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.callback_query.from_user.id
-        roulettes = await data_manager.get_roulettes()
-        channels_data = await data_manager.get_bound_channels()
-        
-        created_count = sum(1 for r in roulettes.values() if str(r.get('creator_id')) == str(user_id))
-        participated_count = sum(1 for r in roulettes.values() if str(user_id) in r.get('participants', []))
-        won_count = sum(1 for r in roulettes.values() if str(user_id) in r.get('winners', []))
-        
-        channel_stats = {}
-        channel_titles = {}
-        for uid, ch_dict in channels_data.items():
-            for ch_id, ch_info in ch_dict.items():
-                channel_titles[str(ch_id)] = ch_info.get('title', f"قناة {ch_id}")
-
-        for r in roulettes.values():
-            ch_id = str(r.get('channel_id'))
-            if ch_id:
-                if ch_id not in channel_stats:
-                    channel_stats[ch_id] = {
-                        'title': channel_titles.get(ch_id, f"قناة {ch_id}"),
-                        'participations': 0
-                    }
-                channel_stats[ch_id]['participations'] += len(r.get('participants', []))
-
-        sorted_channels = sorted(channel_stats.values(), key=lambda x: x['participations'], reverse=True)[:10]
-        
-        text = (
-            f"أهلاً بك! إليك ملخص نشاطك الإجمالي في بوت روليت تناهيد:\n\n"
-            f"🌟 <b>احصائياتي</b>\n"
-            f"❝ 🎯 سحوباتي انشأتها : {created_count}\n"
-            f"❝ 🏆 مرات المشاركة : {participated_count}\n"
-            f"❝ 🏆 مرات الفوز : {won_count} ❞\n\n"
-            f"🌟 <b>أعلى 10 قنوات على مستوى البوت</b>\n"
-        )
-        
-        medals = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-        
-        if not sorted_channels:
-            text += "لا توجد قنوات مسجلة حتى الآن."
-        else:
-            for i, ch in enumerate(sorted_channels):
-                medal = medals[i] if i < len(medals) else f"{i+1}️⃣"
-                safe_title = html.escape(ch['title'])
-                text += f"❝ {medal} - {safe_title} - <b>{ch['participations']}</b> مشاركة ❞\n"
-                
-        await update.callback_query.edit_message_text(
-            text, 
-            parse_mode=ParseMode.HTML, 
-            reply_markup=Keyboards.back_button()
-        )
-    
-    async def reminders_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.callback_query.answer("🔔 اضغط على 'ذكرني إذا فزت' لتلقي إشعار", show_alert=True)
-    
-    async def show_terms(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = (
-            "📜 <b>سياسة الاستخدام والخصوصية</b>\n\n"
-            "ثقتكم هي أولويتنا\n\n"
-            "✅ <b>المسموح به:</b>\n"
-            "├ تنظيم سحوبات حقيقية وواضحة\n"
-            "├ تقديم جوائز حقيقية وموثوقة\n"
-            "└ احترام جميع المشاركين\n\n"
-            "❌ <b>الممنوع:</b>\n"
-            "├ سحوبات وهمية أو مضللة\n"
-            "├ خداع المستخدمين\n"
-            "└ التلاعب بالنتائج\n\n"
-            "<blockquote>🚨 <b>أي مخالفة = حظر دائم</b>\n"
-            "ثقتكم هي أولويتنا</blockquote>"
-        )
-        await update.callback_query.edit_message_text(
-            text, 
-            parse_mode=ParseMode.HTML, 
-            reply_markup=Keyboards.back_button()
-        )
-    
-    async def join_roulette(self, update: Update, context: ContextTypes.DEFAULT_TYPE, roulette_id: str):
-        user = update.callback_query.from_user
-        roulettes = await data_manager.get_roulettes()
-        if roulette_id not in roulettes:
-            await update.callback_query.answer("❌ الروليت غير موجود", show_alert=True)
-            return
-        r = roulettes[roulette_id]
-        if r.get('state') != RouletteState.ACTIVE.value:
-            await update.callback_query.answer("⛔ المشاركة متوقفة", show_alert=True)
-            return
-        if str(user.id) in r.get('participants', []):
-            await update.callback_query.answer("✅ أنت مشارك بالفعل", show_alert=True)
-            return
-        
-        r['participants'].append(str(user.id))
-        r['participant_names'][str(user.id)] = get_display_name(user)
-        roulettes[roulette_id] = r
-        await data_manager.save_roulettes(roulettes)
-        await update.callback_query.answer("✅ تم تسجيل مشاركتك!", show_alert=False)
-        await self.update_roulette_message(context.bot, roulette_id)
-    
-    async def set_reminder(self, update: Update, context: ContextTypes.DEFAULT_TYPE, roulette_id: str):
-        user = update.callback_query.from_user
-        roulettes = await data_manager.get_roulettes()
-        if roulette_id not in roulettes:
-            return
-        r = roulettes[roulette_id]
-        if str(user.id) not in r.get('reminders', []):
-            r.setdefault('reminders', []).append(str(user.id))
-            roulettes[roulette_id] = r
-            await data_manager.save_roulettes(roulettes)
-        await update.callback_query.answer("🔔 سيتم إشعارك إذا فزت!", show_alert=False)
-    
-    async def toggle_roulette(self, update: Update, context: ContextTypes.DEFAULT_TYPE, roulette_id: str):
-        user = update.callback_query.from_user
-        roulettes = await data_manager.get_roulettes()
-        if roulette_id not in roulettes:
-            return
-        r = roulettes[roulette_id]
-        if str(user.id) != str(r.get('creator_id')):
-            return
-        r['state'] = RouletteState.PAUSED.value if r['state'] == RouletteState.ACTIVE.value else RouletteState.ACTIVE.value
-        roulettes[roulette_id] = r
-        await data_manager.save_roulettes(roulettes)
-        await update.callback_query.answer("تم التحديث", show_alert=False)
-        await self.update_roulette_message(context.bot, roulette_id)
-    
-    async def start_draw(self, update: Update, context: ContextTypes.DEFAULT_TYPE, roulette_id: str):
-        user = update.callback_query.from_user
-        roulettes = await data_manager.get_roulettes()
-        if roulette_id not in roulettes:
-            return
-        r = roulettes[roulette_id]
-        if str(user.id) != str(r.get('creator_id')) or not r.get('participants'):
-            return
-        
-        winners = random.sample(r['participants'], min(1, len(r['participants'])))
-        r['winners'] = winners
-        r['state'] = RouletteState.FINISHED.value
-        roulettes[roulette_id] = r
-        await data_manager.save_roulettes(roulettes)
-        await update.callback_query.answer("✅ تم السحب!", show_alert=False)
-        await self.update_roulette_message(context.bot, roulette_id)
-    
-    async def view_participants(self, update: Update, context: ContextTypes.DEFAULT_TYPE, roulette_id: str):
-        roulettes = await data_manager.get_roulettes()
-        if roulette_id not in roulettes:
-            return
-        r = roulettes[roulette_id]
-        count = len(r.get('participants', []))
-        await update.callback_query.answer(f"عدد المشاركين: {count}", show_alert=True)
-
-    async def update_roulette_message(self, bot, roulette_id: str):
-        roulettes = await data_manager.get_roulettes()
-        if roulette_id not in roulettes:
-            return
-        r = roulettes[roulette_id]
-        text = f"{r.get('text', '')}\n\n👥 المشاركين: {len(r.get('participants', []))}"
-        if r.get('winners'):
-            text += "\n🏆 <b>الفائزون:</b>\n"
-            names = r.get('participant_names', {})
-            for w_id in r['winners']:
-                text += f"• {names.get(w_id, w_id)}\n"
-        
-        try:
-            await bot.edit_message_text(
-                chat_id=r['channel_id'],
-                message_id=r['message_id'],
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=Keyboards.roulette_control(roulette_id, r['state'] == RouletteState.ACTIVE.value, True)
+            cur = await con.execute(
+                "SELECT * FROM greetings WHERE receiver_id=? AND year=? ORDER BY id DESC LIMIT ? OFFSET ?",
+                (user_id, year, PAGE_SIZE, offset)
             )
-        except BadRequest:
-            pass
+            count_cur = await con.execute(
+                "SELECT COUNT(*) n FROM greetings WHERE receiver_id=? AND year=?", (user_id, year)
+            )
+        rows = await cur.fetchall()
+        total = (await count_cur.fetchone())["n"]
 
-    async def show_admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self.is_admin(update.callback_query.from_user.id):
-            return
-        await update.callback_query.edit_message_text("⚙️ لوحة الأدمن", reply_markup=Keyboards.admin_panel())
+    if not rows:
+        return await call.message.edit_text(
+            "💌 لا توجد معايدات في هذا القسم بعد.",
+            reply_markup=back_keyboard("home")
+        )
 
-    async def show_admin_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self.is_admin(update.callback_query.from_user.id):
-            return
-        await update.callback_query.edit_message_text("📊 إحصائيات الأدمن", reply_markup=Keyboards.back_button("admin_panel"))
+    lines = [f"💌 <b>{'معايداتي' if year is None else 'أرشيف ' + str(year)}</b>\n"]
+    delete_rows = []
+    for r in rows:
+        stamp = html_escape(r["created_at"][:16].replace("T", " "))
+        sender = html_escape(r["sender_name"])
+        body = html_escape(r["message_text"])
+        lines.append(
+            f"━━━━━━━━━━━━\n"
+            f"👤 <b>{sender}</b>\n"
+            f"🗓️ {stamp}\n"
+            f"{body}\n"
+            f"🆔 <code>{r['id']}</code>"
+        )
+        delete_rows.append([InlineKeyboardButton(text=f"🗑 حذف المعايدة #{r['id']}", callback_data=f"greet_del:{r['id']}:{year if year is not None else 'all'}:{page}")])
 
-    async def manage_forced_channels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self.is_admin(update.callback_query.from_user.id):
-            return
-        await update.callback_query.edit_message_text("📢 القنوات الإجبارية", reply_markup=Keyboards.back_button("admin_panel"))
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ السابق", callback_data=f"page:{year if year is not None else 'all'}:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="noop"))
+    if (page + 1) * PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(text="التالي ➡️", callback_data=f"page:{year if year is not None else 'all'}:{page+1}"))
+    rows_kb = delete_rows + [nav]
+    rows_kb.append([InlineKeyboardButton(text="⬅️ رجوع", callback_data="archive" if year is not None else "home")])
+    await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows_kb))
 
-    async def manage_banned(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self.is_admin(update.callback_query.from_user.id):
-            return
-        await update.callback_query.edit_message_text("🚫 المحظورين", reply_markup=Keyboards.back_button("admin_panel"))
 
-    async def start_broadcast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self.is_admin(update.callback_query.from_user.id):
-            return
-        await update.callback_query.edit_message_text("📣 أرسل رسالة الإذاعة:", reply_markup=Keyboards.back_button("admin_panel"))
+@dp.callback_query(F.data.startswith("inbox:"))
+async def inbox_callback(call: CallbackQuery):
+    if not await subscription_gate(callback=call):
+        return
+    page = int(call.data.split(":")[1])
+    await call.answer()
+    await show_greetings(call, None, page)
 
-    async def show_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self.is_admin(update.callback_query.from_user.id):
-            return
-        await update.callback_query.edit_message_text("⚙️ الإعدادات العامة", reply_markup=Keyboards.back_button("admin_panel"))
 
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        message = update.message
-        if not message: return
-        
-        if message.chat.type in ['group', 'supergroup'] and message.text and message.text.strip() == '← تفعيل روليت':
+@dp.callback_query(F.data.startswith("page:"))
+async def page_callback(call: CallbackQuery):
+    if not await subscription_gate(callback=call):
+        return
+    _, year_raw, page_raw = call.data.split(":")
+    year = None if year_raw == "all" else int(year_raw)
+    await call.answer()
+    await show_greetings(call, year, int(page_raw))
+
+
+@dp.callback_query(F.data.startswith("greet_del:"))
+async def delete_greeting_callback(call: CallbackQuery):
+    if not await subscription_gate(callback=call):
+        return
+    try:
+        _, greeting_id, year_raw, page_raw = call.data.split(":")
+        greeting_id = int(greeting_id)
+        page = int(page_raw)
+    except (ValueError, TypeError):
+        return await call.answer("طلب غير صالح.", show_alert=True)
+    async with await db() as con:
+        cur = await con.execute(
+            "DELETE FROM greetings WHERE id=? AND receiver_id=?",
+            (greeting_id, call.from_user.id)
+        )
+        await con.commit()
+        deleted = cur.rowcount
+    if not deleted:
+        return await call.answer("المعايدة غير موجودة أو لا تملك صلاحية حذفها.", show_alert=True)
+    await call.answer("تم حذف المعايدة.")
+    year = None if year_raw == "all" else int(year_raw)
+    await show_greetings(call, year, page)
+
+
+@dp.callback_query(F.data == "archive")
+async def archive_callback(call: CallbackQuery):
+    if not await subscription_gate(callback=call):
+        return
+    async with await db() as con:
+        cur = await con.execute(
+            "SELECT year,COUNT(*) n FROM greetings WHERE receiver_id=? GROUP BY year ORDER BY year DESC",
+            (call.from_user.id,)
+        )
+        years = await cur.fetchall()
+    rows = [[InlineKeyboardButton(text=f"📦 أرشيف {r['year']} ({r['n']})",
+                                  callback_data=f"archive_year:{r['year']}")] for r in years]
+    if not rows:
+        rows = [[InlineKeyboardButton(text="لا يوجد أرشيف حتى الآن", callback_data="noop")]]
+    rows.append([InlineKeyboardButton(text="⬅️ رجوع", callback_data="home")])
+    await call.answer()
+    await call.message.edit_text("📦 <b>أرشيف معايداتك</b>\n\nاختر السنة:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.startswith("archive_year:"))
+async def archive_year_callback(call: CallbackQuery):
+    if not await subscription_gate(callback=call):
+        return
+    year = int(call.data.split(":")[1])
+    await call.answer()
+    await show_greetings(call, year, 0)
+
+
+@dp.callback_query(F.data == "friends")
+async def friends_callback(call: CallbackQuery):
+    if not await subscription_gate(callback=call):
+        return
+    async with await db() as con:
+        cur = await con.execute(
+            "SELECT COUNT(*) n FROM users WHERE referred_by=?", (call.from_user.id,)
+        )
+        count = (await cur.fetchone())["n"]
+    await call.answer()
+    await call.message.edit_text(
+        "👥 <b>الأصدقاء</b>\n\n"
+        f"عدد الأشخاص الذين بدأوا البوت من رابطك: <b>{count}</b>\n"
+        "شارك رابط شجرتك حتى يصل أصدقاؤك إليها.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📥 مشاركة رابط الشجرة", callback_data="share")],
+            [InlineKeyboardButton(text="⬅️ رجوع", callback_data="home")]
+        ])
+    )
+
+
+@dp.callback_query(F.data == "countdown")
+async def countdown_callback(call: CallbackQuery):
+    if not await subscription_gate(callback=call):
+        return
+    await call.answer()
+    await call.message.edit_text(
+        countdown_text(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 تحديث", callback_data="countdown")],
+            [InlineKeyboardButton(text="⬅️ رجوع", callback_data="home")]
+        ])
+    )
+
+
+@dp.callback_query(F.data == "settings")
+async def settings_callback(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text(
+        "⚙️ <b>الإعدادات</b>\n\n"
+        "يمكنك إدارة شجرتك ومراجعة معايداتك من القائمة الرئيسية.\n"
+        "إذا رغبت بإيقاف استقبال المعايدات، يمكنك التواصل مع إدارة البوت.",
+        reply_markup=back_keyboard("home")
+    )
+
+
+@dp.callback_query(F.data == "about")
+async def about_callback(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text(
+        "ℹ️ <b>حول NewYear</b>\n\n"
+        "بوت أشجار ومعايدات رأس السنة 🎄\n"
+        "أنشئ رابطك الخاص واستقبل رسائل أصدقائك، واحتفظ بمعايداتك في أرشيف منظم لكل سنة.",
+        reply_markup=back_keyboard("home")
+    )
+
+
+@dp.callback_query(F.data == "noop")
+async def noop_callback(call: CallbackQuery):
+    await call.answer()
+
+
+# ============================= بدء إرسال معايدة عبر رابط =============================
+
+
+
+# ============================= لوحة الإدارة =============================
+
+@dp.message(Command("admin"))
+async def admin_command(message: Message):
+    if not await is_admin(message.from_user.id):
+        return await message.answer("⛔ هذا الأمر للإدارة فقط.")
+    await message.answer("👑 <b>لوحة تحكم NewYear</b>", reply_markup=admin_keyboard(await is_owner(message.from_user.id)))
+
+
+@dp.callback_query(F.data == "admin")
+async def admin_callback(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح لك.", show_alert=True)
+    await call.answer()
+    await call.message.edit_text("👑 <b>لوحة تحكم NewYear</b>", reply_markup=admin_keyboard(await is_owner(call.from_user.id)))
+
+
+@dp.callback_query(F.data == "adm:stats")
+async def admin_stats(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح.", show_alert=True)
+    async with await db() as con:
+        q = await con.execute("SELECT COUNT(*) n FROM users")
+        users = (await q.fetchone())["n"]
+        q = await con.execute("SELECT COUNT(*) n FROM users WHERE is_banned=1")
+        banned = (await q.fetchone())["n"]
+        q = await con.execute("SELECT COUNT(*) n FROM greetings")
+        greetings = (await q.fetchone())["n"]
+        q = await con.execute("SELECT COUNT(*) n FROM visits")
+        visits = (await q.fetchone())["n"]
+        q = await con.execute("SELECT COUNT(*) n FROM users WHERE joined_at>=?", (now_local().date().isoformat(),))
+        today = (await q.fetchone())["n"]
+        q = await con.execute("SELECT COUNT(*) n FROM admins")
+        admins = (await q.fetchone())["n"]
+    await call.answer()
+    await call.message.edit_text(
+        "📊 <b>الإحصائيات العامة</b>\n\n"
+        f"👥 إجمالي المستخدمين: <b>{users}</b>\n"
+        f"🆕 المستخدمون اليوم: <b>{today}</b>\n"
+        f"💌 إجمالي المعايدات: <b>{greetings}</b>\n"
+        f"👀 إجمالي الزيارات الفريدة: <b>{visits}</b>\n"
+        f"🚫 المحظورون: <b>{banned}</b>\n"
+        f"👮 المشرفون: <b>{admins}</b>",
+        reply_markup=back_keyboard("admin")
+    )
+
+
+@dp.callback_query(F.data == "adm:channels")
+async def admin_channels(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح.", show_alert=True)
+    channels = await get_channels()
+    await call.answer()
+    await call.message.edit_text(
+        "📣 <b>قنوات الاشتراك الإجباري</b>\n\n"
+        "أضف القناة بصيغة:\n<code>@channel_username | https://t.me/channel</code>\n\n"
+        "يجب أن يكون البوت مشرفاً في القناة.",
+        reply_markup=channels_keyboard(channels)
+    )
+
+
+@dp.callback_query(F.data == "channel_add")
+async def channel_add_start(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح.", show_alert=True)
+    await state.set_state(AdminStates.waiting_channel)
+    await call.answer()
+    await call.message.answer(
+        "أرسل بيانات القناة بهذا الشكل:\n"
+        "<code>@channel_username | https://t.me/channel</code>\n\n"
+        "أو أرسل معرف القناة الرقمي مع رابط الدعوة."
+    )
+
+
+@dp.message(AdminStates.waiting_channel)
+async def channel_add_finish(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    parts = [p.strip() for p in (message.text or "").split("|", 1)]
+    if len(parts) != 2 or not parts[0] or not parts[1].startswith("https://t.me/"):
+        return await message.answer("صيغة غير صحيحة. أرسل: @channel | https://t.me/channel")
+    channel_id, invite_url = parts
+    try:
+        chat = await bot.get_chat(channel_id)
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat.id, me.id)
+        if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+            return await message.answer("اجعل البوت مشرفاً في القناة أولاً.")
+        async with await db() as con:
+            await con.execute(
+                "INSERT OR REPLACE INTO required_channels(channel_id,channel_title,invite_url) VALUES(?,?,?)",
+                (str(chat.id), chat.title or channel_id, invite_url)
+            )
+            await con.commit()
+        await log_admin(message.from_user.id, "add_channel", str(chat.id))
+        await state.clear()
+        await message.answer("✅ تمت إضافة قناة الاشتراك الإجباري.")
+    except TelegramAPIError as e:
+        await message.answer(f"تعذر التحقق من القناة: {html_escape(e)}")
+
+
+@dp.callback_query(F.data.startswith("channel_del:"))
+async def channel_delete(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح.", show_alert=True)
+    channel_id = call.data.split(":", 1)[1]
+    async with await db() as con:
+        await con.execute("DELETE FROM required_channels WHERE channel_id=?", (channel_id,))
+        await con.commit()
+    await log_admin(call.from_user.id, "delete_channel", channel_id)
+    await call.answer("تم حذف القناة.")
+    await admin_channels(call)
+
+
+@dp.callback_query(F.data == "adm:toggle_greetings")
+async def toggle_greetings(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح.", show_alert=True)
+    current = await get_setting("greetings_open", "1")
+    new = "0" if current == "1" else "1"
+    await set_setting("greetings_open", new)
+    await log_admin(call.from_user.id, "toggle_greetings", new)
+    await call.answer("تم تحديث الحالة.")
+    await call.message.edit_text(
+        f"🟢 استقبال المعايدات: <b>{'مفتوح' if new == '1' else 'متوقف'}</b>",
+        reply_markup=back_keyboard("admin")
+    )
+
+
+@dp.callback_query(F.data == "adm:admins")
+async def admins_menu(call: CallbackQuery):
+    if not await is_owner(call.from_user.id):
+        return await call.answer("هذه الصلاحية للمالك فقط.", show_alert=True)
+    async with await db() as con:
+        cur = await con.execute("SELECT user_id FROM admins ORDER BY added_at DESC")
+        rows = await cur.fetchall()
+    names = "\n".join([f"• <code>{r['user_id']}</code>" for r in rows]) or "لا يوجد مشرفون."
+    await call.answer()
+    await call.message.edit_text(
+        f"👮 <b>إدارة المشرفين</b>\n\n{names}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ إضافة مشرف", callback_data="adm:add_admin")],
+            [InlineKeyboardButton(text="➖ إزالة مشرف", callback_data="adm:remove_admin")],
+            [InlineKeyboardButton(text="⬅️ رجوع", callback_data="admin")]
+        ])
+    )
+
+
+@dp.callback_query(F.data == "adm:add_admin")
+async def add_admin_start(call: CallbackQuery, state: FSMContext):
+    if not await is_owner(call.from_user.id):
+        return await call.answer("للمالك فقط.", show_alert=True)
+    await state.set_state(AdminStates.waiting_admin_id)
+    await call.answer()
+    await call.message.answer("أرسل Telegram ID للمشرف الجديد.")
+
+
+@dp.message(AdminStates.waiting_admin_id)
+async def add_admin_finish(message: Message, state: FSMContext):
+    if not await is_owner(message.from_user.id):
+        return
+    value = (message.text or "").strip()
+    if not value.isdigit():
+        return await message.answer("أرسل ID رقمياً.")
+    uid = int(value)
+    if uid == OWNER_ID:
+        return await message.answer("المالك لا يحتاج إلى إضافته كمشرف.")
+    async with await db() as con:
+        await con.execute(
+            "INSERT OR IGNORE INTO admins(user_id,added_at,added_by) VALUES(?,?,?)",
+            (uid, now_iso(), OWNER_ID)
+        )
+        await con.commit()
+    await log_admin(message.from_user.id, "add_admin", str(uid))
+    await state.clear()
+    await message.answer("✅ تمت إضافة المشرف.")
+
+
+@dp.callback_query(F.data == "adm:remove_admin")
+async def remove_admin_start(call: CallbackQuery, state: FSMContext):
+    if not await is_owner(call.from_user.id):
+        return await call.answer("للمالك فقط.", show_alert=True)
+    await state.set_state(AdminStates.waiting_remove_admin_id)
+    await call.answer()
+    await call.message.answer("أرسل ID المشرف الذي تريد إزالته.")
+
+
+@dp.message(AdminStates.waiting_remove_admin_id)
+async def remove_admin_finish(message: Message, state: FSMContext):
+    if not await is_owner(message.from_user.id):
+        return
+    value = (message.text or "").strip()
+    if not value.isdigit():
+        return await message.answer("أرسل ID رقمياً.")
+    uid = int(value)
+    async with await db() as con:
+        await con.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+        await con.commit()
+    await log_admin(message.from_user.id, "remove_admin", str(uid))
+    await state.clear()
+    await message.answer("✅ تمت إزالة المشرف.")
+
+
+# ============================= البحث والحظر =============================
+
+@dp.callback_query(F.data == "adm:lookup")
+async def lookup_start(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح.", show_alert=True)
+    await state.set_state(AdminStates.waiting_user_id)
+    await call.answer()
+    await call.message.answer("أرسل ID المستخدم للبحث عنه.")
+
+
+@dp.message(AdminStates.waiting_user_id)
+async def lookup_finish(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    value = (message.text or "").strip()
+    if not value.isdigit():
+        return await message.answer("أرسل ID رقمياً.")
+    row = await get_user(int(value))
+    await state.clear()
+    if not row:
+        return await message.answer("لم يتم العثور على المستخدم.")
+    count, visits, joined, today = await get_counts(int(value))
+    await message.answer(
+        "🔎 <b>معلومات المستخدم</b>\n\n"
+        f"🆔 ID: <code>{row['user_id']}</code>\n"
+        f"👤 الاسم: {html_escape(row['full_name'])}\n"
+        f"🔗 Username: @{html_escape(row['username'] or 'لا يوجد')}\n"
+        f"📅 تاريخ الانضمام: {html_escape(row['joined_at'])}\n"
+        f"💌 المعايدات: {count}\n"
+        f"👀 الزيارات: {visits}\n"
+        f"🚫 محظور: {'نعم' if row['is_banned'] else 'لا'}"
+    )
+
+
+@dp.callback_query(F.data == "adm:ban")
+async def ban_start(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح.", show_alert=True)
+    await state.set_state(AdminStates.waiting_ban_id)
+    await call.answer()
+    await call.message.answer("أرسل ID المستخدم الذي تريد حظره.")
+
+
+@dp.message(AdminStates.waiting_ban_id)
+async def ban_finish(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    value = (message.text or "").strip()
+    if not value.isdigit():
+        return await message.answer("أرسل ID رقمياً.")
+    uid = int(value)
+    if uid == OWNER_ID:
+        return await message.answer("لا يمكن حظر المالك.")
+    async with await db() as con:
+        await con.execute("UPDATE users SET is_banned=1 WHERE user_id=?", (uid,))
+        await con.commit()
+    await log_admin(message.from_user.id, "ban_user", str(uid))
+    await state.clear()
+    await message.answer("✅ تم حظر المستخدم إذا كان مسجلاً.")
+
+
+@dp.callback_query(F.data == "adm:unban")
+async def unban_start(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح.", show_alert=True)
+    await state.set_state(AdminStates.waiting_unban_id)
+    await call.answer()
+    await call.message.answer("أرسل ID المستخدم لفك الحظر عنه.")
+
+
+@dp.message(AdminStates.waiting_unban_id)
+async def unban_finish(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    value = (message.text or "").strip()
+    if not value.isdigit():
+        return await message.answer("أرسل ID رقمياً.")
+    uid = int(value)
+    async with await db() as con:
+        await con.execute("UPDATE users SET is_banned=0 WHERE user_id=?", (uid,))
+        await con.commit()
+    await log_admin(message.from_user.id, "unban_user", str(uid))
+    await state.clear()
+    await message.answer("✅ تم فك الحظر إذا كان المستخدم مسجلاً.")
+
+
+# ============================= الإذاعة =============================
+
+@dp.callback_query(F.data == "adm:broadcast")
+async def broadcast_start(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح.", show_alert=True)
+    await state.set_state(AdminStates.waiting_broadcast)
+    await call.answer()
+    await call.message.answer(
+        "📢 <b>إنشاء إذاعة</b>\n\n"
+        "أرسل الرسالة التي تريد إذاعتها. يمكنك إرسال نص أو صورة أو فيديو أو ملف أو رسالة مدعومة أخرى.\n"
+        "سيتم إرسال نسخة من الرسالة إلى الأعضاء، ثم طلب تأكيد قبل البدء."
+    )
+
+
+@dp.message(AdminStates.waiting_broadcast)
+async def broadcast_prepare(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    await state.update_data(source_chat_id=message.chat.id, source_message_id=message.message_id)
+    await state.set_state(AdminStates.waiting_broadcast_confirm)
+    await message.answer(
+        "هل تريد بدء الإذاعة الآن؟",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ بدء الإذاعة", callback_data="broadcast:yes"),
+             InlineKeyboardButton(text="❌ إلغاء", callback_data="broadcast:no")]
+        ])
+    )
+
+
+@dp.callback_query(F.data == "broadcast:no")
+async def broadcast_cancel(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح.", show_alert=True)
+    await state.clear()
+    await call.answer("تم إلغاء الإذاعة.")
+    await call.message.edit_text("❌ تم إلغاء الإذاعة.", reply_markup=back_keyboard("admin"))
+
+
+@dp.callback_query(F.data == "broadcast:yes")
+async def broadcast_execute(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح.", show_alert=True)
+    data = await state.get_data()
+    source_chat = data.get("source_chat_id")
+    source_message = data.get("source_message_id")
+    if not source_chat or not source_message:
+        await state.clear()
+        return await call.answer("انتهت جلسة الإذاعة. أعد المحاولة.", show_alert=True)
+
+    await state.clear()
+    async with await db() as con:
+        cur = await con.execute("SELECT user_id FROM users WHERE is_banned=0")
+        recipients = [r["user_id"] for r in await cur.fetchall()]
+        cur = await con.execute(
+            "INSERT INTO broadcasts(created_at,started_by,total,status) VALUES(?,?,?,'running')",
+            (now_iso(), call.from_user.id, len(recipients))
+        )
+        broadcast_id = cur.lastrowid
+        await con.commit()
+
+    await call.answer("بدأت الإذاعة.")
+    status = await call.message.edit_text(
+        f"📢 بدأت الإذاعة إلى <b>{len(recipients)}</b> مستخدم.\n\n"
+        "سيظهر ملخص النتائج بعد الانتهاء."
+    )
+    success = failed = 0
+    for uid in recipients:
+        try:
+            await bot.copy_message(
+                chat_id=uid,
+                from_chat_id=source_chat,
+                message_id=source_message
+            )
+            success += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
             try:
-                bot_member = await context.bot.get_chat_member(message.chat.id, context.bot.id)
-                if bot_member.status not in ['administrator', 'creator']:
-                    await message.reply_text("❗ الرجاء ترقية البوت إلى مشرف أولاً لكي يعمل.")
-                    return
-                
-                channels = await data_manager.get_bound_channels()
-                channels.setdefault(str(message.from_user.id), {})[str(message.chat.id)] = {
-                    'title': message.chat.title,
-                    'username': message.chat.username,
-                    'added_at': datetime.now().isoformat()
-                }
-                await data_manager.save_bound_channels(channels)
-                await message.reply_text("✅ تم تفعيل المجموعة بنجاح! يمكنك الآن استخدامها في السحوبات.")
-            except Exception as e:
-                await message.reply_text("❗ حدث خطأ أثناء التفعيل.")
-            return
+                await bot.copy_message(chat_id=uid, from_chat_id=source_chat, message_id=source_message)
+                success += 1
+            except TelegramAPIError:
+                failed += 1
+        except TelegramAPIError:
+            failed += 1
+        if (success + failed) % 25 == 0:
+            try:
+                await status.edit_text(
+                    f"📢 الإذاعة قيد التنفيذ...\n"
+                    f"✅ نجح: {success}\n❌ فشل: {failed}\n"
+                    f"📊 الإجمالي: {len(recipients)}"
+                )
+            except TelegramAPIError:
+                pass
+        await asyncio.sleep(BROADCAST_DELAY)
 
-        if message.forward_origin and isinstance(message.forward_origin, MessageOriginChannel):
-            user_id = message.from_user.id
-            state = self.user_states.get(user_id)
-            temp = await data_manager.get_temp(user_id)
-            if state == 'awaiting_channel_forward' or temp.get('state') == 'awaiting_channel_forward':
-                await self.handle_channel_forward(update, context)
-                return
-
-        if update.effective_chat.type == 'private':
-            user = message.from_user
-            user_id = user.id
-            
-            if await self.is_banned(user_id):
-                return
-            
-            state = self.user_states.get(user_id)
-            temp = await data_manager.get_temp(user_id)
-            
-            if state == 'awaiting_qr_text':
-                qr_settings = temp.get('qr_settings', {})
-                qr_settings['text'] = message.text or ""
-                temp['qr_settings'] = qr_settings
-                self.user_states.pop(user_id, None)
-                await data_manager.save_temp(user_id, temp)
-                await message.reply_text("✅ تم حفظ كليشة اللعبة بنجاح!", reply_markup=Keyboards.back_button("qr_settings"))
-            elif state == 'awaiting_qr_vote':
-                qr_settings = temp.get('qr_settings', {})
-                qr_settings['vote_cond'] = message.text or ""
-                temp['qr_settings'] = qr_settings
-                self.user_states.pop(user_id, None)
-                await data_manager.save_temp(user_id, temp)
-                await message.reply_text("✅ تم تحديث شرط التصويت!", reply_markup=Keyboards.back_button("qr_settings"))
-            elif state == 'awaiting_qr_interact':
-                qr_settings = temp.get('qr_settings', {})
-                qr_settings['interact_cond'] = message.text or ""
-                temp['qr_settings'] = qr_settings
-                self.user_states.pop(user_id, None)
-                await data_manager.save_temp(user_id, temp)
-                await message.reply_text("✅ تم تحديث شرط التفاعل!", reply_markup=Keyboards.back_button("qr_settings"))
-            else:
-                await message.reply_text("❓ استخدم /start للبدء", reply_markup=Keyboards.back_button())
-    
-    async def handle_channel_forward(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        message = update.message
-        user_id = message.from_user.id
-        
-
-        if not message.forward_origin or not isinstance(message.forward_origin, MessageOriginChannel):
-            await message.reply_text("❗ يرجى توجيه رسالة صحيحة من القناة.")
-            return
-        
-        channel = message.forward_origin.chat
-        try:
-            bot_member = await context.bot.get_chat_member(channel.id, context.bot.id)
-            if bot_member.status not in ['administrator', 'creator']:
-                await message.reply_text("❗ البوت ليس مشرفاً في هذه القناة. أضفه كمشرف أولاً.")
-                return
-        except Exception as e:
-            logger.error(f"Error checking membership: {e}")
-            await message.reply_text("❗ لا يمكن التحقق من صلاحيات البوت. تأكد من إضافته كمشرف.")
-            return
-        
-        channels = await data_manager.get_bound_channels()
-        channels.setdefault(str(user_id), {})[str(channel.id)] = {
-            'title': channel.title,
-            'username': channel.username,
-            'added_at': datetime.now().isoformat()
-        }
-        await data_manager.save_bound_channels(channels)
-        self.user_states.pop(user_id, None)
-        await data_manager.delete_temp(user_id)
-        
-        await message.reply_text(
-            f"✅ تم تسجيل القناة بنجاح: {channel.title}",
-            reply_markup=Keyboards.back_button("start_roulette")
+    async with await db() as con:
+        await con.execute(
+            "UPDATE broadcasts SET success=?,failed=?,status='completed' WHERE id=?",
+            (success, failed, broadcast_id)
         )
+        await con.commit()
+    await log_admin(call.from_user.id, "broadcast", f"id={broadcast_id},success={success},failed={failed}")
+    try:
+        await status.edit_text(
+            "✅ <b>انتهت الإذاعة</b>\n\n"
+            f"👥 المستهدفون: <b>{len(recipients)}</b>\n"
+            f"✅ تم الإرسال: <b>{success}</b>\n"
+            f"❌ تعذر الإرسال: <b>{failed}</b>",
+            reply_markup=back_keyboard("admin")
+        )
+    except TelegramAPIError:
+        pass
 
-def main():
-    if BOT_TOKEN == 'PUT_YOUR_BOT_TOKEN_HERE':
-        print("❌ يرجى تعيين BOT_TOKEN")
-        return
-    if OWNER_ID == 0:
-        print("❌ يرجى تعيين OWNER_ADMIN_ID")
-        return
-    bot = RouletteMasterBot()
-    bot.run()
 
-if __name__ == '__main__':
-    main() 
+@dp.callback_query(F.data == "adm:logs")
+async def admin_logs_callback(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("غير مصرح.", show_alert=True)
+    async with await db() as con:
+        cur = await con.execute("SELECT * FROM admin_logs ORDER BY id DESC LIMIT 10")
+        rows = await cur.fetchall()
+    text = "📜 <b>آخر العمليات الإدارية</b>\n\n"
+    if rows:
+        for r in rows:
+            text += f"• <code>{r['admin_id']}</code> — {html_escape(r['action'])} — {html_escape(r['created_at'])}\n"
+    else:
+        text += "لا توجد عمليات مسجلة."
+    await call.answer()
+    await call.message.edit_text(text, reply_markup=back_keyboard("admin"))
+
+
+# ============================= بدء تدفق رابط الشجرة =============================
+
+# نستخدم معالجاً منفصلاً للأمر /start CODE. هذا المعالج يلتقط الرابط ويبدأ
+# حالة استقبال المعايدة للزائر، بدلاً من وضعه في قائمة صاحب الشجرة.
+# يُعاد تعريف منطق /start هنا عبر توجيه الزائر إلى جلسة الرسالة عند وجود payload.
+
+_original_start_handler = start_handler
+
+@dp.message(Command("send"))
+async def send_command(message: Message, state: FSMContext):
+    """اختياري: /send CODE لبدء كتابة معايدة لشجرة."""
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        return await message.answer("استخدم /send CODE الموجود في رابط الشجرة.")
+    target = await get_user_by_code(parts[1].strip())
+    if not target:
+        return await message.answer("رابط الشجرة غير صحيح.")
+    if target["user_id"] == message.from_user.id:
+        return await message.answer("هذه شجرتك أنت.")
+    if not await subscription_gate(message=message):
+        return
+    if await get_setting("greetings_open", "1") != "1":
+        return await message.answer("استقبال المعايدات متوقف حالياً.")
+    await state.set_state(UserStates.waiting_greeting)
+    await state.update_data(receiver_id=int(target["user_id"]))
+    await message.answer(
+        f"🎄 أنت تكتب الآن معايدة إلى شجرة <b>{html_escape(target['full_name'])}</b>.\n\n"
+        "اكتب معايدتك برسالة واحدة.\n"
+        "ملاحظة: ستصل رسالتك إلى صاحب الشجرة، وقد تُراجع عند الإبلاغ أو الاشتباه بإساءة الاستخدام."
+    )
+
+
+# ============================= معالج رابط /start CODE الفعلي =============================
+
+# تسجيل معالج خاص قبل الإقلاع: نستخدمه لالتقاط /start مع payload.
+# عند وجود كود شجرة، نبدأ حالة كتابة المعايدة؛ وإلا نعرض الرئيسية.
+@dp.message(CommandStart())
+async def start_deeplink_handler(message: Message, state: FSMContext):
+    # هذا المعالج الإضافي يتجاوز المعالج السابق عند ترتيب التسجيل؛
+    # نعيد تنفيذ السلوك هنا لضمان دعم Deep Linking.
+    await state.clear()
+    user = message.from_user
+    if await user_is_banned(user.id):
+        return await message.answer("🚫 حسابك محظور من استخدام البوت.")
+    if not await subscription_gate(message=message):
+        return
+    args = (message.text or "").split(maxsplit=1)
+    payload = args[1].strip() if len(args) > 1 else ""
+    if payload and payload != "home":
+        target = await get_user_by_code(payload)
+        if not target:
+            await ensure_user(user)
+            return await message.answer("رابط الشجرة غير صحيح أو لم يعد متاحاً.", reply_markup=main_keyboard())
+        if int(target["user_id"]) == user.id:
+            await ensure_user(user)
+            return await message.answer("🎄 هذه شجرتك الخاصة! لا يمكنك إرسال معايدة لنفسك.", reply_markup=main_keyboard())
+        await ensure_user(user, int(target["user_id"]))
+        async with await db() as con:
+            await con.execute(
+                "INSERT OR IGNORE INTO visits(owner_id,visitor_id,first_seen) VALUES(?,?,?)",
+                (int(target["user_id"]), user.id, now_iso())
+            )
+            await con.commit()
+        if await get_setting("greetings_open", "1") != "1":
+            return await message.answer("⛔ استقبال المعايدات متوقف حالياً.")
+        await state.set_state(UserStates.waiting_greeting)
+        await state.update_data(receiver_id=int(target["user_id"]))
+        return await message.answer(
+            f"🎄 <b>أهلاً بك!</b>\nأنت تكتب معايدة إلى شجرة <b>{html_escape(target['full_name'])}</b>.\n\n"
+            "✍️ اكتب معايدتك الآن برسالة واحدة.\n"
+            "🔐 تنبيه: ستصل رسالتك إلى صاحب الشجرة، وقد تُراجع عند الإبلاغ أو الاشتباه بإساءة الاستخدام."
+        )
+    await ensure_user(user)
+    count, _, _, _ = await get_counts(user.id)
+    await message.answer(
+        f"🎄 <b>أهلاً بك في NewYear</b>\n\n"
+        f"مرحباً {html_escape(user.first_name)} ✨\n"
+        f"💌 معايداتك الحالية: <b>{count}</b>\n"
+        f"🗓️ السنة الحالية: <b>{current_year()}</b>\n\nاختر من القائمة:",
+        reply_markup=main_keyboard()
+    )
+
+
+# ============================= تشغيل البوت =============================
+
+async def set_commands():
+    await bot.set_my_commands([
+        BotCommand(command="start", description="بدء استخدام البوت"),
+        BotCommand(command="admin", description="لوحة الإدارة"),
+        BotCommand(command="send", description="إرسال معايدة باستخدام رمز الشجرة")
+    ])
+
+
+async def main():
+    await init_db()
+    await set_commands()
+    me = await bot.get_me()
+    log.info("NewYear started as @%s", me.username)
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("NewYear stopped.")
+ 
