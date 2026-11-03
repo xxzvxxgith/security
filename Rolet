@@ -8,14 +8,14 @@ Python 3.10+ | aiogram 3 | aiosqlite
 
 التشغيل:
     ضع BOT_TOKEN و OWNER_ID في متغيرات البيئة، ثم:
-    python NewYear.py
+    python sajad.py
 
 Termux:
     pkg update && pkg install python
     pip install -U aiogram aiosqlite
-    export BOT_TOKEN="8906278700:AAGf5AZs6tKkPtROSxYjJPjLS4cuHX8tW5E"
-    export OWNER_ID="1537665613"
-    python NewYear.py
+    export BOT_TOKEN="توكن_البوت"
+    export OWNER_ID="معرف_المالك"
+    python sajad.py
 
 ملاحظة الخصوصية:
     الرسائل تُسلَّم إلى صاحب الشجرة المقصود فقط. لا توجد نسخة خفية للإدارة.
@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import aiosqlite
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
@@ -42,7 +42,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, BotCommand
+    BotCommand
 )
 
 # ============================= الإعدادات =============================
@@ -52,7 +52,7 @@ OWNER_ID_RAW = os.getenv("OWNER_ID", "1537665613").strip()
 DB_PATH = os.getenv("DB_PATH", "NewYear.db")
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Baghdad")
 PAGE_SIZE = 5
-BROADCAST_DELAY = 0.05
+BROADCAST_DELAY = 0.08
 MAX_MESSAGE_LENGTH = 3500
 
 if not BOT_TOKEN:
@@ -279,6 +279,26 @@ async def user_is_banned(user_id: int) -> bool:
     return bool(row and row["is_banned"])
 
 
+class BanMiddleware(BaseMiddleware):
+    """منع شامل للمستخدمين المحظورين من الرسائل والأزرار."""
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user and await user_is_banned(user.id) and not await is_admin(user.id):
+            state = data.get("state")
+            if state is not None:
+                await state.clear()
+            if isinstance(event, CallbackQuery):
+                await event.answer("🚫 حسابك محظور من استخدام البوت.", show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer("🚫 حسابك محظور من استخدام البوت.")
+            return
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(BanMiddleware())
+dp.callback_query.outer_middleware(BanMiddleware())
+
+
 # ============================= لوحات المفاتيح =============================
 
 def main_keyboard():
@@ -336,7 +356,7 @@ def channels_keyboard(channels):
 
 async def get_channels():
     async with await db() as con:
-        cur = await con.execute("SELECT * FROM required_channels ORDER BY channel_title")
+        cur = await con.execute("SELECT * FROM required_channels ORDER BY channel_title LIMIT 40")
         return await cur.fetchall()
 
 
@@ -350,8 +370,10 @@ async def check_subscription(user_id: int):
             member = await bot.get_chat_member(channel["channel_id"], user_id)
             if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
                 missing.append(channel)
-        except TelegramAPIError:
-            # لا نسمح بالتجاوز إذا تعذر التحقق؛ نوضح المشكلة للمستخدم.
+            elif member.status == ChatMemberStatus.RESTRICTED and not getattr(member, "is_member", True):
+                missing.append(channel)
+        except TelegramAPIError as exc:
+            log.warning("Subscription check failed for channel %s: %s", channel["channel_id"], exc)
             missing.append(channel)
     return len(missing) == 0, missing
 
@@ -423,50 +445,14 @@ def countdown_text():
 
 # ============================= أوامر البداية =============================
 
-async def start_handler_unused(message: Message, state: FSMContext):
-    await state.clear()
-    user = message.from_user
-    if await user_is_banned(user.id):
-        return await message.answer("🚫 حسابك محظور من استخدام البوت.")
-    if not await subscription_gate(message=message):
-        return
-
-    args = (message.text or "").split(maxsplit=1)
-    referral_owner = None
-    if len(args) > 1:
-        payload = args[1].strip()
-        if payload and payload != "home":
-            target = await get_user_by_code(payload)
-            if target and int(target["user_id"]) != user.id:
-                referral_owner = int(target["user_id"])
-
-    await ensure_user(user, referral_owner)
-    if referral_owner:
-        async with await db() as con:
-            await con.execute(
-                "INSERT OR IGNORE INTO visits(owner_id,visitor_id,first_seen) VALUES(?,?,?)",
-                (referral_owner, user.id, now_iso())
-            )
-            await con.commit()
-
-    me = await bot.get_me()
-    profile = await get_user(user.id)
-    count, _, _, _ = await get_counts(user.id)
-    text = (
-        f"🎄 <b>أهلاً بك في NewYear</b>\n\n"
-        f"مرحباً {html_escape(user.first_name)} ✨\n"
-        f"هنا تصنع شجرتك الخاصة وتستقبل أجمل معايدات أصدقائك.\n\n"
-        f"💌 معايداتك الحالية: <b>{count}</b>\n"
-        f"🗓️ السنة الحالية: <b>{current_year()}</b>\n\n"
-        f"اختر ما تريد من القائمة:"
-    )
-    await message.answer(text, reply_markup=main_keyboard())
-
-
 # ============================= استقبال المعايدة =============================
 
 @dp.message(UserStates.waiting_greeting)
 async def receive_greeting(message: Message, state: FSMContext):
+    if await user_is_banned(message.from_user.id):
+        await state.clear()
+        return await message.answer("🚫 حسابك محظور من استخدام البوت.")
+
     data = await state.get_data()
     receiver_id = int(data.get("receiver_id", 0))
     if not receiver_id:
@@ -616,6 +602,7 @@ async def activity_callback(call: CallbackQuery):
 
 async def show_greetings(call: CallbackQuery, year=None, page=0):
     user_id = call.from_user.id
+    page = max(0, min(int(page), 100000))
     offset = page * PAGE_SIZE
     async with await db() as con:
         if year is None:
@@ -640,23 +627,37 @@ async def show_greetings(call: CallbackQuery, year=None, page=0):
     if not rows:
         return await call.message.edit_text(
             "💌 لا توجد معايدات في هذا القسم بعد.",
-            reply_markup=back_keyboard("home")
+            reply_markup=back_keyboard("home" if year is None else "archive")
         )
 
     lines = [f"💌 <b>{'معايداتي' if year is None else 'أرشيف ' + str(year)}</b>\n"]
     delete_rows = []
-    for r in rows:
+    # نوزع مساحة الرسالة على المعايدات حتى لا يتجاوز الناتج حد تيليجرام.
+    for index, r in enumerate(rows):
         stamp = html_escape(r["created_at"][:16].replace("T", " "))
         sender = html_escape(r["sender_name"])
-        body = html_escape(r["message_text"])
-        lines.append(
-            f"━━━━━━━━━━━━\n"
-            f"👤 <b>{sender}</b>\n"
-            f"🗓️ {stamp}\n"
-            f"{body}\n"
-            f"🆔 <code>{r['id']}</code>"
-        )
-        delete_rows.append([InlineKeyboardButton(text=f"🗑 حذف المعايدة #{r['id']}", callback_data=f"greet_del:{r['id']}:{year if year is not None else 'all'}:{page}")])
+        raw_body = r["message_text"] or ""
+        fixed = f"━━━━━━━━━━━━\n👤 <b>{sender}</b>\n🗓️ {stamp}\n\n🆔 <code>{r['id']}</code>"
+        current_size = sum(len(part) for part in lines)
+        remaining_rows = len(rows) - index
+        allowance = max(40, (3700 - current_size) // remaining_rows - len(fixed))
+        escaped_body = html_escape(raw_body)
+        if len(escaped_body) > allowance:
+            # بحث ثنائي لاختيار أطول جزء آمن من النص ضمن المساحة المتاحة.
+            low, high = 0, len(raw_body)
+            while low < high:
+                mid = (low + high + 1) // 2
+                if len(html_escape(raw_body[:mid])) <= max(1, allowance - 1):
+                    low = mid
+                else:
+                    high = mid - 1
+            escaped_body = html_escape(raw_body[:low]) + "…"
+        block = f"━━━━━━━━━━━━\n👤 <b>{sender}</b>\n🗓️ {stamp}\n{escaped_body}\n🆔 <code>{r['id']}</code>"
+        lines.append(block)
+        delete_rows.append([InlineKeyboardButton(
+            text=f"🗑 حذف المعايدة #{r['id']}",
+            callback_data=f"greet_del:{r['id']}:{year if year is not None else 'all'}:{page}"
+        )])
 
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     nav = []
@@ -855,11 +856,14 @@ async def admin_stats(call: CallbackQuery):
 
 
 @dp.callback_query(F.data == "adm:channels")
-async def admin_channels(call: CallbackQuery):
+async def admin_channels(call: CallbackQuery, answer: bool = True):
     if not await is_admin(call.from_user.id):
-        return await call.answer("غير مصرح.", show_alert=True)
+        if answer:
+            return await call.answer("غير مصرح.", show_alert=True)
+        return
     channels = await get_channels()
-    await call.answer()
+    if answer:
+        await call.answer()
     await call.message.edit_text(
         "📣 <b>قنوات الاشتراك الإجباري</b>\n\n"
         "أضف القناة بصيغة:\n<code>@channel_username | https://t.me/channel</code>\n\n"
@@ -918,7 +922,7 @@ async def channel_delete(call: CallbackQuery):
         await con.commit()
     await log_admin(call.from_user.id, "delete_channel", channel_id)
     await call.answer("تم حذف القناة.")
-    await admin_channels(call)
+    await admin_channels(call, answer=False)
 
 
 @dp.callback_query(F.data == "adm:toggle_greetings")
@@ -941,7 +945,7 @@ async def admins_menu(call: CallbackQuery):
     if not await is_owner(call.from_user.id):
         return await call.answer("هذه الصلاحية للمالك فقط.", show_alert=True)
     async with await db() as con:
-        cur = await con.execute("SELECT user_id FROM admins ORDER BY added_at DESC")
+        cur = await con.execute("SELECT user_id FROM admins ORDER BY added_at DESC LIMIT 30")
         rows = await cur.fetchall()
     names = "\n".join([f"• <code>{r['user_id']}</code>" for r in rows]) or "لا يوجد مشرفون."
     await call.answer()
@@ -1234,7 +1238,6 @@ async def admin_logs_callback(call: CallbackQuery):
 # حالة استقبال المعايدة للزائر، بدلاً من وضعه في قائمة صاحب الشجرة.
 # يُعاد تعريف منطق /start هنا عبر توجيه الزائر إلى جلسة الرسالة عند وجود payload.
 
-_original_start_handler = start_handler
 
 @dp.message(Command("send"))
 async def send_command(message: Message, state: FSMContext):
@@ -1242,7 +1245,10 @@ async def send_command(message: Message, state: FSMContext):
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2:
         return await message.answer("استخدم /send CODE الموجود في رابط الشجرة.")
-    target = await get_user_by_code(parts[1].strip())
+    code = parts[1].strip()
+    if len(code) > 32 or not code.isalnum():
+        return await message.answer("رمز الشجرة غير صالح.")
+    target = await get_user_by_code(code)
     if not target:
         return await message.answer("رابط الشجرة غير صحيح.")
     if target["user_id"] == message.from_user.id:
@@ -1277,6 +1283,8 @@ async def start_deeplink_handler(message: Message, state: FSMContext):
     args = (message.text or "").split(maxsplit=1)
     payload = args[1].strip() if len(args) > 1 else ""
     if payload and payload != "home":
+        if len(payload) > 32 or not payload.isalnum():
+            return await message.answer("رابط الشجرة غير صالح.")
         target = await get_user_by_code(payload)
         if not target:
             await ensure_user(user)
